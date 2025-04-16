@@ -1,27 +1,37 @@
 import rclpy
+from std_msgs.msg import String
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 from geometry_msgs.msg import Point
-from cv_bridge import CvBridge
-from image_segmentation import SAMSegmentor
+from cv_bridge import CvBridge, CvBridgeError
+from object_tracking.image_segmentation import SAMSegmentor
 import numpy as np
 
 class SAMNode(Node):
     def __init__(self):
         super().__init__('sam_node')
+        self.get_logger().info('Looking for an object...')
+
         self.bridge = CvBridge()
         self.segmentor = SAMSegmentor()
+        self.current_prompt = "a red cup"
 
-        self.subscription = self.create_subscription(Image, '/camera/image_raw', self.image_callback, 10)
-        self.image_pub = self.create_publisher(Image, '/segmented_image', 10)
-        self.pose_pub = self.create_publisher(Point, '/object_position', 10)
-        self.declare_parameter('target_object', 'a red cup')
+        self.image_sub = self.create_subscription(Image, '/image_in', self.image_callback, rclpy.qos.QoSPresetProfiles.SENSOR_DATA.value)
+        self.prompt_sub = self.create_subscription(String, '/target_prompt', self.prompt_callback, 1)
+        self.image_pub = self.create_publisher(Image, '/image_out', 1)
+        self.pose_pub = self.create_publisher(Point, '/object_position', 1)
+
+    def prompt_callback(self, msg):
+        self.current_prompt = msg.data
+        self.get_logger().info(f'Новый промпт получен: "{self.current_prompt}"')
 
     def image_callback(self, msg):
-        image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-        prompt = self.get_parameter('target_object').get_parameter_value().string_value
+        try:
+            image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        except CvBridgeError as e:
+            print(e)
 
-        seg_img, (x_norm, y_norm, depth) = self.segmentor.segment(image, prompt)
+        seg_img, (x_norm, y_norm, depth) = self.segmentor.segment(image, self.current_prompt)
         self.image_pub.publish(self.bridge.cv2_to_imgmsg(seg_img, encoding='bgr8'))
 
         if x_norm is not None and depth is not None:
