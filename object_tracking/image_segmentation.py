@@ -37,25 +37,25 @@ class SAMSegmentor:
         self.dino_model = AutoModelForZeroShotObjectDetection.from_pretrained("IDEA-Research/grounding-dino-tiny").to("cuda")
 
         # Depth estimation (MiDaS)
-        self.depth_model = torch.hub.load("intel-isl/MiDaS", "DPT_Large").to("cuda").eval()
-        midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
-        self.depth_transform = midas_transforms.dpt_transform if hasattr(midas_transforms, "dpt_transform") else midas_transforms.small_transform
+        #self.depth_model = torch.hub.load("intel-isl/MiDaS", "DPT_Large").to("cuda").eval()
+        #midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
+        #self.depth_transform = midas_transforms.dpt_transform if hasattr(midas_transforms, "dpt_transform") else midas_transforms.small_transform
 
 
-    def estimate_depth(self, image_bgr):
-        img = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-        input_image = PILImage.fromarray(img)
-        transformed = self.depth_transform(img).to("cuda")
-
-        with torch.no_grad():
-            prediction = self.depth_model(transformed.unsqueeze(0))
-            prediction = torch.nn.functional.interpolate(
-                prediction.unsqueeze(1),
-                size=img.shape[:2],
-                mode="bicubic",
-                align_corners=False,
-            ).squeeze()
-        return prediction.cpu().numpy()
+    #def estimate_depth(self, image_bgr):
+    #    img = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    #    input_image = PILImage.fromarray(img)
+    #    transformed = self.depth_transform(img).to("cuda")
+#
+    #    with torch.no_grad():
+    #        prediction = self.depth_model(transformed.unsqueeze(0))
+    #        prediction = torch.nn.functional.interpolate(
+    #            prediction.unsqueeze(1),
+    #            size=img.shape[:2],
+    #            mode="bicubic",
+    #            align_corners=False,
+    #        ).squeeze()
+    #    return prediction.cpu().numpy()
 
     def segment(self, image_bgr, prompt):
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
@@ -66,6 +66,8 @@ class SAMSegmentor:
             outputs = self.dino_model(**inputs)
         #self.predictor.set_image(image_rgb)
 
+        print("received outputs from DINO")
+
         results = self.dino_processor.post_process_grounded_object_detection(
             outputs,
             inputs.input_ids,
@@ -74,14 +76,37 @@ class SAMSegmentor:
             target_sizes=[image_pil.size[::-1]]
         )
 
+        print("dino_pricessor finished")
+
         #if boxes is None or len(boxes) == 0:
         #    return image_bgr, (None, None, None)
 
         result = results[0]
-        if len(result["boxes"]) == 0:
-            return image_bgr, (None, None, None)
-        box = result["boxes"][0].cpu().numpy()
+        #if len(result["boxes"]) == 0:
+        #    print("Object not found")
+        #    return image_bgr, (None, None)
+        #box = result["boxes"][0].cpu().numpy()
+        #input_box = np.array([box])
+
+        # Фильтрация по порогу
+        box_threshold = 0.4
+        filtered = [
+            (box.cpu().numpy(), score.item(), label)
+            for box, score, label in zip(result["boxes"], result["scores"], result["labels"])
+            if score.item() >= box_threshold
+        ]
+
+        if not filtered:
+            print("❌ Объект не найден по уверенности")
+            return image_bgr, (None, None)
+
+        # Выбери самый уверенный бокс
+        box, score, label = sorted(filtered, key=lambda x: -x[1])[0]
         input_box = np.array([box])
+        print(f"✔ Найден объект: {label} (score={score:.2f})")
+
+
+        print("Received bounding boxes")
 
         input_boxes = self.predictor.transform.apply_boxes_torch(torch.tensor(input_box), image_bgr.shape[:2]).numpy()
         self.predictor.set_image(image_rgb)
@@ -91,6 +116,8 @@ class SAMSegmentor:
             boxes=torch.tensor(input_boxes).to("cuda"),
             multimask_output=False,
         )
+
+        print("masks acquired")
 
         mask = masks[0][0].cpu().numpy()
         ys, xs = np.where(mask)
@@ -105,12 +132,22 @@ class SAMSegmentor:
         cx_norm = (center_x - w / 2) / (w / 2)
         cy_norm = (center_y - h / 2) / (h / 2)
 
-        # Глубина
-        depth_map = self.estimate_depth(image_bgr)
-        center_depth = np.median(depth_map[ys, xs])
+        ## Глубина
+        #depth_map = self.estimate_depth(image_bgr)
+        #center_depth = np.median(depth_map[ys, xs])
 
         # Визуализация
         image_out = image_bgr.copy()
         image_out[mask > 0] = (0, 255, 0)
 
-        return image_out, (cx_norm, cy_norm, float(center_depth))
+        print("masked image received, returning")
+
+        for box, score, label in zip(result["boxes"], result["scores"], result["labels"]):
+            if score.item() >= box_threshold:
+                x1, y1, x2, y2 = box.cpu().numpy()
+                x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
+                cv2.rectangle(image_out, (x1, y1), (x2, y2), (255, 0, 0), 2)
+                text = f"{label} ({score:.2f})"
+                cv2.putText(image_out, text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+
+        return image_out, (cx_norm, cy_norm) #, float(center_depth))

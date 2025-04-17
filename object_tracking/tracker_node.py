@@ -22,8 +22,9 @@ class SAMNode(Node):
         self.pose_pub = self.create_publisher(Point, '/object_position', 1)
 
     def prompt_callback(self, msg):
-        self.current_prompt = msg.data
-        self.get_logger().info(f'Новый промпт получен: "{self.current_prompt}"')
+        if self.current_prompt != msg.data:
+            self.current_prompt = msg.data
+            self.get_logger().info(f'Новый промпт получен: "{self.current_prompt}"')
 
     def image_callback(self, msg):
         try:
@@ -31,28 +32,30 @@ class SAMNode(Node):
         except CvBridgeError as e:
             print(e)
 
-        seg_img, (x_norm, y_norm, depth) = self.segmentor.segment(image, self.current_prompt)
+        self.get_logger().info('Image received')
+
+        seg_img, (x_norm, y_norm) = self.segmentor.segment(image, self.current_prompt)
         self.image_pub.publish(self.bridge.cv2_to_imgmsg(seg_img, encoding='bgr8'))
 
-        if x_norm is not None and depth is not None:
-            # Преобразование нормализованных координат в 3D в камере
-            fx = fy = (image.shape[1] / (2 * np.tan(np.deg2rad(self.segmentor.HFOV / 2))))
-            cx = image.shape[1] / 2
-            cy = image.shape[0] / 2
-
-            x_px = x_norm * cx + cx
-            y_px = y_norm * cy + cy
-
-            X = (x_px - cx) * depth / fx
-            Y = (y_px - cy) * depth / fy
-            Z = depth
-
-            position = Point(x=X, y=Y, z=Z)
-            self.pose_pub.publish(position)
-
-            self.get_logger().info(f'Объект в 3D: X={X:.2f}, Y={Y:.2f}, Z={Z:.2f}')
-        else:
-            self.get_logger().warn('Объект не найден.')
+        #if x_norm is not None:
+        #    # Преобразование нормализованных координат в 3D в камере
+        #    #fx = fy = (image.shape[1] / (2 * np.tan(np.deg2rad(self.segmentor.HFOV / 2))))
+        #    #cx = image.shape[1] / 2
+        #    #cy = image.shape[0] / 2
+#
+        #    #x_px = x_norm * cx + cx
+        #    #y_px = y_norm * cy + cy
+#
+        #    #X = (x_px - cx) * depth / fx
+        #    #Y = (y_px - cy) * depth / fy
+        #    #Z = depth
+#
+        #    position = Point(x=X, y=Y, z=Z)
+        #    self.pose_pub.publish(position)
+#
+        #    #self.get_logger().info(f'Объект в 3D: X={X:.2f}, Y={Y:.2f}, Z={Z:.2f}')
+        #else:
+        #    self.get_logger().warn('Объект не найден.')
 
 def main(args=None):
     rclpy.init(args=args)
