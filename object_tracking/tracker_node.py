@@ -5,6 +5,7 @@ from sensor_msgs.msg import Image
 from geometry_msgs.msg import Point
 from cv_bridge import CvBridge, CvBridgeError
 from object_tracking.image_segmentation import SAMSegmentor
+from object_tracking.clip_image_segmentation import CLIPSegmentor
 import numpy as np
 
 class SAMNode(Node):
@@ -13,8 +14,8 @@ class SAMNode(Node):
         self.get_logger().info('Looking for an object...')
 
         self.bridge = CvBridge()
-        self.segmentor = SAMSegmentor()
-        self.current_prompt = "a red cup"
+        self.segmentor = CLIPSegmentor()
+        self.current_prompt = "a grey box"
 
         self.image_sub = self.create_subscription(Image, '/image_in', self.image_callback, rclpy.qos.QoSPresetProfiles.SENSOR_DATA.value)
         self.prompt_sub = self.create_subscription(String, '/target_prompt', self.prompt_callback, 1)
@@ -32,9 +33,15 @@ class SAMNode(Node):
         except CvBridgeError as e:
             print(e)
 
-        self.get_logger().info('Image received')
+        #self.get_logger().info('Image received')
 
-        seg_img, (x_norm, y_norm) = self.segmentor.segment(image, self.current_prompt)
+        seg_img, center_coords = self.segmentor.segment(image, self.current_prompt)
+
+        #if center_coords != None:
+        #    #self.get_logger().info('Центр отсегментированного объекта на изображении (x, y): (' + str(center_coords[0]) + ', ' + str(center_coords[1]) + ")")
+        #else:
+        #    #self.get_logger().info('Объект не найден')
+#
         self.image_pub.publish(self.bridge.cv2_to_imgmsg(seg_img, encoding='bgr8'))
 
         #if x_norm is not None:
