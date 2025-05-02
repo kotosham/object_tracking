@@ -15,7 +15,7 @@ class CLIPSegmentor:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model.to(self.device)
 
-    def segment(self, image, prompt, threshold = 0.75) -> np.ndarray:
+    def segment(self, image, prompt, threshold = 0.85) -> np.ndarray:
         """
         Use CLIPSeg to generate a segmentation mask for the object described by prompt.
         Returns a binary mask (numpy array) of the same size as the image.

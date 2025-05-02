@@ -1,12 +1,15 @@
 import rclpy
 from std_msgs.msg import String
 from rclpy.node import Node
+from rclpy.duration import Duration
 from sensor_msgs.msg import Image, CameraInfo 
-from geometry_msgs.msg import Point, PoseStamped
+from geometry_msgs.msg import Point, PoseStamped, Twist
 from cv_bridge import CvBridge, CvBridgeError
 from object_tracking.image_segmentation import SAMSegmentor
 from object_tracking.clip_image_segmentation import CLIPSegmentor
+from message_filters import ApproximateTimeSynchronizer, Subscriber
 import numpy as np
+import time
 
 import tf2_ros
 import tf2_geometry_msgs
@@ -16,22 +19,55 @@ class SAMNode(Node):
         super().__init__('tracker_node')
         self.get_logger().info('Node initialized')
         self.camera_info_received = False
+        self.target_reached = False
+        self.target_found = False
+        self.SAM = False
 
         self.bridge = CvBridge()
-        self.segmentor = CLIPSegmentor()
-        self.current_prompt = "a grey cube"
+        if self.SAM:
+            self.segmentor = SAMSegmentor()
+            self.goal_position = None
+        else:
+            self.segmentor = CLIPSegmentor()
+        self.current_prompt = "a car wheel"
+        self.current_pose = None
+        self.offset = 0.3
+        self.offset_delta = 0.25
+
+        self.depth_sub = self.create_subscription(Image, 
+                                                  '/depth_camera/depth/image_raw', 
+                                                  self.depth_callback, 
+                                                  rclpy.qos.QoSPresetProfiles.SENSOR_DATA.value)
+        self.image_sub = self.create_subscription(Image,
+                                                  '/image_in', 
+                                                  self.image_callback, 
+                                                  rclpy.qos.QoSPresetProfiles.SENSOR_DATA.value)
 
         self.camera_info_sub = self.create_subscription(CameraInfo, '/camera/camera_info', self.camera_info_callback, 1)
-        self.image_sub = self.create_subscription(Image, '/image_in', self.image_callback, rclpy.qos.QoSPresetProfiles.SENSOR_DATA.value)
         self.prompt_sub = self.create_subscription(String, '/target_prompt', self.prompt_callback, 1)
-        self.depth_sub = self.create_subscription(Image, '/depth_camera/depth/image_raw', self.depth_callback, rclpy.qos.QoSPresetProfiles.SENSOR_DATA.value)
+        
+        self.search_cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.image_pub = self.create_publisher(Image, '/image_out', 1)
         self.pose_pub = self.create_publisher(PoseStamped, '/goal_pose', 1)
 
-        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_buffer = tf2_ros.Buffer(cache_time=Duration(seconds=10.0))
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
+        self.declare_parameter("search_angular_speed", 0.5)
+        self.search_angular_speed = self.get_parameter('search_angular_speed').get_parameter_value().double_value
+
+        timer_period = 0.1  # seconds
+        self.timer = self.create_timer(timer_period, self.timer_callback)
+
         self.latest_depth = None
+
+    def timer_callback(self):
+        msg = Twist()
+        if not self.target_found and not self.target_reached:
+            if self.SAM:
+                return
+            msg.angular.z = self.search_angular_speed
+            self.search_cmd_pub.publish(msg)
 
     def camera_info_callback(self, msg):
         if not self.camera_info_received:
@@ -46,6 +82,8 @@ class SAMNode(Node):
         if self.current_prompt != msg.data:
             self.current_prompt = msg.data
             self.get_logger().info(f'Новый промпт получен: "{self.current_prompt}"')
+            self.target_found = False
+            self.target_reached = False
 
     def depth_callback(self, msg):
         try:
@@ -60,21 +98,66 @@ class SAMNode(Node):
             except CvBridgeError as e:
                 self.get_logger().error(e)
                 return
+            
+            if self.SAM:
+                if not self.target_found:
+                    if self.latest_depth is None:
+                        return
+                    seg_img, center_coords, image_depth_map = self.segmentor.segment(image, self.current_prompt, self.latest_depth)
+                    self.image_pub.publish(self.bridge.cv2_to_imgmsg(seg_img, encoding='bgr8'))
+                    if center_coords is None:
+                        if not self.target_found and not self.target_reached:
+                            self.get_logger().warn('Объект не найден')
+                            msg = Twist()
+                            msg.angular.z = self.search_angular_speed
+                            self.search_cmd_pub.publish(msg)
+                            time.sleep(4.0)
+                            self.latest_depth = None
+                            self.get_logger().info("Ожидание после поворота окончено")
+                        return
+                    else:
+                        if image_depth_map is None:
+                            return
+                        try:
+                            if not self.target_found and not self.target_reached:
+                                camera_transform = self.tf_buffer.lookup_transform('map', 
+                                                                                'depth_camera_link_optical', 
+                                                                                rclpy.time.Time(), 
+                                                                                timeout=rclpy.duration.Duration(seconds=0.5))
+                                transform_base = self.tf_buffer.lookup_transform('map', 
+                                                                            'base_link', 
+                                                                            rclpy.time.Time(), 
+                                                                            timeout=rclpy.duration.Duration(seconds=0.5))
+                                goal_point = self.segmentor.get_goal_point(depth_image=image_depth_map,
+                                                                        center_coords=center_coords,
+                                                                        camera_transform=camera_transform,
+                                                                        transform_base=transform_base,
+                                                                        camera_intrinsics=[self.fx, self.fy, self.cx, self.cy],
+                                                                        offset=self.offset)
+                                goal_point.header.stamp = self.get_clock().now().to_msg()
+                                self.pose_pub.publish(goal_point)
+                                image_depth_map = None
+                                self.target_found = True
+                        except Exception as e:
+                            self.get_logger().error(f'Ошибка трансформации в map: {e}')
+                return
 
             seg_img, center_coords = self.segmentor.segment(image, self.current_prompt)
             self.image_pub.publish(self.bridge.cv2_to_imgmsg(seg_img, encoding='bgr8'))
 
             if center_coords is None:
-                self.get_logger().warn('Объект не найден')
+                if not self.target_found:
+                    self.get_logger().warn('Объект не найден')
                 return
             else:
                 self.get_logger().info('Координаты центра: (' + str(center_coords[0]) + ', ' + str(center_coords[1]) + ')')
+                self.target_found = True
 
             if self.latest_depth is None:
-                self.get_logger().warn('Нет данных depth')
+                if not self.target_found:
+                    self.get_logger().warn('Нет данных depth')
                 return
-            
-            #img_h, img_w = image.shape[:2]
+
             x_px = int(center_coords[0])
             y_px = int(center_coords[1])
 
@@ -93,51 +176,55 @@ class SAMNode(Node):
             point_camera.x = X
             point_camera.y = Y
             point_camera.z = float(Z)
-    
+
             point_stamped = tf2_geometry_msgs.PointStamped()
             point_stamped.header.frame_id = 'depth_camera_link_optical'
-            point_stamped.header.stamp = msg.header.stamp
+            point_stamped.header.stamp = self.get_clock().now().to_msg()
             point_stamped.point = point_camera
 
-            if point_camera.z >= 0.5:
-
+            if not self.target_reached:
                 try:
-                    transform = self.tf_buffer.lookup_transform('map', 'depth_camera_link_optical', msg.header.stamp, timeout=rclpy.duration.Duration(seconds=0.5))
+                    transform = self.tf_buffer.lookup_transform('map', 
+                                                                'depth_camera_link_optical', 
+                                                                rclpy.time.Time(), 
+                                                                timeout=rclpy.duration.Duration(seconds=0.5))
                     point_world = tf2_geometry_msgs.do_transform_point(point_stamped, transform)
+                    transform_base = self.tf_buffer.lookup_transform('map', 
+                                                                     'base_link', 
+                                                                     rclpy.time.Time(), 
+                                                                     timeout=rclpy.duration.Duration(seconds=0.5))
     
+                    robot_x = transform_base.transform.translation.x
+                    robot_y = transform_base.transform.translation.y
+
+                    dx = point_world.point.x - robot_x
+                    dy = point_world.point.y - robot_y
+
+                    distance = np.hypot(dx, dy)
+                    if distance > self.offset + self.offset_delta:
+                        scale = (distance - self.offset) / distance
+                    else:
+                        scale = 0.0
+                        self.target_reached = True
+                        self.get_logger().info("Объект достигнут")
+
+                    goal_x = robot_x + dx * scale
+                    goal_y = robot_y + dy * scale
+
                     self.get_logger().info(f'Объект в map frame: X={point_world.point.x:.2f}, Y={point_world.point.y:.2f}, Z={point_world.point.z:.2f}')
-    
-                    # 5. Публикация цели в Nav2
+                    self.get_logger().info(f'Расстояние до цели distance = {distance:.2f}, offset = {self.offset:.2f}')
+
                     goal = PoseStamped()
+                    
                     goal.header.frame_id = 'map'
-                    goal.header.stamp = msg.header.stamp
-                    goal.pose.position = point_world.point
-                    goal.pose.orientation.w = 1.0  # Без ориентации (или повернуть к объекту)
+                    goal.header.stamp = self.get_clock().now().to_msg()
+
+                    goal.pose.position.x = goal_x
+                    goal.pose.position.y = goal_y
     
                     self.pose_pub.publish(goal)
-    
                 except Exception as e:
                     self.get_logger().error(f'Ошибка трансформации в map: {e}')
-
-            #if x_norm is not None:
-            #    # Преобразование нормализованных координат в 3D в камере
-            #    #fx = fy = (image.shape[1] / (2 * np.tan(np.deg2rad(self.segmentor.HFOV / 2))))
-            #    #cx = image.shape[1] / 2
-            #    #cy = image.shape[0] / 2
-
-            #    #x_px = x_norm * cx + cx
-            #    #y_px = y_norm * cy + cy
-
-            #    #X = (x_px - cx) * depth / fx
-            #    #Y = (y_px - cy) * depth / fy
-            #    #Z = depth
-
-            #    position = Point(x=X, y=Y, z=Z)
-            #    self.pose_pub.publish(position)
-
-            #    #self.get_logger().info(f'Объект в 3D: X={X:.2f}, Y={Y:.2f}, Z={Z:.2f}')
-            #else:
-            #    self.get_logger().warn('Объект не найден.')
 
 def main(args=None):
     rclpy.init(args=args)

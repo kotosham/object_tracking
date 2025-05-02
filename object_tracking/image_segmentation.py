@@ -11,6 +11,13 @@ from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
 
 from PIL import Image as PILImage
 
+import tf2_ros
+import tf2_geometry_msgs
+from geometry_msgs.msg import Point, PoseStamped
+
+import math
+from geometry_msgs.msg import Quaternion
+
 class SAMSegmentor:
     def __init__(self, hfov=70, vfov=40):
         self.HFOV = hfov
@@ -31,7 +38,7 @@ class SAMSegmentor:
         self.dino_processor = AutoProcessor.from_pretrained("IDEA-Research/grounding-dino-tiny")
         self.dino_model = AutoModelForZeroShotObjectDetection.from_pretrained("IDEA-Research/grounding-dino-tiny").to("cuda")
 
-    def segment(self, image_bgr, prompt):
+    def segment(self, image_bgr, prompt, depth_map):
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
         image_pil = PILImage.fromarray(image_rgb)
         text_labels = [[prompt]]
@@ -54,7 +61,7 @@ class SAMSegmentor:
         result = results[0]
 
         # Фильтрация по порогу
-        box_threshold = 0.4
+        box_threshold = 0.75
         filtered = [
             (box.cpu().numpy(), score.item(), label)
             for box, score, label in zip(result["boxes"], result["scores"], result["labels"])
@@ -62,13 +69,13 @@ class SAMSegmentor:
         ]
 
         if not filtered:
-            print("❌ Объект не найден по уверенности")
-            return image_bgr, (None, None)
+            print("Объект не найден по уверенности")
+            return image_bgr, None, depth_map
 
         # Выбери самый уверенный бокс
         box, score, label = sorted(filtered, key=lambda x: -x[1])[0]
         input_box = np.array([box])
-        print(f"✔ Найден объект: {label} (score={score:.2f})")
+        print(f"Найден объект: {label} (score={score:.2f})")
 
         print("Received bounding boxes")
 
@@ -86,17 +93,10 @@ class SAMSegmentor:
         mask = masks[0][0].cpu().numpy()
         ys, xs = np.where(mask)
         if xs.size == 0 or ys.size == 0:
-            return image_bgr, (None, None)
+            return image_bgr, None, depth_map
 
-        center_x = np.mean(xs)
-        center_y = np.mean(ys)
-        h, w = image_rgb.shape[:2]
+        center_coords = self.get_center_coordinates(mask)
 
-        # Нормализованные координаты
-        cx_norm = (center_x - w / 2) / (w / 2)
-        cy_norm = (center_y - h / 2) / (h / 2)
-
-        # Визуализация
         image_out = image_bgr.copy()
         image_out[mask > 0] = (0, 255, 0)
 
@@ -110,4 +110,84 @@ class SAMSegmentor:
                 text = f"{label} ({score:.2f})"
                 cv2.putText(image_out, text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
 
-        return image_out, (cx_norm, cy_norm) #, float(center_depth))
+        return image_out, center_coords, depth_map
+    
+    def get_center_coordinates(self, mask):
+        y_indices, x_indices = np.where(mask)
+        if len(x_indices) == 0 or len(y_indices) == 0:
+            return None
+        x_mean = int(np.mean(x_indices))
+        y_mean = int(np.mean(y_indices))
+        return (x_mean, y_mean)
+    
+    def get_goal_point(self, depth_image, center_coords, camera_transform, transform_base, camera_intrinsics, offset):
+        fx, fy, cx, cy = camera_intrinsics
+        
+        x_px = int(center_coords[0])
+        y_px = int(center_coords[1])
+        
+        depth = depth_image[y_px, x_px]
+
+        X = (x_px - cx) * depth / fx
+        Y = (y_px - cy) * depth / fy
+        Z = depth
+
+        point_camera = Point()
+        point_camera.x = X
+        point_camera.y = Y
+        point_camera.z = float(Z)
+
+        point_stamped = tf2_geometry_msgs.PointStamped()
+        point_stamped.header.frame_id = 'depth_camera_link_optical'
+        point_stamped.header.stamp = camera_transform.header.stamp
+        point_stamped.point = point_camera
+
+        point_world = tf2_geometry_msgs.do_transform_point(point_stamped, camera_transform)
+
+        robot_x = transform_base.transform.translation.x
+        robot_y = transform_base.transform.translation.y
+
+        dx = point_world.point.x - robot_x
+        dy = point_world.point.y - robot_y
+
+        distance = np.hypot(dx, dy)
+
+        if distance <= offset:
+            goal_x = robot_x
+            goal_y = robot_y
+
+            goal = PoseStamped()
+                    
+            goal.header.frame_id = 'map'
+
+            goal.pose.position.x = goal_x
+            goal.pose.position.y = goal_y
+            return goal
+
+        #scale = (distance - offset) / distance
+        scale = 0.95
+
+        goal_x = robot_x + dx * scale
+        goal_y = robot_y + dy * scale
+
+        print(f'Объект в map frame: X={point_world.point.x:.2f}, Y={point_world.point.y:.2f}, Z={point_world.point.z:.2f}')
+        print(f'Расстояние до цели distance = {distance:.2f}, offset = {offset:.2f}')
+
+        goal = PoseStamped()
+                    
+        goal.header.frame_id = 'map'
+
+        theta = np.arctan2(dy, dx)
+
+        def yaw_to_quaternion(yaw):
+            q = Quaternion()
+            q.z = math.sin(yaw / 2.0)
+            q.w = math.cos(yaw / 2.0)
+            return q
+
+        goal.pose.position.x = goal_x
+        goal.pose.position.y = goal_y
+
+        goal.pose.orientation = yaw_to_quaternion(theta)
+
+        return goal
