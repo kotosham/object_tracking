@@ -14,6 +14,9 @@ import time
 import tf2_ros
 import tf2_geometry_msgs
 
+import math
+from geometry_msgs.msg import Quaternion
+
 class SAMNode(Node):
     def __init__(self):
         super().__init__('tracker_node')
@@ -31,8 +34,10 @@ class SAMNode(Node):
             self.segmentor = CLIPSegmentor()
         self.current_prompt = "a car wheel"
         self.current_pose = None
-        self.offset = 0.3
-        self.offset_delta = 0.25
+        self.offset = 0.5
+        self.offset_delta = 0.35
+        self.total_seg_time = 0
+        self.segmentations = 0
 
         self.depth_sub = self.create_subscription(Image, 
                                                   '/depth_camera/depth/image_raw', 
@@ -92,7 +97,7 @@ class SAMNode(Node):
             self.get_logger().error(f'Ошибка конвертации depth изображения: {e}')
 
     def image_callback(self, msg):
-        if self.fx != None and self.fy != None and self.cx != None and self.cy != None:
+        if self.camera_info_received:
             try:
                 image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
             except CvBridgeError as e:
@@ -103,7 +108,7 @@ class SAMNode(Node):
                 if not self.target_found:
                     if self.latest_depth is None:
                         return
-                    seg_img, center_coords, image_depth_map = self.segmentor.segment(image, self.current_prompt, self.latest_depth)
+                    seg_img, center_coords, image_depth_map, segmentation_time = self.segmentor.segment(image, self.current_prompt, self.latest_depth)
                     self.image_pub.publish(self.bridge.cv2_to_imgmsg(seg_img, encoding='bgr8'))
                     if center_coords is None:
                         if not self.target_found and not self.target_reached:
@@ -119,6 +124,8 @@ class SAMNode(Node):
                         if image_depth_map is None:
                             return
                         try:
+                            self.total_seg_time += segmentation_time
+                            self.segmentations += 1
                             if not self.target_found and not self.target_reached:
                                 camera_transform = self.tf_buffer.lookup_transform('map', 
                                                                                 'depth_camera_link_optical', 
@@ -138,24 +145,29 @@ class SAMNode(Node):
                                 self.pose_pub.publish(goal_point)
                                 image_depth_map = None
                                 self.target_found = True
+                                self.get_logger().info(f"Average GroundingDINO + SAM segmentation time is {(self.total_seg_time/self.segmentations)}")
                         except Exception as e:
                             self.get_logger().error(f'Ошибка трансформации в map: {e}')
                 return
 
-            seg_img, center_coords = self.segmentor.segment(image, self.current_prompt)
+            seg_img, center_coords, segmentation_time = self.segmentor.segment(image, self.current_prompt)
             self.image_pub.publish(self.bridge.cv2_to_imgmsg(seg_img, encoding='bgr8'))
 
             if center_coords is None:
-                if not self.target_found:
-                    self.get_logger().warn('Объект не найден')
+                #if not self.target_found:
+                    #self.get_logger().warn('Объект не найден')
                 return
             else:
-                self.get_logger().info('Координаты центра: (' + str(center_coords[0]) + ', ' + str(center_coords[1]) + ')')
+                if not self.target_found:
+                    self.get_logger().info('Координаты центра: (' + str(center_coords[0]) + ', ' + str(center_coords[1]) + ')')
                 self.target_found = True
 
+            self.total_seg_time += segmentation_time
+            self.segmentations += 1
+
             if self.latest_depth is None:
-                if not self.target_found:
-                    self.get_logger().warn('Нет данных depth')
+                #if not self.target_found:
+                #    self.get_logger().warn('Нет данных depth')
                 return
 
             x_px = int(center_coords[0])
@@ -170,7 +182,7 @@ class SAMNode(Node):
             Y = (y_px - self.cy) * depth / self.fy
             Z = depth
     
-            self.get_logger().info(f'Объект в системе камеры: X={X:.2f}, Y={Y:.2f}, Z={Z:.2f}')
+            #self.get_logger().info(f'Объект в системе камеры: X={X:.2f}, Y={Y:.2f}, Z={Z:.2f}')
 
             point_camera = Point()
             point_camera.x = X
@@ -202,17 +214,19 @@ class SAMNode(Node):
 
                     distance = np.hypot(dx, dy)
                     if distance > self.offset + self.offset_delta:
-                        scale = (distance - self.offset) / distance
+                        #scale = (distance - self.offset) / distance
+                        scale = 0.8
                     else:
                         scale = 0.0
                         self.target_reached = True
                         self.get_logger().info("Объект достигнут")
+                        self.get_logger().info(f'Average segmentation time is {(self.total_seg_time/self.segmentations)}')
 
                     goal_x = robot_x + dx * scale
                     goal_y = robot_y + dy * scale
 
                     self.get_logger().info(f'Объект в map frame: X={point_world.point.x:.2f}, Y={point_world.point.y:.2f}, Z={point_world.point.z:.2f}')
-                    self.get_logger().info(f'Расстояние до цели distance = {distance:.2f}, offset = {self.offset:.2f}')
+                    self.get_logger().info(f'Расстояние до цели distance = {distance:.2f}, offset = {self.offset:.2f} +- {self.offset_delta:.2f}')
 
                     goal = PoseStamped()
                     
@@ -221,6 +235,19 @@ class SAMNode(Node):
 
                     goal.pose.position.x = goal_x
                     goal.pose.position.y = goal_y
+
+                    theta = np.arctan2(dy, dx)
+
+                    def yaw_to_quaternion(yaw):
+                        q = Quaternion()
+                        q.z = math.sin(yaw / 2.0)
+                        q.w = math.cos(yaw / 2.0)
+                        return q
+
+                    goal.pose.position.x = goal_x
+                    goal.pose.position.y = goal_y
+
+                    goal.pose.orientation = yaw_to_quaternion(theta)
     
                     self.pose_pub.publish(goal)
                 except Exception as e:

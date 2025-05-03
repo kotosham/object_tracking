@@ -8,6 +8,8 @@ import matplotlib.pyplot as plt
 
 from PIL import Image as PILImage
 
+import time
+
 class CLIPSegmentor:
     def __init__(self):
         self.model = CLIPSegForImageSegmentation.from_pretrained("CIDAS/clipseg-rd64-refined")
@@ -15,7 +17,7 @@ class CLIPSegmentor:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model.to(self.device)
 
-    def segment(self, image, prompt, threshold = 0.85) -> np.ndarray:
+    def segment(self, image, prompt, threshold = 0.85, min_mask_area = 200) -> np.ndarray:
         """
         Use CLIPSeg to generate a segmentation mask for the object described by prompt.
         Returns a binary mask (numpy array) of the same size as the image.
@@ -23,6 +25,8 @@ class CLIPSegmentor:
 
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         image_pil = PILImage.fromarray(image_rgb)
+
+        start_time = time.time()
 
         # Process the image and the prompt
         inputs = self.processor(text=[prompt], images=image_pil, return_tensors="pt").to(self.device)
@@ -42,15 +46,22 @@ class CLIPSegmentor:
 
         # Convert logits to binary mask using sigmoid activation and threshold
         mask = upsampled_logits.sigmoid()[0][0].cpu().numpy() > threshold
+        
+        end_time = time.time()
+
+        mask_area = np.sum(mask)
+        if mask_area < min_mask_area:
+            print(f"Object ignored due to small area: {mask_area} pixels")
+            return image, None, end_time
+
+        segmentation_time = end_time - start_time
 
         center_coords = self.get_center_coordinates(mask)
 
         image_out = image.copy()
         image_out[mask > 0] = (0, 255, 0)
 
-        #print("masked image received, returning")
-
-        return image_out, center_coords
+        return image_out, center_coords, segmentation_time
 
     def get_center_coordinates(self, mask):
         y_indices, x_indices = np.where(mask)

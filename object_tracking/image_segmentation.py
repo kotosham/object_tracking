@@ -18,6 +18,8 @@ from geometry_msgs.msg import Point, PoseStamped
 import math
 from geometry_msgs.msg import Quaternion
 
+import time
+
 class SAMSegmentor:
     def __init__(self, hfov=70, vfov=40):
         self.HFOV = hfov
@@ -42,6 +44,9 @@ class SAMSegmentor:
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
         image_pil = PILImage.fromarray(image_rgb)
         text_labels = [[prompt]]
+
+        start_time_DINO = time.time()
+
         inputs = self.dino_processor(images=image_pil, text=text_labels, return_tensors="pt").to("cuda")
         with torch.no_grad():
             outputs = self.dino_model(**inputs)
@@ -58,6 +63,12 @@ class SAMSegmentor:
 
         print("dino_pricessor finished")
 
+        end_time_DINO = time.time()
+
+        DINO_time = end_time_DINO - start_time_DINO
+
+        print(f"GroundingDINO's work time is {DINO_time}")
+
         result = results[0]
 
         # Фильтрация по порогу
@@ -70,7 +81,7 @@ class SAMSegmentor:
 
         if not filtered:
             print("Объект не найден по уверенности")
-            return image_bgr, None, depth_map
+            return image_bgr, None, depth_map, 0
 
         # Выбери самый уверенный бокс
         box, score, label = sorted(filtered, key=lambda x: -x[1])[0]
@@ -78,6 +89,8 @@ class SAMSegmentor:
         print(f"Найден объект: {label} (score={score:.2f})")
 
         print("Received bounding boxes")
+
+        start_time_SAM = time.time()
 
         input_boxes = self.predictor.transform.apply_boxes_torch(torch.tensor(input_box), image_bgr.shape[:2]).numpy()
         self.predictor.set_image(image_rgb)
@@ -87,6 +100,12 @@ class SAMSegmentor:
             boxes=torch.tensor(input_boxes).to("cuda"),
             multimask_output=False,
         )
+
+        end_time_SAM = time.time()
+
+        SAM_time = end_time_SAM - start_time_SAM
+
+        print(f"SAM's work time is {SAM_time}")
 
         print("masks acquired")
 
@@ -110,7 +129,7 @@ class SAMSegmentor:
                 text = f"{label} ({score:.2f})"
                 cv2.putText(image_out, text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
 
-        return image_out, center_coords, depth_map
+        return image_out, center_coords, depth_map, DINO_time+SAM_time
     
     def get_center_coordinates(self, mask):
         y_indices, x_indices = np.where(mask)
@@ -165,7 +184,7 @@ class SAMSegmentor:
             return goal
 
         #scale = (distance - offset) / distance
-        scale = 0.95
+        scale = 0.8
 
         goal_x = robot_x + dx * scale
         goal_y = robot_y + dy * scale
