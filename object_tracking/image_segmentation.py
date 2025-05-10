@@ -61,7 +61,7 @@ class SAMSegmentor:
             target_sizes=[image_pil.size[::-1]]
         )
 
-        print("dino_pricessor finished")
+        print("dino_processor finished")
 
         end_time_DINO = time.time()
 

@@ -24,7 +24,9 @@ class SAMNode(Node):
         self.camera_info_received = False
         self.target_reached = False
         self.target_found = False
-        self.SAM = False
+        
+        self.declare_parameter("use_sam", False)
+        self.SAM = self.get_parameter("use_sam").get_parameter_value().bool_value
 
         self.bridge = CvBridge()
         if self.SAM:
@@ -32,7 +34,8 @@ class SAMNode(Node):
             self.goal_position = None
         else:
             self.segmentor = CLIPSegmentor()
-        self.current_prompt = "a car wheel"
+
+        self.current_prompt = None
         self.current_pose = None
         self.offset = 0.5
         self.offset_delta = 0.35
@@ -68,7 +71,7 @@ class SAMNode(Node):
 
     def timer_callback(self):
         msg = Twist()
-        if not self.target_found and not self.target_reached:
+        if not self.target_found and not self.target_reached and not (self.current_prompt is None):
             if self.SAM:
                 return
             msg.angular.z = self.search_angular_speed
@@ -104,10 +107,14 @@ class SAMNode(Node):
                 self.get_logger().error(e)
                 return
             
+            if self.current_prompt is None:
+                return
+            
             if self.SAM:
                 if not self.target_found:
                     if self.latest_depth is None:
                         return
+                    
                     seg_img, center_coords, image_depth_map, segmentation_time = self.segmentor.segment(image, self.current_prompt, self.latest_depth)
                     self.image_pub.publish(self.bridge.cv2_to_imgmsg(seg_img, encoding='bgr8'))
                     if center_coords is None:
@@ -119,6 +126,24 @@ class SAMNode(Node):
                             time.sleep(4.0)
                             self.latest_depth = None
                             self.get_logger().info("Ожидание после поворота окончено")
+                        if self.target_found and not self.target_reached:
+                            transform_base = self.tf_buffer.lookup_transform('map', 
+                                                                            'base_link', 
+                                                                            rclpy.time.Time(), 
+                                                                            timeout=rclpy.duration.Duration(seconds=0.5))
+                
+                            robot_x = transform_base.transform.translation.x
+                            robot_y = transform_base.transform.translation.y
+
+                            dx = self.goal_pose.pose.position.x - robot_x
+                            dy = self.goal_pose.pose.position.y - robot_y
+
+                            distance = np.hypot(dx, dy)
+
+                            if distance <= self.offset + self.offset_delta:
+                                self.target_reached = True
+                                self.get_logger().info("Объект достигнут")
+                                self.get_logger().info(f'Average segmentation time is {(self.total_seg_time/self.segmentations)}')
                         return
                     else:
                         if image_depth_map is None:
@@ -142,6 +167,7 @@ class SAMNode(Node):
                                                                         camera_intrinsics=[self.fx, self.fy, self.cx, self.cy],
                                                                         offset=self.offset)
                                 goal_point.header.stamp = self.get_clock().now().to_msg()
+                                self.goal_pose = goal_point
                                 self.pose_pub.publish(goal_point)
                                 image_depth_map = None
                                 self.target_found = True
@@ -150,12 +176,31 @@ class SAMNode(Node):
                             self.get_logger().error(f'Ошибка трансформации в map: {e}')
                 return
 
-            seg_img, center_coords, segmentation_time = self.segmentor.segment(image, self.current_prompt)
+            seg_img, center_coords, segmentation_time, depth_map_used = self.segmentor.segment(image, self.current_prompt, self.latest_depth)
             self.image_pub.publish(self.bridge.cv2_to_imgmsg(seg_img, encoding='bgr8'))
 
             if center_coords is None:
                 #if not self.target_found:
                     #self.get_logger().warn('Объект не найден')
+                if self.target_found and not self.target_reached:
+                    transform_base = self.tf_buffer.lookup_transform('map', 
+                                                                    'base_link', 
+                                                                    rclpy.time.Time(), 
+                                                                    timeout=rclpy.duration.Duration(seconds=0.5))
+                
+                    robot_x = transform_base.transform.translation.x
+                    robot_y = transform_base.transform.translation.y
+
+                    dx = self.goal_pose.pose.position.x - robot_x
+                    dy = self.goal_pose.pose.position.y - robot_y
+
+                    distance = np.hypot(dx, dy)
+
+                    if distance <= self.offset + self.offset_delta:
+                        self.target_reached = True
+                        self.get_logger().info("Объект достигнут")
+                        self.get_logger().info(f'Average segmentation time is {(self.total_seg_time/self.segmentations)}')
+
                 return
             else:
                 if not self.target_found:
@@ -173,7 +218,7 @@ class SAMNode(Node):
             x_px = int(center_coords[0])
             y_px = int(center_coords[1])
 
-            depth = self.latest_depth[y_px, x_px]
+            depth = depth_map_used[y_px, x_px]
             if np.isnan(depth) or depth <= 0.0:
                 self.get_logger().warn('Некорректная глубина в центре объекта')
                 return
@@ -213,11 +258,12 @@ class SAMNode(Node):
                     dy = point_world.point.y - robot_y
 
                     distance = np.hypot(dx, dy)
-                    if distance > self.offset + self.offset_delta:
+                    if 0.8 * distance > self.offset + self.offset_delta:
                         #scale = (distance - self.offset) / distance
                         scale = 0.8
+                        self.get_logger().info(f'Average segmentation time is {(self.total_seg_time/self.segmentations)}')
                     else:
-                        scale = 0.0
+                        scale = 0.8
                         self.target_reached = True
                         self.get_logger().info("Объект достигнут")
                         self.get_logger().info(f'Average segmentation time is {(self.total_seg_time/self.segmentations)}')
@@ -228,13 +274,12 @@ class SAMNode(Node):
                     self.get_logger().info(f'Объект в map frame: X={point_world.point.x:.2f}, Y={point_world.point.y:.2f}, Z={point_world.point.z:.2f}')
                     self.get_logger().info(f'Расстояние до цели distance = {distance:.2f}, offset = {self.offset:.2f} +- {self.offset_delta:.2f}')
 
+                    self.goal_pose = PoseStamped()
+
                     goal = PoseStamped()
                     
                     goal.header.frame_id = 'map'
                     goal.header.stamp = self.get_clock().now().to_msg()
-
-                    goal.pose.position.x = goal_x
-                    goal.pose.position.y = goal_y
 
                     theta = np.arctan2(dy, dx)
 
@@ -248,6 +293,8 @@ class SAMNode(Node):
                     goal.pose.position.y = goal_y
 
                     goal.pose.orientation = yaw_to_quaternion(theta)
+
+                    self.goal_pose = goal
     
                     self.pose_pub.publish(goal)
                 except Exception as e:

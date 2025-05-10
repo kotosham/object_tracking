@@ -17,7 +17,7 @@ class CLIPSegmentor:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model.to(self.device)
 
-    def segment(self, image, prompt, threshold = 0.85, min_mask_area = 200) -> np.ndarray:
+    def segment(self, image, prompt, depth_map, threshold = 0.85, min_mask_area = 200) -> np.ndarray:
         """
         Use CLIPSeg to generate a segmentation mask for the object described by prompt.
         Returns a binary mask (numpy array) of the same size as the image.
@@ -50,9 +50,9 @@ class CLIPSegmentor:
         end_time = time.time()
 
         mask_area = np.sum(mask)
-        if mask_area < min_mask_area:
+        if mask_area < min_mask_area and mask_area > 0:
             print(f"Object ignored due to small area: {mask_area} pixels")
-            return image, None, end_time
+            return image, None, end_time, depth_map
 
         segmentation_time = end_time - start_time
 
@@ -61,7 +61,7 @@ class CLIPSegmentor:
         image_out = image.copy()
         image_out[mask > 0] = (0, 255, 0)
 
-        return image_out, center_coords, segmentation_time
+        return image_out, center_coords, segmentation_time, depth_map
 
     def get_center_coordinates(self, mask):
         y_indices, x_indices = np.where(mask)
