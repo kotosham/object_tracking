@@ -76,11 +76,11 @@ ros2 run object_tracking tracker_node --ros-args -r /image_in:=/camera/image_raw
 
 ### GroundingSAM
 
-[gif]
+![SAM Example](./examples/SAM_example.gif)
 
 ### CLIP
 
-[gif]
+![CLIP Example](./examples/Clip_example.gif)
 
 ---
 
