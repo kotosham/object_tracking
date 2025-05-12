@@ -1,6 +1,6 @@
 # Robot Object Tracker with Text Prompts and Image Segmentation
 
-This repository contains a ROS 2 node implementation for segmenting camera images from a robot using **GroundingSAM** and **CLIP**, identifying an object based on a natural language prompt, and navigating toward it using the **Nav2** stack.
+This repository contains a ROS 2 node implementation for segmenting camera images from a robot using **GroundingSAM** and **CLIP**, identifying an object based on a text prompt contraining target object description, and navigating toward it using the **Nav2** stack.
 
 ---
 
@@ -52,15 +52,8 @@ This repository contains a ROS 2 node implementation for segmenting camera image
 
 ```bash
 # Clone the repository
-git clone https://github.com/your_username/your_repo.git
-cd your_repo
-
-# (Optional) Create a virtual environment
-python3 -m venv venv
-source venv/bin/activate
-
-# Install required packages
-pip install -r requirements.txt
+git clone https://github.com/dnbabkov/object_tracking.git
+cd object_tracking
 ```
 ---
 
