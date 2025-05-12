@@ -50,11 +50,12 @@ This repository contains a ROS 2 node implementation for segmenting camera image
 
 ## Installation
 
+To use this project you need to clone this into the `src` folder in your ROS workspace and build it along with the robot project using
+
 ```bash
-# Clone the repository
-git clone https://github.com/dnbabkov/object_tracking.git
-cd object_tracking
+colcon build --symlink-install
 ```
+
 ---
 
 ## Running the Node
