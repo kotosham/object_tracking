@@ -19,6 +19,8 @@ def launch_setup(context, *args, **kwargs):
     env = dict(os.environ)
     env['MPLCONFIGDIR'] = mpl_config_dir
     env.setdefault('HF_HOME', os.path.expanduser('~/.cache/huggingface'))
+    env.setdefault('HF_HUB_DISABLE_PROGRESS_BARS', '1')
+    env.setdefault('TRANSFORMERS_VERBOSITY', 'error')
     env['PYTHONUNBUFFERED'] = '1'
 
     cmd = [
@@ -79,17 +81,17 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'image_topic',
-            default_value='/camera/image_raw',
+            default_value='/camera/camera/color/image_raw',
             description='RGB image topic.',
         ),
         DeclareLaunchArgument(
             'depth_topic',
-            default_value='/depth_camera/depth/image_raw',
+            default_value='/camera/camera/aligned_depth_to_color/image_raw',
             description='Depth image topic.',
         ),
         DeclareLaunchArgument(
             'camera_info_topic',
-            default_value='/camera/camera_info',
+            default_value='/camera/camera/aligned_depth_to_color/camera_info',
             description='Camera info topic.',
         ),
         DeclareLaunchArgument(

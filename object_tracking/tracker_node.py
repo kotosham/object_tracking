@@ -40,6 +40,11 @@ class SAMNode(Node):
         self.offset_delta = 0.35
         self.total_seg_time = 0
         self.segmentations = 0
+        self.last_tracking_log_time = 0.0
+        self.last_logged_distance = None
+        self.last_logged_center = None
+        self.tracking_log_period = 1.0
+        self.tracking_distance_delta = 0.2
 
         self.depth_sub = self.create_subscription(Image, 
                                                   '/depth_camera/depth/image_raw', 
@@ -91,12 +96,38 @@ class SAMNode(Node):
             self.get_logger().info(f'Новый промпт получен: "{self.current_prompt}"')
             self.target_found = False
             self.target_reached = False
+            self.last_tracking_log_time = 0.0
+            self.last_logged_distance = None
+            self.last_logged_center = None
 
     def depth_callback(self, msg):
         try:
             self.latest_depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
         except CvBridgeError as e:
             self.get_logger().error(f'Ошибка конвертации depth изображения: {e}')
+
+    def should_log_tracking_update(self, distance, center_coords):
+        now = time.time()
+        if self.last_logged_distance is None or self.last_logged_center is None:
+            self.last_tracking_log_time = now
+            self.last_logged_distance = distance
+            self.last_logged_center = center_coords
+            return True
+
+        distance_changed = abs(distance - self.last_logged_distance) >= self.tracking_distance_delta
+        center_changed = (
+            abs(center_coords[0] - self.last_logged_center[0]) >= 10
+            or abs(center_coords[1] - self.last_logged_center[1]) >= 10
+        )
+        period_elapsed = now - self.last_tracking_log_time >= self.tracking_log_period
+
+        if distance_changed or center_changed or period_elapsed:
+            self.last_tracking_log_time = now
+            self.last_logged_distance = distance
+            self.last_logged_center = center_coords
+            return True
+
+        return False
 
     def image_callback(self, msg):
         if self.camera_info_received:
@@ -260,7 +291,6 @@ class SAMNode(Node):
                     if 0.8 * distance > self.offset + self.offset_delta:
                         #scale = (distance - self.offset) / distance
                         scale = 0.8
-                        self.get_logger().info(f'Average segmentation time is {(self.total_seg_time/self.segmentations)}')
                     else:
                         scale = 0.8
                         self.target_reached = True
@@ -270,10 +300,13 @@ class SAMNode(Node):
                     goal_x = robot_x + dx * scale
                     goal_y = robot_y + dy * scale
 
-                    self.get_logger().info(f'Объект в map frame: X={point_world.point.x:.2f}, Y={point_world.point.y:.2f}, Z={point_world.point.z:.2f}')
-                    self.get_logger().info(f'Расстояние до цели distance = {distance:.2f}, offset = {self.offset:.2f} +- {self.offset_delta:.2f}')
-
-                    self.goal_pose = PoseStamped()
+                    if self.should_log_tracking_update(distance, center_coords):
+                        self.get_logger().info(
+                            f'CLIP tracking: center=({center_coords[0]}, {center_coords[1]}), '
+                            f'avg_seg={self.total_seg_time/self.segmentations:.3f}s, '
+                            f'map=({point_world.point.x:.2f}, {point_world.point.y:.2f}, {point_world.point.z:.2f}), '
+                            f'distance={distance:.2f}m'
+                        )
 
                     goal = PoseStamped()
                     
@@ -292,10 +325,14 @@ class SAMNode(Node):
                     goal.pose.position.y = goal_y
 
                     goal.pose.orientation = yaw_to_quaternion(theta)
-
                     self.goal_pose = goal
     
                     self.pose_pub.publish(goal)
+                    if self.should_log_tracking_update(distance, center_coords):
+                        self.get_logger().info(
+                            f'Updated nav goal: x={goal.pose.position.x:.2f}, '
+                            f'y={goal.pose.position.y:.2f}, yaw={theta:.2f}rad'
+                        )
                 except Exception as e:
                     self.get_logger().error(f'Ошибка трансформации в map: {e}')
 

@@ -1,6 +1,7 @@
 import torch
 from torch.nn.functional import interpolate
 from transformers import CLIPSegProcessor, CLIPSegForImageSegmentation
+from transformers.utils import logging as transformers_logging
 import numpy as np
 import cv2
 
@@ -10,6 +11,7 @@ import time
 
 class CLIPSegmentor:
     def __init__(self):
+        transformers_logging.set_verbosity_error()
         self.model = CLIPSegForImageSegmentation.from_pretrained("CIDAS/clipseg-rd64-refined")
         self.processor = CLIPSegProcessor.from_pretrained("CIDAS/clipseg-rd64-refined")
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
