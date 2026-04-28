@@ -4,14 +4,10 @@ import numpy as np
 from ament_index_python.packages import get_package_share_directory
 import cv2
 from segment_anything import sam_model_registry, SamPredictor
-from groundingdino.util.inference import load_model, predict
-
-import requests
 from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
 
 from PIL import Image as PILImage
 
-import tf2_ros
 import tf2_geometry_msgs
 from geometry_msgs.msg import Point, PoseStamped
 
@@ -24,6 +20,7 @@ class SAMSegmentor:
     def __init__(self, hfov=70, vfov=40):
         self.HFOV = hfov
         self.VFOV = vfov
+        self.dino_device, self.sam_device = self._select_devices()
 
         share_dir = get_package_share_directory('object_tracking')
         checkpoint_path_SAM = os.path.join(share_dir, 'model_weights', 'sam_vit_h_4b8939.pth')
@@ -35,10 +32,26 @@ class SAMSegmentor:
                                     f"and place it in:\n  object_tracking/models/")
 
         # SAM + DINO
-        self.sam = sam_model_registry["vit_h"](checkpoint=checkpoint_path_SAM).to("cuda")
+        self.sam = sam_model_registry["vit_h"](checkpoint=checkpoint_path_SAM).to(self.sam_device)
+        self.sam.eval()
         self.predictor = SamPredictor(self.sam)
         self.dino_processor = AutoProcessor.from_pretrained("IDEA-Research/grounding-dino-tiny")
-        self.dino_model = AutoModelForZeroShotObjectDetection.from_pretrained("IDEA-Research/grounding-dino-tiny").to("cuda")
+        self.dino_model = AutoModelForZeroShotObjectDetection.from_pretrained("IDEA-Research/grounding-dino-tiny").to(self.dino_device)
+        self.dino_model.eval()
+
+    def _select_devices(self):
+        if not torch.cuda.is_available():
+            return "cpu", "cpu"
+
+        total_memory_gib = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+        if total_memory_gib < 8.0:
+            print(
+                f"CUDA device has only {total_memory_gib:.2f} GiB VRAM. "
+                "Using GroundingDINO on CPU and keeping SAM on CUDA to fit memory."
+            )
+            return "cpu", "cuda"
+
+        return "cuda", "cuda"
 
     def segment(self, image_bgr, prompt, depth_map):
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
@@ -47,8 +60,8 @@ class SAMSegmentor:
 
         start_time_DINO = time.time()
 
-        inputs = self.dino_processor(images=image_pil, text=text_labels, return_tensors="pt").to("cuda")
-        with torch.no_grad():
+        inputs = self.dino_processor(images=image_pil, text=text_labels, return_tensors="pt").to(self.dino_device)
+        with torch.inference_mode():
             outputs = self.dino_model(**inputs)
 
         print("received outputs from DINO")
@@ -56,7 +69,7 @@ class SAMSegmentor:
         results = self.dino_processor.post_process_grounded_object_detection(
             outputs,
             inputs.input_ids,
-            box_threshold=0.4,
+            threshold=0.4,
             text_threshold=0.3,
             target_sizes=[image_pil.size[::-1]]
         )
@@ -92,14 +105,53 @@ class SAMSegmentor:
 
         start_time_SAM = time.time()
 
-        input_boxes = self.predictor.transform.apply_boxes_torch(torch.tensor(input_box), image_bgr.shape[:2]).numpy()
-        self.predictor.set_image(image_rgb)
-        masks, _, _ = self.predictor.predict_torch(
-            point_coords=None,
-            point_labels=None,
-            boxes=torch.tensor(input_boxes).to("cuda"),
-            multimask_output=False,
-        )
+        if self.sam_device == "cuda":
+            torch.cuda.empty_cache()
+
+        if self.dino_device == "cuda" and self.sam_device != "cuda":
+            # Free as much VRAM as possible before the CPU SAM pass.
+            del outputs
+            torch.cuda.empty_cache()
+
+        try:
+            input_boxes = self.predictor.transform.apply_boxes_torch(torch.tensor(input_box), image_bgr.shape[:2]).numpy()
+            if self.sam_device == "cuda":
+                with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.float16):
+                    self.predictor.set_image(image_rgb)
+                    masks, _, _ = self.predictor.predict_torch(
+                        point_coords=None,
+                        point_labels=None,
+                        boxes=torch.tensor(input_boxes).to(self.sam_device),
+                        multimask_output=False,
+                    )
+            else:
+                self.predictor.set_image(image_rgb)
+                with torch.inference_mode():
+                    masks, _, _ = self.predictor.predict_torch(
+                        point_coords=None,
+                        point_labels=None,
+                        boxes=torch.tensor(input_boxes).to(self.sam_device),
+                        multimask_output=False,
+                    )
+        except torch.OutOfMemoryError:
+            if self.sam_device != "cuda":
+                raise
+
+            print("CUDA OOM during SAM inference, switching SAM to CPU and retrying.")
+            self.sam_device = "cpu"
+            self.sam = self.sam.to(self.sam_device)
+            self.predictor = SamPredictor(self.sam)
+            torch.cuda.empty_cache()
+
+            input_boxes = self.predictor.transform.apply_boxes_torch(torch.tensor(input_box), image_bgr.shape[:2]).numpy()
+            self.predictor.set_image(image_rgb)
+            with torch.inference_mode():
+                masks, _, _ = self.predictor.predict_torch(
+                    point_coords=None,
+                    point_labels=None,
+                    boxes=torch.tensor(input_boxes).to(self.sam_device),
+                    multimask_output=False,
+                )
 
         end_time_SAM = time.time()
 
@@ -112,7 +164,7 @@ class SAMSegmentor:
         mask = masks[0][0].cpu().numpy()
         ys, xs = np.where(mask)
         if xs.size == 0 or ys.size == 0:
-            return image_bgr, None, depth_map
+            return image_bgr, None, depth_map, DINO_time + SAM_time
 
         center_coords = self.get_center_coordinates(mask)
 

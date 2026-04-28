@@ -2,12 +2,9 @@ import rclpy
 from std_msgs.msg import String
 from rclpy.node import Node
 from rclpy.duration import Duration
-from sensor_msgs.msg import Image, CameraInfo 
+from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import Point, PoseStamped, Twist
 from cv_bridge import CvBridge, CvBridgeError
-from object_tracking.image_segmentation import SAMSegmentor
-from object_tracking.clip_image_segmentation import CLIPSegmentor
-from message_filters import ApproximateTimeSynchronizer, Subscriber
 import numpy as np
 import time
 
@@ -30,9 +27,11 @@ class SAMNode(Node):
 
         self.bridge = CvBridge()
         if self.SAM:
+            from object_tracking.image_segmentation import SAMSegmentor
             self.segmentor = SAMSegmentor()
             self.goal_position = None
         else:
+            from object_tracking.clip_image_segmentation import CLIPSegmentor
             self.segmentor = CLIPSegmentor()
 
         self.current_prompt = None
@@ -305,3 +304,7 @@ def main(args=None):
     node = SAMNode()
     rclpy.spin(node)
     rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

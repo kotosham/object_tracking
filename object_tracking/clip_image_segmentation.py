@@ -1,10 +1,8 @@
 import torch
 from torch.nn.functional import interpolate
-from transformers import CLIPProcessor, CLIPModel, CLIPSegProcessor, CLIPSegForImageSegmentation
+from transformers import CLIPSegProcessor, CLIPSegForImageSegmentation
 import numpy as np
 import cv2
-from PIL import Image
-import matplotlib.pyplot as plt
 
 from PIL import Image as PILImage
 
@@ -50,11 +48,10 @@ class CLIPSegmentor:
         end_time = time.time()
 
         mask_area = np.sum(mask)
+        segmentation_time = end_time - start_time
         if mask_area < min_mask_area and mask_area > 0:
             print(f"Object ignored due to small area: {mask_area} pixels")
-            return image, None, end_time, depth_map
-
-        segmentation_time = end_time - start_time
+            return image, None, segmentation_time, depth_map
 
         center_coords = self.get_center_coordinates(mask)
 

@@ -1,1 +1,3 @@
 object_tracking/model_weights/*
+__pycache__/
+*.py[cod]
