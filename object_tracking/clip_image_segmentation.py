@@ -20,9 +20,9 @@ class CLIPSegmentor:
     def segment(self, image, prompt, depth_map, threshold = 0.85, min_mask_area = 200) -> np.ndarray:
         """
         Use CLIPSeg to generate a segmentation mask for the object described by prompt.
+
         Returns a binary mask (numpy array) of the same size as the image.
         """
-
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         image_pil = PILImage.fromarray(image_rgb)
 
