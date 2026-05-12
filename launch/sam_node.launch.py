@@ -31,6 +31,8 @@ def launch_setup(context, *args, **kwargs):
         '-p',
         f"use_sam:={LaunchConfiguration('use_sam').perform(context)}",
         '-p',
+        f"model_mode:={LaunchConfiguration('model_mode').perform(context)}",
+        '-p',
         f"search_angular_speed:={LaunchConfiguration('search_angular_speed').perform(context)}",
         '-r',
         f"/image_in:={LaunchConfiguration('image_topic').perform(context)}",
@@ -71,8 +73,13 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'use_sam',
-            default_value='true',
-            description='Use GroundingDINO + SAM if true, otherwise use CLIPSeg.',
+            default_value='false',
+            description='Legacy switch. Used only when model_mode:=auto.',
+        ),
+        DeclareLaunchArgument(
+            'model_mode',
+            default_value='auto',
+            description='Segmentation backend: auto, clip, dino_mobilesam, or yoloe.',
         ),
         DeclareLaunchArgument(
             'search_angular_speed',

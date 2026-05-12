@@ -12,7 +12,11 @@ setup(
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
         ('share/' + package_name + '/launch', glob('launch/*.launch.py')),
-        ('share/' + package_name + '/model_weights', glob('object_tracking/model_weights/*.pth')),
+        (
+            'share/' + package_name + '/model_weights',
+            glob('object_tracking/model_weights/*.pt')
+            + glob('object_tracking/model_weights/*.ts')
+        ),
     ],
     install_requires=['setuptools'],
     zip_safe=True,

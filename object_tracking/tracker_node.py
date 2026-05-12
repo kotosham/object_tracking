@@ -23,16 +23,26 @@ class SAMNode(Node):
         self.target_found = False
         
         self.declare_parameter("use_sam", False)
+        self.declare_parameter("model_mode", "auto")
         self.SAM = self.get_parameter("use_sam").get_parameter_value().bool_value
+        requested_mode = self.get_parameter("model_mode").get_parameter_value().string_value.strip().lower()
 
         self.bridge = CvBridge()
-        if self.SAM:
-            from object_tracking.image_segmentation import SAMSegmentor
-            self.segmentor = SAMSegmentor()
+        self.model_mode = self._resolve_model_mode(requested_mode, self.SAM)
+        self.model_label = self._get_model_label(self.model_mode)
+
+        if self.model_mode == "dino_mobilesam":
+            from object_tracking.dino_mobilesam_image_segmentation import GroundingDINOMobileSAMSegmentor
+            self.segmentor = GroundingDINOMobileSAMSegmentor()
             self.goal_position = None
+        elif self.model_mode == "yoloe":
+            from object_tracking.yoloe_image_segmentation import YOLOESegmentor
+            self.segmentor = YOLOESegmentor()
         else:
             from object_tracking.clip_image_segmentation import CLIPSegmentor
             self.segmentor = CLIPSegmentor()
+
+        self.get_logger().info(f'Using segmentation backend: {self.model_label}')
 
         self.current_prompt = None
         self.current_pose = None
@@ -73,10 +83,32 @@ class SAMNode(Node):
 
         self.latest_depth = None
 
+    def _resolve_model_mode(self, requested_mode, use_sam):
+        if requested_mode in ("", "auto"):
+            return "dino_mobilesam" if use_sam else "clip"
+
+        valid_modes = {"clip", "dino_mobilesam", "yoloe"}
+        if requested_mode not in valid_modes:
+            self.get_logger().warn(
+                f'Unknown model_mode "{requested_mode}", falling back to '
+                f'{"dino_mobilesam" if use_sam else "clip"}.'
+            )
+            return "dino_mobilesam" if use_sam else "clip"
+
+        return requested_mode
+
+    def _get_model_label(self, model_mode):
+        labels = {
+            "clip": "CLIPSeg",
+            "dino_mobilesam": "GroundingDINO + MobileSAM",
+            "yoloe": "YOLOE",
+        }
+        return labels.get(model_mode, model_mode)
+
     def timer_callback(self):
         msg = Twist()
         if not self.target_found and not self.target_reached and not (self.current_prompt is None):
-            if self.SAM:
+            if self.model_mode == "dino_mobilesam":
                 return
             msg.angular.z = self.search_angular_speed
             self.search_cmd_pub.publish(msg)
@@ -140,7 +172,7 @@ class SAMNode(Node):
             if self.current_prompt is None:
                 return
             
-            if self.SAM:
+            if self.model_mode == "dino_mobilesam":
                 if not self.target_found:
                     if self.latest_depth is None:
                         return
@@ -201,7 +233,10 @@ class SAMNode(Node):
                                 self.pose_pub.publish(goal_point)
                                 image_depth_map = None
                                 self.target_found = True
-                                self.get_logger().info(f"Average GroundingDINO + SAM segmentation time is {(self.total_seg_time/self.segmentations)}")
+                                self.get_logger().info(
+                                    f"Average {self.model_label} segmentation time is "
+                                    f"{(self.total_seg_time/self.segmentations)}"
+                                )
                         except Exception as e:
                             self.get_logger().error(f'Ошибка трансформации в map: {e}')
                 return
@@ -302,7 +337,7 @@ class SAMNode(Node):
 
                     if self.should_log_tracking_update(distance, center_coords):
                         self.get_logger().info(
-                            f'CLIP tracking: center=({center_coords[0]}, {center_coords[1]}), '
+                            f'{self.model_label} tracking: center=({center_coords[0]}, {center_coords[1]}), '
                             f'avg_seg={self.total_seg_time/self.segmentations:.3f}s, '
                             f'map=({point_world.point.x:.2f}, {point_world.point.y:.2f}, {point_world.point.z:.2f}), '
                             f'distance={distance:.2f}m'

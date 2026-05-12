@@ -3,8 +3,8 @@ import os
 import numpy as np
 from ament_index_python.packages import get_package_share_directory
 import cv2
-from segment_anything import sam_model_registry, SamPredictor
 from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
+from mobile_sam import sam_model_registry, SamPredictor
 
 from PIL import Image as PILImage
 
@@ -16,23 +16,24 @@ from geometry_msgs.msg import Quaternion
 
 import time
 
-class SAMSegmentor:
+class GroundingDINOMobileSAMSegmentor:
     def __init__(self, hfov=70, vfov=40):
         self.HFOV = hfov
         self.VFOV = vfov
         self.dino_device, self.sam_device = self._select_devices()
 
         share_dir = get_package_share_directory('object_tracking')
-        checkpoint_path_SAM = os.path.join(share_dir, 'model_weights', 'sam_vit_h_4b8939.pth')
+        checkpoint_path_SAM = os.path.join(share_dir, 'model_weights', 'mobile_sam.pt')
 
         if not os.path.isfile(checkpoint_path_SAM):
-            raise FileNotFoundError(f"\n[ERROR] SAM checkpoint not found at:\n  {checkpoint_path_SAM}\n\n"
-                                    f"Please download it from:\n"
-                                    f"  https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth\n"
-                                    f"and place it in:\n  object_tracking/models/")
+            raise FileNotFoundError(
+                f"\n[ERROR] MobileSAM checkpoint not found at:\n  {checkpoint_path_SAM}\n\n"
+                f"Please download `mobile_sam.pt` from the official MobileSAM repository\n"
+                f"and place it in:\n  {os.path.join(share_dir, 'model_weights')}\n"
+            )
 
-        # SAM + DINO
-        self.sam = sam_model_registry["vit_h"](checkpoint=checkpoint_path_SAM).to(self.sam_device)
+        # MobileSAM + DINO
+        self.sam = sam_model_registry["vit_t"](checkpoint=checkpoint_path_SAM).to(self.sam_device)
         self.sam.eval()
         self.predictor = SamPredictor(self.sam)
         self.dino_processor = AutoProcessor.from_pretrained("IDEA-Research/grounding-dino-tiny")
@@ -43,10 +44,15 @@ class SAMSegmentor:
         if not torch.cuda.is_available():
             return "cpu", "cpu"
 
-        total_memory_gib = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-        if total_memory_gib < 8.0:
+        total_memory_bytes = torch.cuda.get_device_properties(0).total_memory
+        total_memory_gib = total_memory_bytes / (1024 ** 3)
+        total_memory_gb = total_memory_bytes / 1e9
+
+        # Use decimal GB here so nominal 6 GB GPUs are treated as 6 GB class
+        # devices instead of being penalized by the GiB/GB conversion.
+        if total_memory_gb < 6.0:
             print(
-                f"CUDA device has only {total_memory_gib:.2f} GiB VRAM. "
+                f"CUDA device has only {total_memory_gib:.2f} GiB ({total_memory_gb:.2f} GB) VRAM. "
                 "Using GroundingDINO on CPU and keeping SAM on CUDA to fit memory."
             )
             return "cpu", "cuda"
