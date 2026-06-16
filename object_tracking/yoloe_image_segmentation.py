@@ -34,6 +34,15 @@ class YOLOESegmentor:
         self.model = YOLOE(self.model_path)
         self.imgsz = imgsz
         self.current_prompt = None
+        self.last_detection_score = None
+        self.last_mask = None
+
+    def runtime_info(self):
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0)
+            total_memory_gib = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+            return f"YOLOE device={self.device}, CUDA device={gpu_name} ({total_memory_gib:.2f} GiB VRAM)"
+        return f"YOLOE device={self.device}, CUDA unavailable"
 
     def _get_weights_dir(self):
         try:
@@ -69,6 +78,8 @@ class YOLOESegmentor:
         self.current_prompt = prompt
 
     def segment(self, image, prompt, depth_map, conf=0.25, min_mask_area=200):
+        self.last_detection_score = None
+        self.last_mask = None
         """
         Run YOLOE text-prompted detection and segmentation on the whole image.
 
@@ -110,6 +121,8 @@ class YOLOESegmentor:
             return image, None, segmentation_time, depth_map
 
         center_coords = self.get_center_coordinates(mask)
+        self.last_detection_score = float(boxes_conf[best_idx])
+        self.last_mask = mask.astype(np.uint8)
 
         image_out = image.copy()
         image_out[mask > 0] = (0, 255, 0)

@@ -20,7 +20,11 @@ class GroundingDINOMobileSAMSegmentor:
     def __init__(self, hfov=70, vfov=40):
         self.HFOV = hfov
         self.VFOV = vfov
+        self.dino_model_id = "IDEA-Research/grounding-dino-tiny"
         self.dino_device, self.sam_device = self._select_devices()
+        self.last_detection_score = None
+        self.last_detection_label = None
+        self.last_mask = None
 
         share_dir = get_package_share_directory('object_tracking')
         checkpoint_path_SAM = os.path.join(share_dir, 'model_weights', 'mobile_sam.pt')
@@ -36,9 +40,36 @@ class GroundingDINOMobileSAMSegmentor:
         self.sam = sam_model_registry["vit_t"](checkpoint=checkpoint_path_SAM).to(self.sam_device)
         self.sam.eval()
         self.predictor = SamPredictor(self.sam)
-        self.dino_processor = AutoProcessor.from_pretrained("IDEA-Research/grounding-dino-tiny")
-        self.dino_model = AutoModelForZeroShotObjectDetection.from_pretrained("IDEA-Research/grounding-dino-tiny").to(self.dino_device)
+        self.dino_model_source = self._resolve_dino_model_source(share_dir)
+        dino_load_kwargs = {}
+        if os.path.isdir(self.dino_model_source):
+            dino_load_kwargs["local_files_only"] = True
+            print(f"Using local GroundingDINO weights from: {self.dino_model_source}")
+        else:
+            print(
+                f"Local GroundingDINO snapshot not found. Falling back to Hugging Face model id: "
+                f"{self.dino_model_source}"
+            )
+        self.dino_processor = AutoProcessor.from_pretrained(self.dino_model_source, **dino_load_kwargs)
+        self.dino_model = AutoModelForZeroShotObjectDetection.from_pretrained(
+            self.dino_model_source,
+            **dino_load_kwargs,
+        ).to(self.dino_device)
         self.dino_model.eval()
+
+    def runtime_info(self):
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0)
+            total_memory_gib = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+            return (
+                f"GroundingDINO device={self.dino_device}, "
+                f"MobileSAM device={self.sam_device}, "
+                f"CUDA device={gpu_name} ({total_memory_gib:.2f} GiB VRAM)"
+            )
+        return (
+            f"GroundingDINO device={self.dino_device}, "
+            f"MobileSAM device={self.sam_device}, CUDA unavailable"
+        )
 
     def _select_devices(self):
         if not torch.cuda.is_available():
@@ -59,7 +90,64 @@ class GroundingDINOMobileSAMSegmentor:
 
         return "cuda", "cuda"
 
+    def _resolve_dino_model_source(self, share_dir):
+        candidates = []
+
+        env_model_dir = os.environ.get("GROUNDING_DINO_MODEL_DIR", "").strip()
+        if env_model_dir:
+            candidates.append(os.path.expanduser(env_model_dir))
+
+        candidates.append(os.path.join(share_dir, "model_weights", "grounding-dino-tiny"))
+
+        hf_snapshot_dir = self._find_local_hf_snapshot_dir()
+        if hf_snapshot_dir:
+            candidates.append(hf_snapshot_dir)
+
+        for candidate in candidates:
+            if self._is_valid_dino_dir(candidate):
+                return candidate
+
+        return self.dino_model_id
+
+    def _find_local_hf_snapshot_dir(self):
+        hf_home = os.path.expanduser(os.environ.get("HF_HOME", "~/.cache/huggingface"))
+        snapshots_root = os.path.join(
+            hf_home,
+            "hub",
+            "models--IDEA-Research--grounding-dino-tiny",
+            "snapshots",
+        )
+        if not os.path.isdir(snapshots_root):
+            return None
+
+        snapshot_dirs = [
+            os.path.join(snapshots_root, name)
+            for name in os.listdir(snapshots_root)
+            if os.path.isdir(os.path.join(snapshots_root, name))
+        ]
+        if not snapshot_dirs:
+            return None
+
+        snapshot_dirs.sort(key=os.path.getmtime, reverse=True)
+        for snapshot_dir in snapshot_dirs:
+            if self._is_valid_dino_dir(snapshot_dir):
+                return snapshot_dir
+        return None
+
+    @staticmethod
+    def _is_valid_dino_dir(path):
+        required_files = (
+            "config.json",
+            "model.safetensors",
+            "preprocessor_config.json",
+            "tokenizer.json",
+        )
+        return os.path.isdir(path) and all(os.path.isfile(os.path.join(path, name)) for name in required_files)
+
     def segment(self, image_bgr, prompt, depth_map):
+        self.last_detection_score = None
+        self.last_detection_label = None
+        self.last_mask = None
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
         image_pil = PILImage.fromarray(image_rgb)
         text_labels = [[prompt]]
@@ -75,8 +163,8 @@ class GroundingDINOMobileSAMSegmentor:
         results = self.dino_processor.post_process_grounded_object_detection(
             outputs,
             inputs.input_ids,
-            threshold=0.4,
-            text_threshold=0.3,
+            threshold=0.3,
+            text_threshold=0.25,
             target_sizes=[image_pil.size[::-1]]
         )
 
@@ -91,7 +179,7 @@ class GroundingDINOMobileSAMSegmentor:
         result = results[0]
 
         # Фильтрация по порогу
-        box_threshold = 0.75
+        box_threshold = 0.55
         filtered = [
             (box.cpu().numpy(), score.item(), label)
             for box, score, label in zip(result["boxes"], result["scores"], result["labels"])
@@ -105,6 +193,8 @@ class GroundingDINOMobileSAMSegmentor:
         # Выбери самый уверенный бокс
         box, score, label = sorted(filtered, key=lambda x: -x[1])[0]
         input_box = np.array([box])
+        self.last_detection_score = float(score)
+        self.last_detection_label = str(label)
         print(f"Найден объект: {label} (score={score:.2f})")
 
         print("Received bounding boxes")
@@ -167,12 +257,13 @@ class GroundingDINOMobileSAMSegmentor:
 
         print("masks acquired")
 
-        mask = masks[0][0].cpu().numpy()
+        mask = masks[0][0].cpu().numpy() > 0.5
         ys, xs = np.where(mask)
         if xs.size == 0 or ys.size == 0:
             return image_bgr, None, depth_map, DINO_time + SAM_time
 
         center_coords = self.get_center_coordinates(mask)
+        self.last_mask = mask.astype(np.uint8)
 
         image_out = image_bgr.copy()
         image_out[mask > 0] = (0, 255, 0)

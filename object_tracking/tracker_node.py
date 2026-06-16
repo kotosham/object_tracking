@@ -43,6 +43,8 @@ class SAMNode(Node):
             self.segmentor = CLIPSegmentor()
 
         self.get_logger().info(f'Using segmentation backend: {self.model_label}')
+        if hasattr(self.segmentor, 'runtime_info'):
+            self.get_logger().info(f'Inference runtime: {self.segmentor.runtime_info()}')
 
         self.current_prompt = None
         self.current_pose = None
@@ -55,6 +57,7 @@ class SAMNode(Node):
         self.last_logged_center = None
         self.tracking_log_period = 1.0
         self.tracking_distance_delta = 0.2
+        self.depth_scale_logged = False
 
         self.depth_sub = self.create_subscription(Image, 
                                                   '/depth_camera/depth/image_raw', 
@@ -134,7 +137,17 @@ class SAMNode(Node):
 
     def depth_callback(self, msg):
         try:
-            self.latest_depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
+            depth_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
+
+            # RealSense aligned depth is commonly published as 16UC1 in millimeters.
+            # Convert once here so the rest of the tracker consistently works in meters.
+            if msg.encoding == '16UC1' or depth_image.dtype == np.uint16:
+                self.latest_depth = depth_image.astype(np.float32) / 1000.0
+                if not self.depth_scale_logged:
+                    self.get_logger().info('Depth stream detected as 16UC1, converting millimeters to meters.')
+                    self.depth_scale_logged = True
+            else:
+                self.latest_depth = depth_image.astype(np.float32, copy=False)
         except CvBridgeError as e:
             self.get_logger().error(f'Ошибка конвертации depth изображения: {e}')
 

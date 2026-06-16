@@ -27,7 +27,8 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'tracker_node = object_tracking.tracker_node:main'
+            'tracker_node = object_tracking.tracker_node:main',
+            'rgb_tracker_node = object_tracking.rgb_tracker_node:main',
         ],
     },
 )
