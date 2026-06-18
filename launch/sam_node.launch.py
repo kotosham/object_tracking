@@ -1,5 +1,7 @@
 import os
+import sys
 
+from ament_index_python.packages import get_package_prefix
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, ExecuteProcess, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
@@ -22,6 +24,16 @@ def launch_setup(context, *args, **kwargs):
     env.setdefault('HF_HUB_DISABLE_PROGRESS_BARS', '1')
     env.setdefault('TRANSFORMERS_VERBOSITY', 'error')
     env['PYTHONUNBUFFERED'] = '1'
+    package_prefix = get_package_prefix('object_tracking')
+    package_site_packages = os.path.join(
+        package_prefix,
+        'lib',
+        f'python{sys.version_info.major}.{sys.version_info.minor}',
+        'site-packages',
+    )
+    env['PYTHONPATH'] = os.pathsep.join(
+        path for path in [package_site_packages, env.get('PYTHONPATH', '')] if path
+    )
 
     cmd = [
         venv_python,
@@ -36,6 +48,8 @@ def launch_setup(context, *args, **kwargs):
         f"search_angular_speed:={LaunchConfiguration('search_angular_speed').perform(context)}",
         '-p',
         f"use_compressed_input:={LaunchConfiguration('use_compressed_input').perform(context)}",
+        '-p',
+        f"input_reliability:={LaunchConfiguration('input_reliability').perform(context)}",
         '-p',
         f"goal_locked_topic:={LaunchConfiguration('goal_locked_topic').perform(context)}",
         '-p',
@@ -54,6 +68,10 @@ def launch_setup(context, *args, **kwargs):
         f"depth_match_tolerance:={LaunchConfiguration('depth_match_tolerance').perform(context)}",
         '-p',
         f"target_publish_rate:={LaunchConfiguration('target_publish_rate').perform(context)}",
+        '-p',
+        f"continuous_frame_max_age:={LaunchConfiguration('continuous_frame_max_age').perform(context)}",
+        '-p',
+        f"publish_mask_in_continuous:={LaunchConfiguration('publish_mask_in_continuous').perform(context)}",
         '-r',
         f"/image_in:={LaunchConfiguration('image_topic').perform(context)}",
         '-r',
@@ -108,6 +126,11 @@ def generate_launch_description():
             'use_compressed_input',
             default_value='true',
             description='Subscribe to sensor_msgs/CompressedImage instead of raw Image.',
+        ),
+        DeclareLaunchArgument(
+            'input_reliability',
+            default_value='best_effort',
+            description='QoS reliability used for incoming RGB/depth subscriptions: best_effort or reliable.',
         ),
         DeclareLaunchArgument(
             'image_topic',
@@ -168,6 +191,16 @@ def generate_launch_description():
             'target_publish_rate',
             default_value='3.0',
             description='Maximum rate in Hz for publishing /target_pixel and /target_mask in continuous mode. Set <=0 for no limit.',
+        ),
+        DeclareLaunchArgument(
+            'continuous_frame_max_age',
+            default_value='2.0',
+            description='Drop a cached frame in continuous mode if it sat unprocessed longer than this many seconds. Set <=0 to disable.',
+        ),
+        DeclareLaunchArgument(
+            'publish_mask_in_continuous',
+            default_value='false',
+            description='Whether to publish /target_mask alongside /target_pixel in continuous mode.',
         ),
         DeclareLaunchArgument(
             'enable_search_rotation',
