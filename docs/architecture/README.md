@@ -17,7 +17,7 @@
 
 | Компонент | Пакет (robust) | Роль |
 |---|---|---|
-| **Planner Orchestrator** | `planner_orchestrator` (NEW) | async-клиент к Qwen3-VL-30B-A3B (OpenAI-совместимый vLLM API): single-in-flight, UUID-идемпотентность, timeout по измеренному p99, circuit-breaker, **structured/enum tool-call** (VLM выбирает только `frontier_id`/`approach_target` из реального списка, координат не порождает), streaming; notes/summary-буфер; anytime/async-реплан с adoption в commit-точке |
+| **Planner Orchestrator** | `planner_orchestrator` (NEW) | лёгкий async **HTTP-клиент к внешнему OpenAI-совместимому VLM API** (Qwen3-VL-30B-A3B; модель **не хостим здесь**, GPU не требует — `base_url`+ключ): single-in-flight, UUID-идемпотентность, timeout по измеренному p99, circuit-breaker, **structured/enum tool-call** (VLM выбирает только `frontier_id`/`approach_target` из реального списка, координат не порождает), streaming; notes/summary-буфер; anytime/async-реплан с adoption в commit-точке |
 | **Open-vocab детектор** | `object_tracking/` (REUSED) | YOLOE (default) + GroundingDINO+MobileSAM (fallback), Set-of-Mark рендер кандидатов; CLIPSeg из грудинга исключён. Отдаёт пиксель/маску по запросу (`DetectTarget.action`) |
 | **SLAM** | RTAB-Map (REUSED) | offline mapping → `.db`; online localization → **low-rate `MapOdomCorrection`** (НЕ TF-поток) для `map_odom_relay` на Pi |
 | **Интерфейсы** | `object_tracking_msgs` (NEW) | `SeekObject.action`, `DetectTarget.action`, `PlanStep.msg`, `Notes.msg`, `Candidate.msg` |
@@ -28,4 +28,4 @@
 - **VLM/детектор никогда не пишут в реактивный путь робота** и не выдают навигационных координат.
 - **Никаких PointCloud2/сырых depth-потоков по Wi-Fi** — приходит один сжатый keyframe по событию; SLAM получает RGB-D и отдаёт компактную коррекцию.
 - **VLM — ненадёжный медленный советник**: при недоступности edge/VLM/Wi-Fi робот бесшовно работает в `flat` (см. деградацию в `MODES.md`).
-- **CUDA-on-WSL2 / VRAM:** FP8-сборка Qwen3-VL-30B-A3B не влезает в 24 ГБ — для sim используйте удалённый OpenAI-совместимый endpoint или 4-битную/меньшую модель (см. поправки в `GAZEBO_WSL_TESTING.md`).
+- **VLM — всегда внешний OpenAI-совместимый API**, не self-hosted на edge: Planner Orchestrator лишь HTTP-клиент (`base_url`), GPU не требует. Edge-GPU обслуживает **только** детектор (YOLOE/DINO+SAM) и SLAM (RTAB-Map). Кто поднял эндпоинт (vLLM/SGLang/облако) — деталь развёртывания (см. `GAZEBO_WSL_TESTING.md`).
