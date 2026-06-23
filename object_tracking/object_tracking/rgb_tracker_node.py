@@ -5,11 +5,11 @@ import cv2
 import numpy as np
 import rclpy
 from cv_bridge import CvBridge, CvBridgeError
-from geometry_msgs.msg import PointStamped, Twist
+from geometry_msgs.msg import PointStamped
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CompressedImage, Image
-from std_msgs.msg import Bool, Float32, String, UInt32
+from std_msgs.msg import Float32, String, UInt32
 
 
 class RGBTrackerNode(Node):
@@ -19,11 +19,11 @@ class RGBTrackerNode(Node):
 
         self.declare_parameter('use_sam', False)
         self.declare_parameter('model_mode', 'auto')
-        self.declare_parameter('search_angular_speed', 0.5)
         self.declare_parameter('use_compressed_input', True)
         self.declare_parameter('input_reliability', 'best_effort')
-        self.declare_parameter('goal_locked_topic', '/target_goal_locked')
-        self.declare_parameter('enable_search_rotation', False)
+        # Phase 2.9: reactive /cmd_vel + goal-lock soup removed. The tracker only
+        # detects and publishes /target_pixel; the Pi executive (SeekObject FSM)
+        # owns ALL motion via Nav2.
         self.declare_parameter('burst_quiet_period', 2.0)
         self.declare_parameter('burst_complete_topic', '/tracker/burst_complete')
         self.declare_parameter('tracking_mode', 'burst')
@@ -40,11 +40,8 @@ class RGBTrackerNode(Node):
 
         use_sam = self.get_parameter('use_sam').get_parameter_value().bool_value
         requested_mode = self.get_parameter('model_mode').get_parameter_value().string_value.strip().lower()
-        self.search_angular_speed = self.get_parameter('search_angular_speed').get_parameter_value().double_value
         self.use_compressed_input = self.get_parameter('use_compressed_input').get_parameter_value().bool_value
         self.input_reliability = self.get_parameter('input_reliability').get_parameter_value().string_value.strip().lower()
-        self.goal_locked_topic = self.get_parameter('goal_locked_topic').get_parameter_value().string_value
-        self.enable_search_rotation = self.get_parameter('enable_search_rotation').get_parameter_value().bool_value
         self.burst_quiet_period = self.get_parameter('burst_quiet_period').get_parameter_value().double_value
         self.burst_complete_topic = self.get_parameter('burst_complete_topic').get_parameter_value().string_value
         self.tracking_mode = self.get_parameter('tracking_mode').get_parameter_value().string_value.strip().lower()
@@ -88,8 +85,8 @@ class RGBTrackerNode(Node):
         if hasattr(self.segmentor, 'runtime_info'):
             self.get_logger().info(f'Inference runtime: {self.segmentor.runtime_info()}')
         self.get_logger().info(
-            f'Search rotation is {"enabled" if self.enable_search_rotation else "disabled"} '
-            f'(cmd_vel search topic remains available).'
+            'Reactive cmd_vel + goal-lock removed (Phase 2.9): tracker detects and '
+            'publishes /target_pixel only; the Pi executive owns motion via Nav2.'
         )
         self.get_logger().info(
             f'Tracking mode: {self.tracking_mode}. '
@@ -99,7 +96,6 @@ class RGBTrackerNode(Node):
 
         self.current_prompt = None
         self.target_found = False
-        self.goal_locked = False
         self.tracking_enabled = False
         self.total_seg_time = 0.0
         self.segmentations = 0
@@ -154,15 +150,6 @@ class RGBTrackerNode(Node):
                 sensor_qos,
             )
         self.prompt_sub = self.create_subscription(String, '/target_prompt', self.prompt_callback, 1)
-        latched_state_qos = QoSProfile(depth=1)
-        latched_state_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
-        latched_state_qos.reliability = ReliabilityPolicy.RELIABLE
-        self.goal_locked_sub = self.create_subscription(
-            Bool,
-            self.goal_locked_topic,
-            self.goal_locked_callback,
-            latched_state_qos,
-        )
         self.burst_complete_sub = self.create_subscription(
             UInt32,
             self.burst_complete_topic,
@@ -170,7 +157,6 @@ class RGBTrackerNode(Node):
             10,
         )
 
-        self.search_cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.image_pub = self.create_publisher(Image, '/image_out', 1)
         self.pixel_pub = self.create_publisher(PointStamped, '/target_pixel', tracking_output_qos)
         self.mask_pub = self.create_publisher(Image, '/target_mask', tracking_output_qos)
@@ -209,7 +195,6 @@ class RGBTrackerNode(Node):
 
         self.current_prompt = msg.data
         self.target_found = False
-        self.goal_locked = False
         self.tracking_enabled = bool(self.current_prompt)
         self.total_seg_time = 0.0
         self.segmentations = 0
@@ -224,27 +209,6 @@ class RGBTrackerNode(Node):
         self.latest_continuous_frame = None
         self._reset_burst_state()
         self.get_logger().info(f'New prompt received: "{self.current_prompt}"')
-
-    def goal_locked_callback(self, msg):
-        was_locked = self.goal_locked
-        self.goal_locked = bool(msg.data)
-        self.tracking_enabled = bool(self.current_prompt) and not self.goal_locked
-        if self.goal_locked and not was_locked:
-            completed_prompt = self.current_prompt
-            self.latest_continuous_frame = None
-            self._reset_burst_state()
-            self.current_prompt = None
-            self.tracking_enabled = False
-            self.target_found = False
-            self.prompt_started_monotonic = 0.0
-            self.last_rgb_frame_received_monotonic = 0.0
-            self.frames_received_for_prompt = 0
-            self.get_logger().info('Goal lock received from Raspberry Pi bridge. Pausing RGB tracking until the next prompt.')
-            if completed_prompt:
-                self.get_logger().info(
-                    f'Completed prompt "{completed_prompt}" and cleared tracker state. '
-                    'Waiting for the next prompt.'
-                )
 
     def burst_complete_callback(self, msg):
         if self.tracking_mode != 'burst':
@@ -271,12 +235,6 @@ class RGBTrackerNode(Node):
         else:
             self._process_latest_continuous_frame()
         self._warn_if_no_rgb_frames_arrived()
-        if not self.enable_search_rotation or self.target_found:
-            return
-
-        msg = Twist()
-        msg.angular.z = self.search_angular_speed
-        self.search_cmd_pub.publish(msg)
 
     def _should_log_tracking_update(self, center_coords):
         now = time.time()
