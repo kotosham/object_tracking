@@ -10,6 +10,7 @@
   <buildtool_depend>ament_python</buildtool_depend>
 
   <depend>rclpy</depend>
+  <depend>fleet_comms</depend>
   <depend>object_tracking_msgs</depend>
   <depend>ar_project_msgs</depend>
   <depend>std_msgs</depend>

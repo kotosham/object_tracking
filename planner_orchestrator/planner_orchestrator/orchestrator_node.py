@@ -12,11 +12,25 @@ The VLM is NEVER on the reactive path. See ar_project/docs/ROADMAP.md Phase 4.
 import rclpy
 from rclpy.node import Node
 
+from fleet_comms.heartbeat import HeartbeatPublisher
+
 
 class PlannerOrchestrator(Node):
+    # Must match the fleet-wide heartbeat period (search_coordinator monitor).
+    HEARTBEAT_PERIOD_S = 0.5
+
     def __init__(self) -> None:
         super().__init__('planner_orchestrator')
-        self.get_logger().info('planner_orchestrator scaffold up (Phase 1.6).')
+
+        # Phase 1.3: edge producer heartbeat. Loss of this beat (or a high
+        # last_latency_ms feeding the p99 circuit-breaker, Phase 4.4) is what
+        # triggers VLM->FLAT degradation (Phase 5.1). set_latency_ms()/
+        # set_status() get called from the VLM client loop in Phase 4.
+        self.heartbeat = HeartbeatPublisher(self, 'planner_orchestrator',
+                                            period_s=self.HEARTBEAT_PERIOD_S)
+
+        self.get_logger().info('planner_orchestrator scaffold up (Phase 1.6) with '
+                               'Phase 1.3 heartbeat publisher.')
 
 
 def main() -> None:
