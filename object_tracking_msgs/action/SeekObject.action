@@ -1,0 +1,22 @@
+# SeekObject: single mission entry point (replaces reliable_prompt_sender).
+# Goal
+string instruction              # natural-language instruction / target
+string request_id               # idempotency UUID
+uint32 mission_epoch            # mission epoch; an instruction change increments it
+bool allow_vlm                  # true = VLM mode, false = force FLAT
+---
+# Result
+uint8 SUCCEEDED=0
+uint8 ABORTED=1
+uint8 PREEMPTED=2
+uint8 DEGRADED_SUCCESS=3
+
+uint8 outcome
+geometry_msgs/PoseStamped final_pose
+string summary                  # final note / outcome
+---
+# Feedback
+string state                    # current FSM state (SEARCH/DETECT/DRIVE/APPROACH/REPLAN/...)
+string active_subtask           # human-readable subtask name
+float32 progress                # 0..1
+uint32 mission_epoch

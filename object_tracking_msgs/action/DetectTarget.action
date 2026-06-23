@@ -1,0 +1,21 @@
+# DetectTarget: on-demand open-vocab detection (service-mode replacement for the
+# continuous tracker).
+# Goal
+string request_id
+uint32 mission_epoch
+string query                    # target description (open-vocab)
+bool render_setofmark
+float32 conf_threshold
+---
+# Result
+uint8 FOUND=0
+uint8 NOT_FOUND=1
+uint8 ABORTED=2
+
+uint8 outcome
+Candidate[] candidates
+sensor_msgs/CompressedImage annotated   # Set-of-Mark render
+---
+# Feedback
+uint32 frames_processed
+float32 best_confidence
