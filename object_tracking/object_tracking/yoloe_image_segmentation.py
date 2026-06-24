@@ -179,7 +179,7 @@ class YOLOESegmentor:
             if masks is not None and i < len(masks):
                 mask = masks[i] > 0.5
                 area = int(np.sum(mask))
-                if 0 < area < min_mask_area:
+                if area < min_mask_area:           # skip below-threshold AND empty masks
                     continue
                 center = self.get_center_coordinates(mask)
                 cx, cy = center if center else ((x1 + x2) // 2, (y1 + y2) // 2)

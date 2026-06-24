@@ -124,6 +124,7 @@ class PlannerOrchestrator(Node):
         self.result_timeout_s = float(g('result_timeout_s'))
         self.min_step_s = float(g('min_step_s'))
         self.detect_timeout_s = float(g('detect_timeout_s'))
+        self.vlm_timeout_s = float(g('vlm_timeout_s'))
         self.camera_frame = g('camera_frame')
         self.async_replan = bool(g('async_replan'))
         self._planner_pool = ThreadPoolExecutor(max_workers=1,
@@ -152,14 +153,17 @@ class PlannerOrchestrator(Node):
         self._frontiers = None
         self._pixel = None
         self._jpeg = None
-        self._candidates = []            # planner_logic.Candidate list (real mark_ids)
-        self._cand_pixels = {}           # mark_id -> geometry_msgs/Point (u,v,depth)
+        # guards the consistency of the (camera jpeg, /target_pixel) snapshot vs the
+        # ROS executor threads that write them (_on_image / _on_pixel)
+        self._lock = threading.Lock()
         self._bridge = CvBridge() if _HAVE_CV else None
         sub = ReentrantCallbackGroup()
         self.create_subscription(FrontierArray, '/frontiers', self._on_frontiers, 1,
                                  callback_group=sub)
-        self.create_subscription(PointStamped, '/target_pixel', self._on_pixel, 1,
-                                 callback_group=sub)
+        # BEST_EFFORT/no-deadline to match the detector/tracker's offered QoS (a
+        # RELIABLE sub would receive nothing from a BEST_EFFORT publisher)
+        self.create_subscription(PointStamped, '/target_pixel', self._on_pixel,
+                                 detection_stream_nodeadline(), callback_group=sub)
         if _HAVE_CV:
             self.create_subscription(Image, '/camera/camera/color/image_raw',
                                      self._on_image, 1, callback_group=sub)
@@ -195,14 +199,16 @@ class PlannerOrchestrator(Node):
         self._frontiers = msg
 
     def _on_pixel(self, msg):
-        self._pixel = msg
+        with self._lock:
+            self._pixel = msg
 
     def _on_image(self, msg):
         try:
             cv = self._bridge.imgmsg_to_cv2(msg, 'bgr8')
             ok, buf = cv2.imencode('.jpg', cv)
             if ok:
-                self._jpeg = buf.tobytes()
+                with self._lock:
+                    self._jpeg = buf.tobytes()
         except Exception as e:
             self.get_logger().warn('image encode failed: %s' % e, throttle_duration_sec=5.0)
 
@@ -214,48 +220,55 @@ class PlannerOrchestrator(Node):
         threading.Thread(target=self._run_mission, args=(target,), daemon=True).start()
 
     # ---- observation ----
+    def _camera_jpeg(self):
+        with self._lock:
+            return self._jpeg
+
     def _observation(self, target, step_index):
-        self._refresh_candidates(target)     # pull real Set-of-Mark candidates from edge
+        """Pull candidates + the matching VLM image together, then build the
+        Observation. Returns (obs, pixels, jpeg) so the plan uses a CONSISTENT
+        (candidate ids, image) pair even while the camera/replan threads run."""
+        cands, pixels, jpeg = self._refresh_candidates(target)
         fr = []
         if self._frontiers is not None:
             for f in self._frontiers.frontiers:
                 fr.append(FrontierOpt(id=int(f.id), distance_m=float(f.distance_m),
                                       score=float(f.score)))
-        return Observation(target=target, candidates=list(self._candidates), frontiers=fr,
-                           notes_facts=self.notes.facts, step_index=step_index)
+        obs = Observation(target=target, candidates=cands, frontiers=fr,
+                          notes_facts=self.notes.facts, step_index=step_index)
+        return obs, pixels, jpeg
 
     def _refresh_candidates(self, target):
-        """Query the edge DetectTarget service for the numbered Set-of-Mark
-        candidates. On success: refresh the planner candidate list, the
-        mark_id->pixel map (for DRIVE_TO_VISIBLE), and adopt the annotated frame
-        as the VLM image. On absence/timeout: fall back to a single /target_pixel
-        candidate so the loop still runs without the detector."""
-        if not self._detect.wait_for_server(timeout_sec=1.0):
-            return self._fallback_candidates(target)
-        g = DetectTarget.Goal()
-        g.request_id = self._goal_id()
-        g.mission_epoch = self._epoch
-        g.query = target
-        g.render_setofmark = True
-        g.conf_threshold = 0.0
-        res = self._call_action(self._detect, g, self.detect_timeout_s)
-        if res is None or not getattr(res, 'candidates', None):
-            return self._fallback_candidates(target)
-        cands, pix = [], {}
-        for c in res.candidates:
-            cands.append(Candidate(mark_id=int(c.mark_id), label=c.label,
-                                   score=float(c.confidence)))
-            pix[int(c.mark_id)] = c.pixel        # Point: x=u, y=v, z=depth_m
-        self._candidates, self._cand_pixels = cands, pix
-        if res.annotated.data:
-            self._jpeg = bytes(res.annotated.data)   # Set-of-Mark frame for the VLM
+        """Query the edge DetectTarget service. Returns (candidates, pixels, jpeg)
+        captured together: jpeg = the annotated Set-of-Mark frame when available,
+        else the latest camera frame -- so the VLM image always matches the candidate
+        ids (and the camera callback can't clobber the annotated frame mid-plan).
+        Falls back to a single /target_pixel candidate when the detector is absent."""
+        if self._detect.wait_for_server(timeout_sec=1.0):
+            g = DetectTarget.Goal()
+            g.request_id = self._goal_id()
+            g.mission_epoch = self._epoch
+            g.query = target
+            g.render_setofmark = True
+            g.conf_threshold = 0.0
+            res = self._call_action(self._detect, g, self.detect_timeout_s)
+            if res is not None and getattr(res, 'candidates', None):
+                cands, pix = [], {}
+                for c in res.candidates:
+                    cands.append(Candidate(mark_id=int(c.mark_id), label=c.label,
+                                           score=float(c.confidence)))
+                    pix[int(c.mark_id)] = c.pixel    # Point: x=u, y=v, z=depth_m
+                jpeg = bytes(res.annotated.data) if res.annotated.data else self._camera_jpeg()
+                return cands, pix, jpeg
+        return self._fallback_candidates(target)
 
     def _fallback_candidates(self, target):
-        if self._pixel is not None:
-            self._candidates = [Candidate(mark_id=1, label=target, score=1.0)]
-            self._cand_pixels = {1: self._pixel.point}
-        else:
-            self._candidates, self._cand_pixels = [], {}
+        with self._lock:
+            px = self._pixel
+            jpeg = self._jpeg
+        if px is not None:
+            return [Candidate(mark_id=1, label=target, score=1.0)], {1: px.point}, jpeg
+        return [], {}, jpeg
 
     def _robot_pose(self):
         try:
@@ -274,9 +287,9 @@ class PlannerOrchestrator(Node):
         Runs either inline (bootstrap) or on the planner pool concurrently with
         execution. Returns a _PlanBundle (actions + the candidate pixel snapshot
         the VLM chose from); empty actions on VLM failure (circuit-breaker fed)."""
-        obs = self._observation(target, step)
-        pixels = dict(self._cand_pixels)     # snapshot so DRIVE_TO_VISIBLE is race-free
-        jpeg = self._jpeg
+        # (obs, pixels, jpeg) captured together -> the plan's DRIVE_TO_VISIBLE pixels
+        # and the VLM image are a consistent pair (race-free vs camera/replan threads).
+        obs, pixels, jpeg = self._observation(target, step)
         # Phase 5.1: pick VLM or the latched FLAT fallback (once the breaker opens).
         client = self._degrade.select(self.client, self._fallback, self.cb.is_open)
         if self._degrade.just_degraded():
@@ -322,6 +335,7 @@ class PlannerOrchestrator(Node):
                         break
                     bundle = self._next_bundle(pending, target, step)
                     pending = None
+                    time.sleep(self.min_step_s)   # rate-limit transient empty-plan retries
                     continue
                 terminate = False
                 for i, action in enumerate(bundle.actions):
@@ -332,6 +346,7 @@ class PlannerOrchestrator(Node):
                         if action.kind == STOP:
                             self._dispatch_stop()
                         self._publish_notes(target)
+                        step += 1            # count the terminal action too
                         terminate = True
                         break
                     # anytime: launch the NEXT replan while this (last-of-batch) action
@@ -360,8 +375,16 @@ class PlannerOrchestrator(Node):
             self.get_logger().info('VLM mission ended after %d steps%s' % (
                 step, ' (DEGRADED: ran in FLAT fallback)' if self._degrade.degraded else ''))
         finally:
+            # Join the in-flight replan BEFORE clearing _busy, so a stale pool worker
+            # can never write this mission's circuit-breaker / degrade-latch / notes
+            # after the NEXT mission has reinitialised them (cancel() is best-effort:
+            # an already-running future ignores it, so we must wait it out).
             if pending is not None:
                 pending.cancel()
+                try:
+                    pending.result(timeout=self.detect_timeout_s + self.vlm_timeout_s + 2.0)
+                except Exception:
+                    pass
             self._busy = False
 
     # ---- dispatch one atomic action to the matching FLAT skill ----

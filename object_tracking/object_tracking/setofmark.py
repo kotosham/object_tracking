@@ -72,6 +72,6 @@ def render_setofmark(image_bgr, marked: Sequence[Detection]):
         cv2.putText(out, tag, (bx - tw // 2, by + th // 2),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         caption = '#%d %s %.2f' % (d.mark_id, d.label, d.confidence)
-        cv2.putText(out, caption, (x1, max(y1 - 8, th + 2)),
+        cv2.putText(out, caption, (max(0, x1), max(y1 - 8, th + 2)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
     return out

@@ -98,10 +98,14 @@ def validate_action(action: Action, obs: Observation) -> Tuple[bool, str]:
         if action.mark_id not in {c.mark_id for c in obs.candidates}:
             return False, 'mark_id %d not in candidates' % action.mark_id
     if action.kind == GO_TO_FRONTIER:
-        if action.frontier_id >= 0 and action.frontier_id not in {f.id for f in obs.frontiers}:
-            return False, 'frontier_id %d not in frontiers' % action.frontier_id
-        if action.frontier_id < 0 and not obs.frontiers:
-            return False, 'GO_TO_FRONTIER but no frontiers exist'
+        if action.frontier_id == -1:                 # -1 = "best after hysteresis"
+            if not obs.frontiers:
+                return False, 'GO_TO_FRONTIER -1 (best) but no frontiers exist'
+        elif action.frontier_id >= 0:
+            if action.frontier_id not in {f.id for f in obs.frontiers}:
+                return False, 'frontier_id %d not in frontiers' % action.frontier_id
+        else:                                        # reject hallucinated -2/-5/...
+            return False, 'frontier_id must be -1 (best) or a listed id, got %d' % action.frontier_id
     return True, 'OK'
 
 

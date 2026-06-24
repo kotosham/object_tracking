@@ -72,6 +72,15 @@ def test_validate_rejects_frontier_when_none_exist():
     assert not ok
 
 
+def test_validate_rejects_invalid_negative_frontier():
+    # -1 means "best"; any other negative is a hallucination and must be rejected
+    obs = Observation(target='x', frontiers=[FrontierOpt(4, 1.0, 1.0)])
+    ok, reason = validate_action(Action(GO_TO_FRONTIER, frontier_id=-2), obs)
+    assert not ok and 'frontier_id must be' in reason
+    ok2, _ = validate_action(Action(GO_TO_FRONTIER, frontier_id=-1), obs)   # best -> ok
+    assert ok2
+
+
 # ---- VLM tool-call build / parse -------------------------------------------
 
 def test_build_options_lists_real_ids():
