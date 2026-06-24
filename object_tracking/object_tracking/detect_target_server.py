@@ -46,6 +46,11 @@ class DetectTargetServer(Node):
         self.declare_parameter('min_mask_area', 200)
         self.declare_parameter('max_marks', 9)           # Set-of-Mark legibility cap
         self.declare_parameter('jpeg_quality', 80)
+        self.declare_parameter('use_depth', True)
+        self.declare_parameter('depth_topic', '/camera/camera/aligned_depth_to_color/image_raw')
+        self.declare_parameter('min_depth_m', 0.1)
+        self.declare_parameter('max_depth_m', 8.0)
+        self.declare_parameter('depth_window', 2)        # +/- px median window
 
         g = lambda n: self.get_parameter(n).value
         self.image_topic = g('image_topic')
@@ -55,10 +60,15 @@ class DetectTargetServer(Node):
         self.min_mask_area = int(g('min_mask_area'))
         self.max_marks = int(g('max_marks'))
         self.jpeg_quality = int(g('jpeg_quality'))
+        self.use_depth = bool(g('use_depth'))
+        self.min_depth_m = float(g('min_depth_m'))
+        self.max_depth_m = float(g('max_depth_m'))
+        self.depth_window = int(g('depth_window'))
 
         self._bridge = CvBridge() if _HAVE_CV else None
         self._frame = None               # latest BGR frame
         self._frame_header = None
+        self._depth = None               # latest depth frame in METERS (float)
         self._lock = threading.Lock()    # single-in-flight detection
 
         self.segmentor = self._load_segmentor()
@@ -72,6 +82,9 @@ class DetectTargetServer(Node):
         msg_type = CompressedImage if self.use_compressed else Image
         self.create_subscription(msg_type, self.image_topic, self._on_image, q,
                                  callback_group=sub_group)
+        if self.use_depth:
+            self.create_subscription(Image, str(g('depth_topic')), self._on_depth, q,
+                                     callback_group=sub_group)
 
         self._srv = ActionServer(
             self, DetectTarget, 'detect_target',
@@ -121,6 +134,36 @@ class DetectTargetServer(Node):
                 self._frame = frame
                 self._frame_header = msg.header
 
+    def _on_depth(self, msg):
+        if not _HAVE_CV:
+            return
+        try:
+            depth = self._bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
+        except Exception as exc:
+            self.get_logger().warn('depth decode failed: %r' % (exc,))
+            return
+        depth = np.asarray(depth)
+        if np.issubdtype(depth.dtype, np.integer):    # 16UC1 in mm -> meters
+            depth = depth.astype(np.float32) / 1000.0
+        else:
+            depth = depth.astype(np.float32)
+        with self._lock:
+            self._depth = depth
+
+    def _sample_depth(self, cx, cy):
+        """Median valid depth (m) in a small window around (cx,cy); 0.0 if none."""
+        depth = self._depth
+        if depth is None:
+            return 0.0
+        h, w = depth.shape[:2]
+        if not (0 <= cy < h and 0 <= cx < w):
+            return 0.0
+        r = max(0, self.depth_window)
+        patch = depth[max(0, cy - r):cy + r + 1, max(0, cx - r):cx + r + 1].ravel()
+        valid = patch[(patch >= self.min_depth_m) & (patch <= self.max_depth_m)
+                      & np.isfinite(patch)]
+        return float(np.median(valid)) if valid.size else 0.0
+
     # ---- DetectTarget goal ----
     def _execute(self, goal_handle):
         req = goal_handle.request
@@ -152,6 +195,9 @@ class DetectTargetServer(Node):
             return result
 
         marked = assign_marks(dets, conf_threshold=conf, max_marks=self.max_marks)
+        if self.use_depth:
+            for d in marked:                       # fill metric depth at each center
+                d.depth_m = self._sample_depth(d.cx, d.cy)
         fb.frames_processed = 1
         fb.best_confidence = float(marked[0].confidence) if marked else 0.0
         goal_handle.publish_feedback(fb)

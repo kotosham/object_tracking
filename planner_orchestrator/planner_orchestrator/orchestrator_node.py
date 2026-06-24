@@ -40,7 +40,10 @@ from tf2_ros import (Buffer, ConnectivityException, ExtrapolationException,
 from ar_project_msgs.action import (ApproachDetection, ExploreFrontier,
                                     GetObservation, GoToPose, Stop)
 from ar_project_msgs.msg import FrontierArray
+from object_tracking_msgs.action import DetectTarget
 from object_tracking_msgs.msg import Notes
+
+from fleet_comms.qos import detection_stream_nodeadline
 
 from fleet_comms.heartbeat import HeartbeatPublisher
 from planner_orchestrator import orchestration as orch
@@ -92,6 +95,11 @@ class PlannerOrchestrator(Node):
         # Floor on per-step wall time so an instant-reached skill can't make the
         # loop hammer the executive (and gives observations time to refresh).
         self.declare_parameter('min_step_s', 0.5)
+        # Phase 3 binding: pull real Set-of-Mark candidates from the edge detector
+        # and feed the chosen mark's pixel to ApproachDetection on DRIVE_TO_VISIBLE.
+        self.declare_parameter('detect_action_name', 'detect_target')
+        self.declare_parameter('detect_timeout_s', 6.0)
+        self.declare_parameter('camera_frame', 'camera_link_optical')
         g = lambda n: self.get_parameter(n).value
         self.replan_n = max(1, int(g('replan_every_n')))
         self.turn_step = float(g('turn_step_rad'))
@@ -104,6 +112,8 @@ class PlannerOrchestrator(Node):
         self.skill_wait_s = float(g('skill_wait_s'))
         self.result_timeout_s = float(g('result_timeout_s'))
         self.min_step_s = float(g('min_step_s'))
+        self.detect_timeout_s = float(g('detect_timeout_s'))
+        self.camera_frame = g('camera_frame')
 
         self.client = make_client(use_mock=bool(g('use_mock')), base_url=g('vlm_base_url'),
                                   api_key=g('vlm_api_key'), model=g('vlm_model'),
@@ -123,6 +133,8 @@ class PlannerOrchestrator(Node):
         self._frontiers = None
         self._pixel = None
         self._jpeg = None
+        self._candidates = []            # planner_logic.Candidate list (real mark_ids)
+        self._cand_pixels = {}           # mark_id -> geometry_msgs/Point (u,v,depth)
         self._bridge = CvBridge() if _HAVE_CV else None
         sub = ReentrantCallbackGroup()
         self.create_subscription(FrontierArray, '/frontiers', self._on_frontiers, 1,
@@ -145,6 +157,12 @@ class PlannerOrchestrator(Node):
             orch.SKILL_GET_OBS: ActionClient(self, GetObservation, 'get_observation', callback_group=cg),
             orch.SKILL_STOP: ActionClient(self, Stop, 'stop', callback_group=cg),
         }
+        self._detect = ActionClient(self, DetectTarget, g('detect_action_name'),
+                                    callback_group=cg)
+        # inject the chosen candidate's pixel for ApproachDetection (matches the
+        # detector's /target_pixel QoS so the executive's subscriber receives it)
+        self._pixel_pub = self.create_publisher(PointStamped, '/target_pixel',
+                                                detection_stream_nodeadline())
         self._tf = Buffer()
         self._tfl = TransformListener(self._tf, self)
         self._busy = False
@@ -178,16 +196,47 @@ class PlannerOrchestrator(Node):
 
     # ---- observation ----
     def _observation(self, target, step_index):
-        cands = []
-        if self._pixel is not None:      # one Set-of-Mark candidate from the live detection
-            cands.append(Candidate(mark_id=0, label=target, score=1.0))
+        self._refresh_candidates(target)     # pull real Set-of-Mark candidates from edge
         fr = []
         if self._frontiers is not None:
             for f in self._frontiers.frontiers:
                 fr.append(FrontierOpt(id=int(f.id), distance_m=float(f.distance_m),
                                       score=float(f.score)))
-        return Observation(target=target, candidates=cands, frontiers=fr,
+        return Observation(target=target, candidates=list(self._candidates), frontiers=fr,
                            notes_facts=self.notes.facts, step_index=step_index)
+
+    def _refresh_candidates(self, target):
+        """Query the edge DetectTarget service for the numbered Set-of-Mark
+        candidates. On success: refresh the planner candidate list, the
+        mark_id->pixel map (for DRIVE_TO_VISIBLE), and adopt the annotated frame
+        as the VLM image. On absence/timeout: fall back to a single /target_pixel
+        candidate so the loop still runs without the detector."""
+        if not self._detect.wait_for_server(timeout_sec=1.0):
+            return self._fallback_candidates(target)
+        g = DetectTarget.Goal()
+        g.request_id = self._goal_id()
+        g.mission_epoch = self._epoch
+        g.query = target
+        g.render_setofmark = True
+        g.conf_threshold = 0.0
+        res = self._call_action(self._detect, g, self.detect_timeout_s)
+        if res is None or not getattr(res, 'candidates', None):
+            return self._fallback_candidates(target)
+        cands, pix = [], {}
+        for c in res.candidates:
+            cands.append(Candidate(mark_id=int(c.mark_id), label=c.label,
+                                   score=float(c.confidence)))
+            pix[int(c.mark_id)] = c.pixel        # Point: x=u, y=v, z=depth_m
+        self._candidates, self._cand_pixels = cands, pix
+        if res.annotated.data:
+            self._jpeg = bytes(res.annotated.data)   # Set-of-Mark frame for the VLM
+
+    def _fallback_candidates(self, target):
+        if self._pixel is not None:
+            self._candidates = [Candidate(mark_id=1, label=target, score=1.0)]
+            self._cand_pixels = {1: self._pixel.point}
+        else:
+            self._candidates, self._cand_pixels = [], {}
 
     def _robot_pose(self):
         try:
@@ -265,7 +314,7 @@ class PlannerOrchestrator(Node):
         if action.kind == GO_TO_FRONTIER:
             return self._send_explore(action.frontier_id)
         if action.kind == DRIVE_TO_VISIBLE:
-            return self._send_approach(action.arg_label)
+            return self._send_approach_mark(action.mark_id, action.arg_label)
         if action.kind == GET_OBSERVATION:
             return self._send_getobs()
         return False
@@ -305,6 +354,52 @@ class PlannerOrchestrator(Node):
         g.approach_offset = self.approach_offset
         g.max_pixel_age_s = 1.5
         return self._send_and_wait(orch.SKILL_APPROACH, g)
+
+    def _send_approach_mark(self, mark_id, label):
+        """DRIVE_TO_VISIBLE(mark_id): inject the chosen candidate's pixel onto
+        /target_pixel (kept fresh by a background republisher so ApproachDetection's
+        freshness gate stays satisfied through the whole drive), then approach."""
+        pt = self._cand_pixels.get(int(mark_id))
+        if pt is None:
+            self.get_logger().warn('DRIVE_TO_VISIBLE: no pixel for mark %s' % mark_id)
+            return False
+        stop = threading.Event()
+
+        def _republish():
+            while not stop.is_set():
+                px = PointStamped()
+                px.header.frame_id = self.camera_frame
+                px.header.stamp = self.get_clock().now().to_msg()
+                px.point.x, px.point.y, px.point.z = float(pt.x), float(pt.y), float(pt.z)
+                self._pixel_pub.publish(px)
+                time.sleep(0.1)
+        pub_thread = threading.Thread(target=_republish, daemon=True)
+        pub_thread.start()
+        try:
+            return self._send_approach(label)
+        finally:
+            stop.set()
+
+    def _call_action(self, ac, goal, timeout_s):
+        """Send a goal and block (worker thread) for its result message; None on
+        non-accept / timeout. Mirrors _send_and_wait but returns the result."""
+        gh_box, gh_evt = {}, threading.Event()
+
+        def _gh_cb(fut):
+            gh_box['gh'] = fut.result()
+            gh_evt.set()
+        ac.send_goal_async(goal).add_done_callback(_gh_cb)
+        if not gh_evt.wait(timeout_s) or gh_box.get('gh') is None or not gh_box['gh'].accepted:
+            return None
+        res_box, res_evt = {}, threading.Event()
+
+        def _res_cb(fut):
+            res_box['res'] = fut.result()
+            res_evt.set()
+        gh_box['gh'].get_result_async().add_done_callback(_res_cb)
+        if not res_evt.wait(timeout_s):
+            return None
+        return getattr(res_box.get('res'), 'result', None)
 
     def _send_getobs(self):
         g = GetObservation.Goal()
