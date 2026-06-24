@@ -1,41 +1,41 @@
-# Robot Object Tracker with Text Prompts and Image Segmentation
+# Отслеживание объектов роботом по текстовым подсказкам и сегментации изображений
 
-This repository contains a ROS 2 node implementation for segmenting camera images from a robot using **GroundingDINO + MobileSAM**, **CLIPSeg**, or **YOLOE**, identifying an object based on a text prompt contraining target object description, and navigating toward it using the **Nav2** stack.
-
----
-
-## Repository Structure
-
-- `tracker_node.py` — the main ROS 2 node that performs segmentation, prompt matching, and navigation.
-- `dino_mobilesam_image_segmentation.py` — a module for object segmentation using GroundingDINO + MobileSAM.
-- `clip_image_segmentation.py` — a module for object segmentation using CLIP.
-- `yoloe_image_segmentation.py` — a module for object segmentation using YOLOE.
+Этот репозиторий содержит реализацию ROS 2-узла для сегментации изображений с камеры робота с помощью **GroundingDINO + MobileSAM**, **CLIPSeg** или **YOLOE**, определения объекта на основе текстовой подсказки (prompt), содержащей описание целевого объекта, и навигации к нему с использованием стека **Nav2**.
 
 ---
 
-## Features
+## Структура репозитория
 
-- Captures RGB frames from the robot's onboard camera.
-- Identifies the object given with a text prompt and segments it using GroundingDINO + MobileSAM, CLIPSeg, or YOLOE.
-- Computes the centroid of the matched object.
-- Sends navigation goals to Nav2 to approach the object.
-
----
-
-## Workflow Overview
-
-1. Capture image from robot camera.
-2. Receive a text prompt describing the target object.
-3. Run segmentation using GroundingDINO + MobileSAM, CLIPSeg, or YOLOE based on the selected backend.
-4. Look for an object by spinning, if it has not been found.
-4. Publish a navigation goal to the Nav2 stack.
-5. Robot navigates autonomously to the object.
+- `tracker_node.py` — основной ROS 2-узел, выполняющий сегментацию, сопоставление с подсказкой и навигацию.
+- `dino_mobilesam_image_segmentation.py` — модуль сегментации объектов с использованием GroundingDINO + MobileSAM.
+- `clip_image_segmentation.py` — модуль сегментации объектов с использованием CLIP.
+- `yoloe_image_segmentation.py` — модуль сегментации объектов с использованием YOLOE.
 
 ---
 
-## Dependencies
+## Возможности
 
-- ROS 2 (tested on **Humble**)
+- Захватывает RGB-кадры с бортовой камеры робота.
+- Определяет объект, заданный текстовой подсказкой, и сегментирует его с помощью GroundingDINO + MobileSAM, CLIPSeg или YOLOE.
+- Вычисляет центроид найденного объекта.
+- Отправляет навигационные цели в Nav2 для приближения к объекту.
+
+---
+
+## Обзор рабочего процесса
+
+1. Захват изображения с камеры робота.
+2. Получение текстовой подсказки, описывающей целевой объект.
+3. Запуск сегментации с помощью GroundingDINO + MobileSAM, CLIPSeg или YOLOE в зависимости от выбранного бэкенда.
+4. Поиск объекта вращением на месте, если он не был найден.
+4. Публикация навигационной цели в стек Nav2.
+5. Робот автономно навигирует к объекту.
+
+---
+
+## Зависимости
+
+- ROS 2 (протестировано на **Humble**)
 - Python 3.8+
 - `torch`
 - `transformers`
@@ -45,13 +45,13 @@ This repository contains a ROS 2 node implementation for segmenting camera image
 - OpenAI CLIP
 - Nav2
 
-> ⚠️ A CUDA-enabled GPU is highly recommended for real-time performance.
+> ⚠️ Для работы в реальном времени настоятельно рекомендуется GPU с поддержкой CUDA.
 
 ---
 
-## Installation
+## Установка
 
-To use this project you need to clone this into the `src` folder in your ROS workspace and build it along with the robot project using
+Чтобы использовать этот проект, нужно клонировать его в папку `src` вашего рабочего пространства ROS и собрать вместе с проектом робота с помощью команды
 
 ```bash
 colcon build --symlink-install
@@ -59,7 +59,7 @@ colcon build --symlink-install
 
 ---
 
-## Running the Node
+## Запуск узла
 
 ```bash
 ros2 run object_tracking tracker_node --ros-args -r /image_in:=/camera/image_raw -p model_mode:=<clip|dino_mobilesam|yoloe>
@@ -67,7 +67,7 @@ ros2 run object_tracking tracker_node --ros-args -r /image_in:=/camera/image_raw
 
 ---
 
-## Examples
+## Примеры
 
 ### GroundingDINO + MobileSAM
 
@@ -79,23 +79,23 @@ ros2 run object_tracking tracker_node --ros-args -r /image_in:=/camera/image_raw
 
 ### YOLOE
 
-Use `model_mode:=yoloe` to enable the YOLOE text-prompted segmentation backend.
+Используйте `model_mode:=yoloe`, чтобы включить бэкенд сегментации YOLOE по текстовой подсказке.
 
 ---
 
-## Robot Description and Configuration
+## Описание робота и конфигурация
 
-Robot model, navigation parameters, and launch files are provided in a separate repository:
+Модель робота, параметры навигации и launch-файлы предоставлены в отдельном репозитории:
 
 [robot_repository](https://github.com/dnbabkov/ar_project)
 
-Repository also contains three different test worlds with corresponging maps.
+Репозиторий также содержит три различных тестовых мира с соответствующими картами.
 
 ---
 
 ## TODO
 
-- Add voice input for prompts
-- Add natural language parsing
-- Improve target navigation
-- Fine tune the models for better performance
+- Добавить голосовой ввод подсказок
+- Добавить разбор естественного языка
+- Улучшить навигацию к цели
+- Дообучить модели для повышения производительности
