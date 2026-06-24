@@ -38,7 +38,14 @@ SYSTEM_PROMPT = (
     "(set forward_dist_m), DRIVE_TO_VISIBLE (set mark_id -- MUST be one of the listed "
     "visible marks), GO_TO_FRONTIER (set frontier_id -- MUST be one of the listed "
     "frontiers), GET_OBSERVATION, DONE, STOP. NEVER invent a mark_id or frontier_id "
-    "that is not in the options, and NEVER output map coordinates. JSON schema: "
+    "that is not in the options, and NEVER output map coordinates. "
+    "ALWAYS MAKE PROGRESS toward the target -- prefer a navigation action. "
+    "GET_OBSERVATION does NOT move the robot and does NOT create detections; use it at "
+    "most once and NEVER repeat it. The detections list (not the image) is the ground "
+    "truth for DRIVE_TO_VISIBLE: if the target looks visible in the image but is NOT in "
+    "the detections, do not wait for it -- DRIVE_FORWARD toward it or pick a "
+    "GO_TO_FRONTIER to get closer. If there are no detections and no frontiers, TURN to "
+    "scan for new options. JSON schema: "
     '{"action": str, "turn_yaw_rad": float, "forward_dist_m": float, "mark_id": int, '
     '"frontier_id": int, "arg_label": str, "rationale": str}.'
 )
