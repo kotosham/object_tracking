@@ -41,6 +41,14 @@ class VlmClient:
     def plan(self, obs: Observation, image_jpeg: Optional[bytes] = None) -> Action:
         raise NotImplementedError
 
+    def plan_sequence(self, obs: Observation, image_jpeg: Optional[bytes] = None,
+                      n: int = 1) -> list:
+        """A short plan of up to n atomic actions (replan-every-N). Default: one
+        action (reactive); the real VLM client may override to plan n steps ahead
+        from a single observation. The orchestrator executes the returned list,
+        then replans with a fresh observation."""
+        return [self.plan(obs, image_jpeg)]
+
 
 class MockVlmClient(VlmClient):
     """Deterministic stand-in (no network) -- drives the whole loop in sim/CI."""
