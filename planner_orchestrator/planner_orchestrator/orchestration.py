@@ -50,6 +50,17 @@ def is_terminal(kind: int) -> bool:
     return kind in (DONE, STOP)
 
 
+def should_launch_lead_replan(action_index: int, batch_len: int,
+                              async_enabled: bool, already_pending: bool) -> bool:
+    """Phase 4.6 anytime policy: launch the NEXT replan while the LAST action of the
+    current batch is executing (lead-time), exactly once per batch, and only when
+    async replanning is on and no replan is already in flight. Adopting the result
+    happens later at the commit-point (batch boundary) so an in-flight action is
+    never interrupted (consensus-horizon)."""
+    return (async_enabled and not already_pending
+            and batch_len > 0 and action_index == batch_len - 1)
+
+
 def wrap_angle(a: float) -> float:
     return math.atan2(math.sin(a), math.cos(a))
 

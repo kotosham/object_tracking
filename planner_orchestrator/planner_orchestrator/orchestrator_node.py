@@ -25,6 +25,13 @@ import os
 import threading
 import time
 import uuid
+from collections import namedtuple
+from concurrent.futures import ThreadPoolExecutor
+
+# A plan plus the candidate pixel map captured at planning time, so DRIVE_TO_VISIBLE
+# resolves mark_id->pixel against the SAME observation the VLM chose from -- even
+# while a concurrent replan is already overwriting the live candidate state.
+_PlanBundle = namedtuple('_PlanBundle', 'actions pixels')
 
 import rclpy
 from rclpy.action import ActionClient
@@ -95,6 +102,10 @@ class PlannerOrchestrator(Node):
         # Floor on per-step wall time so an instant-reached skill can't make the
         # loop hammer the executive (and gives observations time to refresh).
         self.declare_parameter('min_step_s', 0.5)
+        # Phase 4.6 anytime/async replan: compute the NEXT plan concurrently while
+        # the executive still runs the current action, adopt only at a commit-point
+        # (the batch boundary) -> no idle / "wasted actions" between replans.
+        self.declare_parameter('async_replan', True)
         # Phase 3 binding: pull real Set-of-Mark candidates from the edge detector
         # and feed the chosen mark's pixel to ApproachDetection on DRIVE_TO_VISIBLE.
         self.declare_parameter('detect_action_name', 'detect_target')
@@ -114,6 +125,9 @@ class PlannerOrchestrator(Node):
         self.min_step_s = float(g('min_step_s'))
         self.detect_timeout_s = float(g('detect_timeout_s'))
         self.camera_frame = g('camera_frame')
+        self.async_replan = bool(g('async_replan'))
+        self._planner_pool = ThreadPoolExecutor(max_workers=1,
+                                                thread_name_prefix='replan')
 
         self.client = make_client(use_mock=bool(g('use_mock')), base_url=g('vlm_base_url'),
                                   api_key=g('vlm_api_key'), model=g('vlm_model'),
@@ -249,30 +263,53 @@ class PlannerOrchestrator(Node):
                          1.0 - 2.0 * (q.y * q.y + q.z * q.z))
         return (t.x, t.y, yaw)
 
-    # ---- mission loop: replan every N atomic steps ----
+    # ---- anytime/async mission loop (Phase 4.6): replan overlaps execution ----
+    def _compute_plan(self, target, step):
+        """Build an observation and ask the planner for up to N atomic actions.
+        Runs either inline (bootstrap) or on the planner pool concurrently with
+        execution. Returns a _PlanBundle (actions + the candidate pixel snapshot
+        the VLM chose from); empty actions on VLM failure (circuit-breaker fed)."""
+        obs = self._observation(target, step)
+        pixels = dict(self._cand_pixels)     # snapshot so DRIVE_TO_VISIBLE is race-free
+        jpeg = self._jpeg
+        try:
+            actions = list(self.client.plan_sequence(obs, jpeg, n=self.replan_n))
+            self.cb.record_success() if actions else self.cb.record_failure()
+        except Exception as e:
+            self.cb.record_failure()
+            self.get_logger().warn('VLM plan failed (%s); cb_open=%s' % (e, self.cb.is_open))
+            actions = []
+        return _PlanBundle(actions, pixels)
+
+    def _next_bundle(self, pending, target, step):
+        """Adopt the concurrently-computed plan at the commit-point (no idle if it
+        finished during execution), or compute inline when async is off."""
+        if pending is not None:
+            try:
+                return pending.result()
+            except Exception:
+                return _PlanBundle([], {})
+        return self._compute_plan(target, step)
+
     def _run_mission(self, target):
         self.get_logger().info('VLM mission start: target="%s"' % target)
         self.notes = NotesBuffer()
         self.cb = CircuitBreaker()
         step = 0
+        pending = None
         try:
+            bundle = self._compute_plan(target, step)   # bootstrap (the only idle point)
             while rclpy.ok() and step < self.max_steps:
-                obs = self._observation(target, step)
-                try:
-                    plan = self.client.plan_sequence(obs, self._jpeg, n=self.replan_n)
-                    self.cb.record_success()
-                except Exception as e:
-                    self.cb.record_failure()
-                    self.get_logger().warn('VLM plan failed (%s); cb_open=%s'
-                                           % (e, self.cb.is_open))
+                if not bundle.actions:
                     if self.cb.is_open:
                         self.get_logger().error('circuit-breaker OPEN -> degrade VLM->FLAT; stopping')
                         self._dispatch_stop()
                         break
+                    bundle = self._next_bundle(pending, target, step)
+                    pending = None
                     continue
-                # execute this plan (up to N atomic actions), then replan
-                replan = False
-                for action in plan:
+                terminate = False
+                for i, action in enumerate(bundle.actions):
                     self.get_logger().info('step %d: %s (%s)'
                                            % (step, action.name, action.rationale or ''))
                     if orch.is_terminal(action.kind):
@@ -280,29 +317,39 @@ class PlannerOrchestrator(Node):
                         if action.kind == STOP:
                             self._dispatch_stop()
                         self._publish_notes(target)
-                        return
+                        terminate = True
+                        break
+                    # anytime: launch the NEXT replan while this (last-of-batch) action
+                    # executes, so it is ready at the commit-point -> no wasted idle.
+                    if orch.should_launch_lead_replan(i, len(bundle.actions),
+                                                      self.async_replan, pending is not None):
+                        pending = self._planner_pool.submit(self._compute_plan, target, step + 1)
                     t0 = time.monotonic()
-                    ok = self._dispatch(action)
+                    ok = self._dispatch(action, bundle.pixels)
                     self.notes.add_fact('%s%s -> %s' % (
                         action.name,
                         (' ' + action.rationale) if action.rationale else '',
                         'ok' if ok else 'failed'))
                     self._publish_notes(target)
                     step += 1
-                    replan = True
                     dt = time.monotonic() - t0
                     if dt < self.min_step_s:      # don't hammer on instant-reached skills
                         time.sleep(self.min_step_s - dt)
                     if step >= self.max_steps:
                         break
-                if not replan:
+                if terminate or step >= self.max_steps:
                     break
+                # commit-point: adopt the plan computed during execution
+                bundle = self._next_bundle(pending, target, step)
+                pending = None
             self.get_logger().info('VLM mission ended after %d steps' % step)
         finally:
+            if pending is not None:
+                pending.cancel()
             self._busy = False
 
     # ---- dispatch one atomic action to the matching FLAT skill ----
-    def _dispatch(self, action):
+    def _dispatch(self, action, cand_pixels):
         skill = orch.skill_for_action(action.kind)
         if action.kind in (TURN, DRIVE_FORWARD):
             pose = self._robot_pose()
@@ -314,7 +361,7 @@ class PlannerOrchestrator(Node):
         if action.kind == GO_TO_FRONTIER:
             return self._send_explore(action.frontier_id)
         if action.kind == DRIVE_TO_VISIBLE:
-            return self._send_approach_mark(action.mark_id, action.arg_label)
+            return self._send_approach_mark(action.mark_id, action.arg_label, cand_pixels)
         if action.kind == GET_OBSERVATION:
             return self._send_getobs()
         return False
@@ -355,11 +402,13 @@ class PlannerOrchestrator(Node):
         g.max_pixel_age_s = 1.5
         return self._send_and_wait(orch.SKILL_APPROACH, g)
 
-    def _send_approach_mark(self, mark_id, label):
+    def _send_approach_mark(self, mark_id, label, cand_pixels):
         """DRIVE_TO_VISIBLE(mark_id): inject the chosen candidate's pixel onto
         /target_pixel (kept fresh by a background republisher so ApproachDetection's
-        freshness gate stays satisfied through the whole drive), then approach."""
-        pt = self._cand_pixels.get(int(mark_id))
+        freshness gate stays satisfied through the whole drive), then approach.
+        Resolves against the plan's pixel snapshot, not live state (a concurrent
+        replan may already be overwriting self._cand_pixels)."""
+        pt = (cand_pixels or {}).get(int(mark_id))
         if pt is None:
             self.get_logger().warn('DRIVE_TO_VISIBLE: no pixel for mark %s' % mark_id)
             return False
