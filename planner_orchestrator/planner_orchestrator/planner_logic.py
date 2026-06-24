@@ -156,6 +156,37 @@ class CircuitBreaker:
         return self._fails
 
 
+class DegradationLatch:
+    """Phase 5.1 seamless VLM->FLAT degradation. When the circuit-breaker opens
+    (VLM lost / unreachable / edge link gone), latch to a FLAT fallback policy for
+    the REST of the mission so it CONTINUES (DEGRADED) instead of stopping -- and
+    never flaps back to the VLM mid-mission even if the breaker later recovers.
+
+    `select(primary, fallback, cb_open)` returns the planner to use this cycle and
+    sets the latch the first time it sees an open breaker. `just_degraded()` fires
+    once at the transition so the caller can log / note it exactly once."""
+
+    def __init__(self):
+        self._degraded = False
+        self._announced = False
+
+    @property
+    def degraded(self) -> bool:
+        return self._degraded
+
+    def select(self, primary, fallback, cb_open: bool):
+        if cb_open:
+            self._degraded = True
+        return fallback if self._degraded else primary
+
+    def just_degraded(self) -> bool:
+        """True exactly once, on the cycle degradation first latches."""
+        if self._degraded and not self._announced:
+            self._announced = True
+            return True
+        return False
+
+
 class NotesBuffer:
     """Compact, deduped fact list + summary (context kept instead of frames)."""
 

@@ -1,8 +1,8 @@
 """Unit tests for the VLM planner pure logic (Phase 4)."""
 from planner_orchestrator.planner_logic import (
-    Action, Candidate, CircuitBreaker, FrontierOpt, MockPlanner, NotesBuffer,
-    Observation, ReplanScheduler, build_vlm_options, parse_vlm_action, validate_action,
-    DRIVE_TO_VISIBLE, GO_TO_FRONTIER, TURN, DONE,
+    Action, Candidate, CircuitBreaker, DegradationLatch, FrontierOpt, MockPlanner,
+    NotesBuffer, Observation, ReplanScheduler, build_vlm_options, parse_vlm_action,
+    validate_action, DRIVE_TO_VISIBLE, GO_TO_FRONTIER, TURN, DONE,
 )
 
 
@@ -128,6 +128,39 @@ def test_circuit_breaker_opens_then_closes():
     cb.record_failure(); assert not cb.is_open
     cb.record_failure(); assert cb.is_open
     cb.record_success(); assert not cb.is_open and cb.consecutive_failures == 0
+
+
+# ---- FMEA 5.1: seamless VLM->FLAT degradation latch ------------------------
+
+PRIMARY, FALLBACK = 'VLM', 'FLAT'
+
+
+def test_degradation_selects_primary_until_breaker_opens():
+    d = DegradationLatch()
+    assert d.select(PRIMARY, FALLBACK, cb_open=False) == PRIMARY
+    assert not d.degraded
+
+
+def test_degradation_latches_to_fallback_on_open():
+    d = DegradationLatch()
+    assert d.select(PRIMARY, FALLBACK, cb_open=True) == FALLBACK
+    assert d.degraded
+
+
+def test_degradation_does_not_flap_back_after_recovery():
+    d = DegradationLatch()
+    d.select(PRIMARY, FALLBACK, cb_open=True)          # degrade
+    # breaker "recovers" -> must STAY on FLAT for the rest of the mission
+    assert d.select(PRIMARY, FALLBACK, cb_open=False) == FALLBACK
+    assert d.degraded
+
+
+def test_degradation_announces_once():
+    d = DegradationLatch()
+    assert not d.just_degraded()                       # not degraded yet
+    d.select(PRIMARY, FALLBACK, cb_open=True)
+    assert d.just_degraded()                           # fires once at transition
+    assert not d.just_degraded()                       # and only once
 
 
 # ---- notes buffer ----------------------------------------------------------

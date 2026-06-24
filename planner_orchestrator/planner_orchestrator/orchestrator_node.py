@@ -55,7 +55,7 @@ from fleet_comms.qos import detection_stream_nodeadline
 from fleet_comms.heartbeat import HeartbeatPublisher
 from planner_orchestrator import orchestration as orch
 from planner_orchestrator.planner_logic import (
-    Candidate, CircuitBreaker, FrontierOpt, NotesBuffer, Observation,
+    Candidate, CircuitBreaker, DegradationLatch, FrontierOpt, NotesBuffer, Observation,
     DRIVE_FORWARD, DRIVE_TO_VISIBLE, GET_OBSERVATION, GO_TO_FRONTIER, STOP, TURN,
 )
 from planner_orchestrator.vlm_client import make_client
@@ -140,6 +140,11 @@ class PlannerOrchestrator(Node):
         else:
             self._cred_src = 'none'
         self.cb = CircuitBreaker()
+        # Phase 5.1 seamless degradation: a zero-network FLAT fallback (MockPlanner)
+        # the orchestrator latches onto when the VLM is lost (circuit-breaker open),
+        # so the mission CONTINUES as FLAT instead of stopping.
+        self._fallback = make_client(use_mock=True)
+        self._degrade = DegradationLatch()
         self.notes = NotesBuffer()
         self._epoch = int(g('mission_epoch'))
 
@@ -272,12 +277,18 @@ class PlannerOrchestrator(Node):
         obs = self._observation(target, step)
         pixels = dict(self._cand_pixels)     # snapshot so DRIVE_TO_VISIBLE is race-free
         jpeg = self._jpeg
+        # Phase 5.1: pick VLM or the latched FLAT fallback (once the breaker opens).
+        client = self._degrade.select(self.client, self._fallback, self.cb.is_open)
+        if self._degrade.just_degraded():
+            self.get_logger().error('circuit-breaker OPEN -> degrade VLM->FLAT (mission '
+                                     'continues as FLAT, DEGRADED)')
+            self.notes.add_fact('DEGRADED: VLM lost -> continuing in FLAT fallback')
         try:
-            actions = list(self.client.plan_sequence(obs, jpeg, n=self.replan_n))
+            actions = list(client.plan_sequence(obs, jpeg, n=self.replan_n))
             self.cb.record_success() if actions else self.cb.record_failure()
         except Exception as e:
             self.cb.record_failure()
-            self.get_logger().warn('VLM plan failed (%s); cb_open=%s' % (e, self.cb.is_open))
+            self.get_logger().warn('plan failed (%s); cb_open=%s' % (e, self.cb.is_open))
             actions = []
         return _PlanBundle(actions, pixels)
 
@@ -295,14 +306,18 @@ class PlannerOrchestrator(Node):
         self.get_logger().info('VLM mission start: target="%s"' % target)
         self.notes = NotesBuffer()
         self.cb = CircuitBreaker()
+        self._degrade = DegradationLatch()   # fresh mission retries the VLM
         step = 0
         pending = None
         try:
             bundle = self._compute_plan(target, step)   # bootstrap (the only idle point)
             while rclpy.ok() and step < self.max_steps:
                 if not bundle.actions:
-                    if self.cb.is_open:
-                        self.get_logger().error('circuit-breaker OPEN -> degrade VLM->FLAT; stopping')
+                    # Degradation (cb open) does NOT stop the mission -- _compute_plan
+                    # has already switched to the FLAT fallback. Only stop if even the
+                    # fallback yields nothing; otherwise retry (transient empty plan).
+                    if self._degrade.degraded:
+                        self.get_logger().error('FLAT fallback produced no action -> stopping')
                         self._dispatch_stop()
                         break
                     bundle = self._next_bundle(pending, target, step)
@@ -342,7 +357,8 @@ class PlannerOrchestrator(Node):
                 # commit-point: adopt the plan computed during execution
                 bundle = self._next_bundle(pending, target, step)
                 pending = None
-            self.get_logger().info('VLM mission ended after %d steps' % step)
+            self.get_logger().info('VLM mission ended after %d steps%s' % (
+                step, ' (DEGRADED: ran in FLAT fallback)' if self._degrade.degraded else ''))
         finally:
             if pending is not None:
                 pending.cancel()
