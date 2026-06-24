@@ -15,6 +15,7 @@ find_package(builtin_interfaces REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/Candidate.msg"
   "msg/PlanStep.msg"
+  "msg/AtomicAction.msg"
   "msg/Notes.msg"
   "action/SeekObject.action"
   "action/DetectTarget.action"
