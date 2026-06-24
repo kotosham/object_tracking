@@ -29,6 +29,7 @@ setup(
         'console_scripts': [
             'tracker_node = object_tracking.tracker_node:main',
             'rgb_tracker_node = object_tracking.rgb_tracker_node:main',
+            'detect_target_server = object_tracking.detect_target_server:main',
         ],
     },
 )

@@ -149,3 +149,43 @@ class YOLOESegmentor:
         x_mean = int(np.mean(x_indices))
         y_mean = int(np.mean(y_indices))
         return (x_mean, y_mean)
+
+    def segment_all(self, image, prompt, conf=0.25, min_mask_area=200):
+        """Open-vocab detection returning ALL matches as setofmark.Detection objects
+        (best-first by confidence) -- the multi-candidate path for the DetectTarget
+        Set-of-Mark service (Phase 3.2/3.3), vs. segment() which returns only the
+        single best for the continuous tracker. Centers come from the mask when
+        present, else the box center; depth is left 0.0 (filled by the caller)."""
+        from object_tracking.setofmark import Detection
+        self._set_prompt(prompt)
+
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        results = self.model.predict(
+            source=image_rgb, conf=conf, imgsz=self.imgsz,
+            verbose=False, device=self.device,
+        )
+        dets = []
+        if not results:
+            return dets
+        result = results[0]
+        if result.boxes is None or len(result.boxes) == 0:
+            return dets
+
+        confs = result.boxes.conf.detach().cpu().numpy()
+        boxes = result.boxes.xyxy.detach().cpu().numpy().astype(int)
+        masks = result.masks.data.detach().cpu().numpy() if result.masks is not None else None
+        for i in range(len(confs)):
+            x1, y1, x2, y2 = (int(v) for v in boxes[i].tolist())
+            if masks is not None and i < len(masks):
+                mask = masks[i] > 0.5
+                area = int(np.sum(mask))
+                if 0 < area < min_mask_area:
+                    continue
+                center = self.get_center_coordinates(mask)
+                cx, cy = center if center else ((x1 + x2) // 2, (y1 + y2) // 2)
+            else:
+                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+            dets.append(Detection(label=prompt, confidence=float(confs[i]),
+                                  cx=int(cx), cy=int(cy), bbox=(x1, y1, x2, y2)))
+        dets.sort(key=lambda d: d.confidence, reverse=True)
+        return dets
