@@ -16,6 +16,7 @@ publishing the target on /vlm_mission (std_msgs/String).
 """
 import math
 import threading
+import time
 import uuid
 
 import rclpy
@@ -77,6 +78,13 @@ class PlannerOrchestrator(Node):
         self.declare_parameter('robot_frame', 'base_link')
         self.declare_parameter('skill_wait_s', 5.0)
         self.declare_parameter('result_timeout_s', 90.0)
+        # Epoch the orchestrator's skill goals carry: must match the executive's
+        # CURRENT MissionState epoch (idle = 0) or the skills reject them as
+        # zombies. In VLM mode the orchestrator drives the skills directly.
+        self.declare_parameter('mission_epoch', 0)
+        # Floor on per-step wall time so an instant-reached skill can't make the
+        # loop hammer the executive (and gives observations time to refresh).
+        self.declare_parameter('min_step_s', 0.5)
         g = lambda n: self.get_parameter(n).value
         self.replan_n = max(1, int(g('replan_every_n')))
         self.turn_step = float(g('turn_step_rad'))
@@ -88,13 +96,14 @@ class PlannerOrchestrator(Node):
         self.robot_frame = g('robot_frame')
         self.skill_wait_s = float(g('skill_wait_s'))
         self.result_timeout_s = float(g('result_timeout_s'))
+        self.min_step_s = float(g('min_step_s'))
 
         self.client = make_client(use_mock=bool(g('use_mock')), base_url=g('vlm_base_url'),
                                   api_key=g('vlm_api_key'), model=g('vlm_model'),
                                   timeout_s=float(g('vlm_timeout_s')))
         self.cb = CircuitBreaker()
         self.notes = NotesBuffer()
-        self._epoch = 1
+        self._epoch = int(g('mission_epoch'))
 
         # ---- inputs ----
         self._frontiers = None
@@ -209,6 +218,7 @@ class PlannerOrchestrator(Node):
                             self._dispatch_stop()
                         self._publish_notes(target)
                         return
+                    t0 = time.monotonic()
                     ok = self._dispatch(action)
                     self.notes.add_fact('%s%s -> %s' % (
                         action.name,
@@ -217,6 +227,9 @@ class PlannerOrchestrator(Node):
                     self._publish_notes(target)
                     step += 1
                     replan = True
+                    dt = time.monotonic() - t0
+                    if dt < self.min_step_s:      # don't hammer on instant-reached skills
+                        time.sleep(self.min_step_s - dt)
                     if step >= self.max_steps:
                         break
                 if not replan:
