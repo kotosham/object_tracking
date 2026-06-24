@@ -11,10 +11,17 @@ EXISTING FLAT skill on the Pi executive:
   GET_OBSERVATION      -> GetObservation ; STOP -> Stop ; DONE -> finish
 The VLM is never on the reactive path; the executive owns motion + safety. A
 per-call timeout + circuit-breaker degrade VLM->FLAT on loss. Mock-first: with
-use_mock the whole loop runs in sim/CI with no API key. Trigger a mission by
-publishing the target on /vlm_mission (std_msgs/String).
+use_mock (or no credentials anywhere) the whole loop runs in sim/CI with no API
+key. Trigger a mission by publishing the target on /vlm_mission (std_msgs/String).
+
+Real-VLM credentials: set the ROS params vlm_base_url / vlm_api_key / vlm_model,
+OR (preferred for secrets) export the environment variables VLM_BASE_URL /
+VLM_API_KEY / VLM_MODEL -- env fills in any param left blank, so keys never need
+to live in a launch file. A base_url from either source auto-engages the real
+OpenAI-compatible client unless use_mock:=true is set explicitly.
 """
 import math
+import os
 import threading
 import time
 import uuid
@@ -64,7 +71,7 @@ class PlannerOrchestrator(Node):
                                             period_s=self.HEARTBEAT_PERIOD_S)
         # ---- params ----
         self.declare_parameter('replan_every_n', 3)
-        self.declare_parameter('use_mock', True)
+        self.declare_parameter('use_mock', False)
         self.declare_parameter('vlm_base_url', '')
         self.declare_parameter('vlm_api_key', '')
         self.declare_parameter('vlm_model', '')
@@ -101,6 +108,13 @@ class PlannerOrchestrator(Node):
         self.client = make_client(use_mock=bool(g('use_mock')), base_url=g('vlm_base_url'),
                                   api_key=g('vlm_api_key'), model=g('vlm_model'),
                                   timeout_s=float(g('vlm_timeout_s')))
+        # Where credentials came from -- a label only; the key/url are never logged.
+        if g('vlm_base_url'):
+            self._cred_src = 'param'
+        elif os.environ.get('VLM_BASE_URL'):
+            self._cred_src = 'env'
+        else:
+            self._cred_src = 'none'
         self.cb = CircuitBreaker()
         self.notes = NotesBuffer()
         self._epoch = int(g('mission_epoch'))
@@ -135,9 +149,9 @@ class PlannerOrchestrator(Node):
         self._tfl = TransformListener(self._tf, self)
         self._busy = False
         self.get_logger().info(
-            'planner_orchestrator up (Phase 4 VLM mode): client=%s replan_every_n=%d. '
+            'planner_orchestrator up (Phase 4 VLM mode): client=%s creds=%s replan_every_n=%d. '
             'Publish target on /vlm_mission to start.'
-            % (type(self.client).__name__, self.replan_n))
+            % (type(self.client).__name__, self._cred_src, self.replan_n))
 
     # ---- input callbacks ----
     def _on_frontiers(self, msg):

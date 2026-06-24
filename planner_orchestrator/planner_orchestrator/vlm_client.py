@@ -13,8 +13,17 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import urllib.request
 from typing import Optional
+
+# Environment variables the real VLM credentials can be supplied through. The
+# operator populates these (e.g. in the launch environment or a sourced env file)
+# instead of putting secrets in launch files / ROS params. An explicit non-empty
+# ROS param still takes precedence; env only fills in what the param leaves blank.
+ENV_BASE_URL = 'VLM_BASE_URL'
+ENV_API_KEY = 'VLM_API_KEY'
+ENV_MODEL = 'VLM_MODEL'
 
 from planner_orchestrator.planner_logic import (
     Action, MockPlanner, Observation, build_vlm_options, parse_vlm_action,
@@ -114,9 +123,24 @@ class OpenAICompatibleClient(VlmClient):
         return self.parse_response(self._post(body), obs)
 
 
-def make_client(use_mock: bool = True, base_url: str = '', api_key: str = '',
+def resolve_credentials(base_url: str = '', api_key: str = '', model: str = ''):
+    """Fill blank credentials from the environment (VLM_BASE_URL/VLM_API_KEY/
+    VLM_MODEL). A non-empty argument (e.g. an explicit ROS param) always wins;
+    env only supplies what the caller left empty. Returns (base_url, api_key,
+    model). NOTE: secrets are read here at runtime only -- they are never logged."""
+    base_url = base_url or os.environ.get(ENV_BASE_URL, '')
+    api_key = api_key or os.environ.get(ENV_API_KEY, '')
+    model = model or os.environ.get(ENV_MODEL, '')
+    return base_url.strip(), api_key.strip(), model.strip()
+
+
+def make_client(use_mock: bool = False, base_url: str = '', api_key: str = '',
                 model: str = '', timeout_s: float = 8.0, **mock_kwargs) -> VlmClient:
-    """Pluggable factory: mock unless a real base_url is configured."""
+    """Pluggable factory. Credentials come from the given args or, if blank, the
+    environment (see resolve_credentials). Returns the real OpenAI-compatible
+    client when a base_url is available and mock is not forced; otherwise the
+    deterministic mock (so with no creds anywhere the loop still runs offline)."""
+    base_url, api_key, model = resolve_credentials(base_url, api_key, model)
     if use_mock or not base_url:
         return MockVlmClient(**mock_kwargs)
     return OpenAICompatibleClient(base_url, api_key, model, timeout_s)

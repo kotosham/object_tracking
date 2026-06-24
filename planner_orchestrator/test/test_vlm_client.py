@@ -1,12 +1,23 @@
 """Unit tests for the pluggable VLM client (Phase 4). No network."""
 import json
 
+import pytest
+
 from planner_orchestrator.planner_logic import (
     Candidate, FrontierOpt, Observation, DRIVE_TO_VISIBLE, GO_TO_FRONTIER, TURN,
 )
 from planner_orchestrator.vlm_client import (
-    MockVlmClient, OpenAICompatibleClient, make_client,
+    ENV_API_KEY, ENV_BASE_URL, ENV_MODEL,
+    MockVlmClient, OpenAICompatibleClient, make_client, resolve_credentials,
 )
+
+
+@pytest.fixture(autouse=True)
+def _clear_vlm_env(monkeypatch):
+    """Make the whole module hermetic: a populated operator shell (VLM_* exported)
+    must not change what these tests resolve. Individual tests opt back in."""
+    for name in (ENV_BASE_URL, ENV_API_KEY, ENV_MODEL):
+        monkeypatch.delenv(name, raising=False)
 
 
 def test_make_client_mock_by_default():
@@ -20,6 +31,32 @@ def test_make_client_mock_when_no_base_url():
 def test_make_client_real_when_configured():
     c = make_client(use_mock=False, base_url='http://x/v1', api_key='k', model='m')
     assert isinstance(c, OpenAICompatibleClient) and c.base_url == 'http://x/v1'
+
+
+def test_make_client_uses_env_when_param_blank(monkeypatch):
+    monkeypatch.setenv(ENV_BASE_URL, 'http://env/v1')
+    monkeypatch.setenv(ENV_API_KEY, 'envkey')
+    monkeypatch.setenv(ENV_MODEL, 'envmodel')
+    c = make_client()                       # no args -> all from env, real client
+    assert isinstance(c, OpenAICompatibleClient)
+    assert c.base_url == 'http://env/v1' and c.api_key == 'envkey' and c.model == 'envmodel'
+
+
+def test_make_client_param_overrides_env(monkeypatch):
+    monkeypatch.setenv(ENV_BASE_URL, 'http://env/v1')
+    c = make_client(base_url='http://param/v1', api_key='k', model='m')
+    assert c.base_url == 'http://param/v1'   # explicit param wins over env
+
+
+def test_make_client_use_mock_forces_mock_even_with_env(monkeypatch):
+    monkeypatch.setenv(ENV_BASE_URL, 'http://env/v1')
+    assert isinstance(make_client(use_mock=True), MockVlmClient)
+
+
+def test_resolve_credentials_strips_and_falls_back(monkeypatch):
+    monkeypatch.setenv(ENV_API_KEY, '  spacey-key  ')
+    base, key, model = resolve_credentials(base_url='http://x/v1')
+    assert base == 'http://x/v1' and key == 'spacey-key' and model == ''
 
 
 def test_mock_client_drives_loop():

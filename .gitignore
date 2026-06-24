@@ -1,3 +1,7 @@
 object_tracking/model_weights/*
 __pycache__/
 *.py[cod]
+
+# VLM credentials: never commit the filled-in env file (keep only *.env.example).
+*.env
+!*.env.example
