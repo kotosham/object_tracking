@@ -30,40 +30,47 @@ from planner_orchestrator.planner_logic import (
 )
 
 SYSTEM_PROMPT = (
-    "You are the high-level planner for a mobile robot looking for a target object. "
-    "Each turn you receive the target, a camera image, and the REAL options: the "
-    "visible detections (each with a mark_id) and the frontier options (each with an "
-    "id). Choose exactly ONE atomic action and reply with a single JSON object, no "
-    "prose. Allowed actions: TURN (rotate in place, set turn_yaw_rad), DRIVE_FORWARD "
-    "(set forward_dist_m), DRIVE_TO_VISIBLE (set mark_id -- MUST be one of the listed "
-    "visible marks), GO_TO_FRONTIER (set frontier_id -- MUST be one of the listed "
-    "frontiers), GET_OBSERVATION, DONE, STOP. NEVER invent a mark_id or frontier_id "
-    "that is not in the options, and NEVER output map coordinates. "
-    "ALWAYS MAKE PROGRESS toward the target -- prefer a navigation action. "
-    "GET_OBSERVATION does NOT move the robot and does NOT create detections; use it at "
-    "most once and NEVER repeat it. The detections list (not the image) is the ground "
-    "truth for DRIVE_TO_VISIBLE: if the target looks visible in the image but is NOT in "
-    "the detections, do not wait for it -- DRIVE_FORWARD toward it or pick a "
-    "GO_TO_FRONTIER to get closer. If there are no detections and no frontiers, TURN to "
-    "scan for new options. JSON schema: "
+    "You are the planner for a mobile robot searching for a target object. Each turn "
+    "you receive: the target; the live camera image (1st image, with numbered marks "
+    "on detected objects); a top-down SLAM occupancy map (2nd image, if available); "
+    "the currently visible detections (each with a mark_id, its detector class label, "
+    "a confidence score, and distance_m -- the RealSense range to it in meters); and "
+    "your running notes. Use distance_m to size DRIVE_FORWARD and the map to avoid "
+    "obstacles and unexplored dead-ends. Choose exactly ONE action and reply with a "
+    "single JSON object, no prose. Actions: "
+    "TURN -- rotate in place; set turn_yaw_rad (radians, + = left). "
+    "DRIVE_FORWARD -- drive straight; set forward_dist_m (meters, negative = backward). "
+    "DRIVE_TO_VISIBLE -- drive to a detected object using the navigation stack; set "
+    "mark_id, which MUST be one of the listed visible marks. "
+    "DETECT_ALL -- run the detector over the whole view and add every object and its "
+    "class to your notes (recognises common everyday classes: people, vehicles, "
+    "furniture, animals, household items). "
+    "DONE -- the target is reached or the mission is complete. Choose DONE once the "
+    "target's distance_m shows you are close (roughly within ~0.6 m, the robot's "
+    "approach standoff), or right after a DRIVE_TO_VISIBLE has brought you up to it and "
+    "it now fills the camera / drops out of the detections at point-blank range. "
+    "Never invent a mark_id that is not listed, and never output map coordinates. "
+    "JSON schema: "
     '{"action": str, "turn_yaw_rad": float, "forward_dist_m": float, "mark_id": int, '
-    '"frontier_id": int, "arg_label": str, "rationale": str}.'
+    '"arg_label": str, "rationale": str}.'
 )
 
 
 class VlmClient:
-    """Observation (+ optional JPEG) -> Action. Raises on failure/timeout."""
+    """Observation (+ optional camera JPEG + optional map JPEG) -> Action. Raises on
+    failure/timeout."""
 
-    def plan(self, obs: Observation, image_jpeg: Optional[bytes] = None) -> Action:
+    def plan(self, obs: Observation, image_jpeg: Optional[bytes] = None,
+             map_jpeg: Optional[bytes] = None) -> Action:
         raise NotImplementedError
 
     def plan_sequence(self, obs: Observation, image_jpeg: Optional[bytes] = None,
-                      n: int = 1) -> list:
+                      map_jpeg: Optional[bytes] = None, n: int = 1) -> list:
         """A short plan of up to n atomic actions (replan-every-N). Default: one
         action (reactive); the real VLM client may override to plan n steps ahead
         from a single observation. The orchestrator executes the returned list,
         then replans with a fresh observation."""
-        return [self.plan(obs, image_jpeg)]
+        return [self.plan(obs, image_jpeg, map_jpeg)]
 
 
 class MockVlmClient(VlmClient):
@@ -72,7 +79,8 @@ class MockVlmClient(VlmClient):
     def __init__(self, **mock_kwargs):
         self._mp = MockPlanner(**mock_kwargs)
 
-    def plan(self, obs: Observation, image_jpeg: Optional[bytes] = None) -> Action:
+    def plan(self, obs: Observation, image_jpeg: Optional[bytes] = None,
+             map_jpeg: Optional[bytes] = None) -> Action:
         return self._mp.plan(obs)
 
 
@@ -85,15 +93,24 @@ class OpenAICompatibleClient(VlmClient):
         self.model = model
         self.timeout_s = timeout_s
 
-    def build_messages(self, obs: Observation, image_jpeg: Optional[bytes]) -> list:
+    @staticmethod
+    def _image_part(jpeg: bytes) -> dict:
+        b64 = base64.b64encode(jpeg).decode('ascii')
+        return {'type': 'image_url',
+                'image_url': {'url': 'data:image/jpeg;base64,' + b64}}
+
+    def build_messages(self, obs: Observation, image_jpeg: Optional[bytes],
+                       map_jpeg: Optional[bytes] = None) -> list:
         opts = build_vlm_options(obs)
         text = ('Target: %s\nOptions (JSON):\n%s\nReply with ONE JSON action.'
                 % (obs.target, json.dumps(opts)))
         content = [{'type': 'text', 'text': text}]
-        if image_jpeg:
-            b64 = base64.b64encode(image_jpeg).decode('ascii')
-            content.append({'type': 'image_url',
-                            'image_url': {'url': 'data:image/jpeg;base64,' + b64}})
+        if image_jpeg:                       # 1st image: live camera (Set-of-Mark)
+            content.append({'type': 'text', 'text': 'Live camera (numbered marks):'})
+            content.append(self._image_part(image_jpeg))
+        if map_jpeg:                         # 2nd image: top-down SLAM map
+            content.append({'type': 'text', 'text': 'Top-down SLAM map:'})
+            content.append(self._image_part(map_jpeg))
         return [{'role': 'system', 'content': SYSTEM_PROMPT},
                 {'role': 'user', 'content': content}]
 
@@ -119,10 +136,11 @@ class OpenAICompatibleClient(VlmClient):
         with urllib.request.urlopen(req, timeout=self.timeout_s) as r:
             return r.read().decode('utf-8')
 
-    def plan(self, obs: Observation, image_jpeg: Optional[bytes] = None) -> Action:
+    def plan(self, obs: Observation, image_jpeg: Optional[bytes] = None,
+             map_jpeg: Optional[bytes] = None) -> Action:
         body = {
             'model': self.model,
-            'messages': self.build_messages(obs, image_jpeg),
+            'messages': self.build_messages(obs, image_jpeg, map_jpeg),
             'temperature': 0,
             'max_tokens': 256,
             'response_format': {'type': 'json_object'},

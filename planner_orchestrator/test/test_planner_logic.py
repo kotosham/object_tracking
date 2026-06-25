@@ -1,8 +1,8 @@
 """Unit tests for the VLM planner pure logic (Phase 4)."""
 from planner_orchestrator.planner_logic import (
-    Action, Candidate, CircuitBreaker, DegradationLatch, FrontierOpt, MockPlanner,
+    Action, Candidate, CircuitBreaker, DegradationLatch, MockPlanner,
     NotesBuffer, Observation, ReplanScheduler, build_vlm_options, parse_vlm_action,
-    validate_action, DRIVE_TO_VISIBLE, GO_TO_FRONTIER, TURN, DONE,
+    validate_action, DRIVE_TO_VISIBLE, DETECT_ALL, TURN, DONE,
 )
 
 
@@ -10,8 +10,7 @@ from planner_orchestrator.planner_logic import (
 
 def test_mock_approaches_visible_target():
     obs = Observation(target='bus',
-                      candidates=[Candidate(2, 'bus', 0.9), Candidate(5, 'person', 0.8)],
-                      frontiers=[FrontierOpt(7, 1.0, 50.0)])
+                      candidates=[Candidate(2, 'bus', 0.9), Candidate(5, 'person', 0.8)])
     a = MockPlanner().plan(obs)
     assert a.kind == DRIVE_TO_VISIBLE and a.mark_id == 2
 
@@ -23,28 +22,43 @@ def test_mock_picks_best_matching_candidate():
     assert a.kind == DRIVE_TO_VISIBLE and a.mark_id == 3   # best score among matches
 
 
-def test_mock_explores_when_no_target():
-    obs = Observation(target='bus', candidates=[Candidate(1, 'door', 0.7)],
-                      frontiers=[FrontierOpt(4, 2.0, 10.0), FrontierOpt(9, 1.0, 80.0)])
-    a = MockPlanner().plan(obs)
-    assert a.kind == GO_TO_FRONTIER and a.frontier_id == 9   # best frontier score
-
-
-def test_mock_scans_then_done():
-    obs = Observation(target='bus')  # nothing visible, no frontiers
+def test_mock_detects_all_then_scans_then_done():
+    obs = Observation(target='bus')  # nothing visible
     mp = MockPlanner(scan_turn_limit=2, turn_step_rad=0.5)
+    assert mp.plan(obs).kind == DETECT_ALL   # one wide look first
     assert mp.plan(obs).kind == TURN
     assert mp.plan(obs).kind == TURN
-    assert mp.plan(obs).kind == DONE   # exhausted
+    assert mp.plan(obs).kind == DONE         # exhausted
 
 
-def test_mock_scan_resets_after_progress():
-    mp = MockPlanner(scan_turn_limit=2)
-    empty = Observation(target='bus')
-    assert mp.plan(empty).kind == TURN
-    # a frontier appears -> explore, scan counter resets
-    assert mp.plan(Observation(target='bus', frontiers=[FrontierOpt(1, 1.0, 1.0)])).kind == GO_TO_FRONTIER
-    assert mp.plan(empty).kind == TURN   # counter was reset, scans again
+def test_mock_done_when_target_close():
+    # a known distance within the reached threshold -> arrived, no need to drive.
+    mp = MockPlanner(reached_dist_m=0.8)
+    close = Observation(target='bus', candidates=[Candidate(2, 'bus', 0.9, distance_m=0.5)])
+    assert mp.plan(close).kind == DONE
+
+
+def test_mock_approaches_until_close():
+    mp = MockPlanner(reached_dist_m=0.8)
+    far = Observation(target='bus', candidates=[Candidate(2, 'bus', 0.9, distance_m=1.5)])
+    assert mp.plan(far).kind == DRIVE_TO_VISIBLE      # still far -> keep driving
+    near = Observation(target='bus', candidates=[Candidate(2, 'bus', 0.9, distance_m=0.5)])
+    assert mp.plan(near).kind == DONE                 # now close -> arrived
+
+
+def test_mock_done_when_lost_after_approach():
+    mp = MockPlanner()
+    seen = Observation(target='bus', candidates=[Candidate(2, 'bus', 0.9)])  # distance unknown
+    assert mp.plan(seen).kind == DRIVE_TO_VISIBLE     # drove toward it
+    # at point-blank the bus overflows the frame and YOLOE drops it -> treated as arrived.
+    assert mp.plan(Observation(target='bus')).kind == DONE
+
+
+def test_mock_approach_is_bounded():
+    mp = MockPlanner(reached_dist_m=0.8, max_approaches=3)
+    far = Observation(target='bus', candidates=[Candidate(2, 'bus', 0.9, distance_m=2.0)])
+    kinds = [mp.plan(far).kind for _ in range(4)]
+    assert kinds == [DRIVE_TO_VISIBLE, DRIVE_TO_VISIBLE, DRIVE_TO_VISIBLE, DONE]  # bounded
 
 
 # ---- enum-tool-call validation (anti-hallucination) ------------------------
@@ -61,35 +75,30 @@ def test_validate_accepts_real_mark():
     assert ok
 
 
-def test_validate_rejects_phantom_frontier():
-    obs = Observation(target='x', frontiers=[FrontierOpt(4, 1.0, 1.0)])
-    ok, _ = validate_action(Action(GO_TO_FRONTIER, frontier_id=8), obs)
-    assert not ok
-
-
-def test_validate_rejects_frontier_when_none_exist():
-    ok, _ = validate_action(Action(GO_TO_FRONTIER, frontier_id=-1), Observation(target='x'))
-    assert not ok
-
-
-def test_validate_rejects_invalid_negative_frontier():
-    # -1 means "best"; any other negative is a hallucination and must be rejected
-    obs = Observation(target='x', frontiers=[FrontierOpt(4, 1.0, 1.0)])
-    ok, reason = validate_action(Action(GO_TO_FRONTIER, frontier_id=-2), obs)
-    assert not ok and 'frontier_id must be' in reason
-    ok2, _ = validate_action(Action(GO_TO_FRONTIER, frontier_id=-1), obs)   # best -> ok
-    assert ok2
+def test_validate_accepts_argless_actions():
+    obs = Observation(target='bus')
+    assert validate_action(Action(DETECT_ALL), obs)[0]
+    assert validate_action(Action(TURN, turn_yaw_rad=0.5), obs)[0]
+    assert validate_action(Action(DONE), obs)[0]
 
 
 # ---- VLM tool-call build / parse -------------------------------------------
 
-def test_build_options_lists_real_ids():
-    obs = Observation(target='bus', candidates=[Candidate(2, 'bus', 0.9)],
-                      frontiers=[FrontierOpt(7, 1.5, 30.0)])
+def test_build_options_lists_real_marks():
+    obs = Observation(target='bus',
+                      candidates=[Candidate(2, 'bus', 0.9, distance_m=3.25)],
+                      map_text='occupancy map 40x40')
     opt = build_vlm_options(obs)
-    assert opt['visible_marks'][0]['mark_id'] == 2
-    assert opt['frontiers'][0]['id'] == 7
-    assert 'DRIVE_TO_VISIBLE' in opt['actions']
+    mark = opt['visible_marks'][0]
+    assert mark['mark_id'] == 2 and mark['distance_m'] == 3.25   # realsense range
+    assert 'DRIVE_TO_VISIBLE' in opt['actions'] and 'DETECT_ALL' in opt['actions']
+    assert opt['map'] == 'occupancy map 40x40'
+    assert 'frontiers' not in opt          # frontier options removed from the vocab
+
+
+def test_build_options_omits_map_when_absent():
+    opt = build_vlm_options(Observation(target='bus'))
+    assert 'map' not in opt
 
 
 def test_parse_valid_tool_call():
@@ -113,6 +122,12 @@ def test_parse_rejects_unknown_action():
 def test_parse_turn_carries_angle():
     act, _ = parse_vlm_action({'action': 'TURN', 'turn_yaw_rad': 0.8}, Observation(target='x'))
     assert act.kind == TURN and abs(act.turn_yaw_rad - 0.8) < 1e-9
+
+
+def test_parse_detect_all():
+    act, reason = parse_vlm_action({'action': 'DETECT_ALL', 'rationale': 'look around'},
+                                   Observation(target='x'))
+    assert act is not None and act.kind == DETECT_ALL and reason == 'OK'
 
 
 # ---- replan scheduler ------------------------------------------------------

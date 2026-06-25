@@ -182,14 +182,21 @@ class DetectTargetServer(Node):
             result.outcome = DetectTarget.Result.ABORTED
             return result
 
+        # The query is passed straight through (open-vocab object class). An EMPTY
+        # query means DETECT_ALL: detect every object in a broad built-in vocabulary
+        # and report each with its OWN predicted class, rather than one named target.
         query = (req.query or '').strip()
         conf = req.conf_threshold if req.conf_threshold > 0.0 else self.conf_default
         fb = DetectTarget.Feedback()
         try:
-            dets = self.segmentor.segment_all(frame, query, conf=conf,
-                                              min_mask_area=self.min_mask_area)
+            if query:
+                dets = self.segmentor.segment_all(frame, query, conf=conf,
+                                                  min_mask_area=self.min_mask_area)
+            else:
+                dets = self.segmentor.segment_vocab(frame, conf=conf,
+                                                    min_mask_area=self.min_mask_area)
         except Exception as exc:
-            self.get_logger().error('segment_all failed: %r' % (exc,))
+            self.get_logger().error('segment failed: %r' % (exc,))
             goal_handle.abort()
             result.outcome = DetectTarget.Result.ABORTED
             return result
@@ -210,7 +217,7 @@ class DetectTargetServer(Node):
         result.outcome = (DetectTarget.Result.FOUND if marked
                           else DetectTarget.Result.NOT_FOUND)
         self.get_logger().info('detect_target "%s": %d candidate(s) (conf>=%.2f)'
-                               % (query, len(marked), conf))
+                               % (query or '<all>', len(marked), conf))
         goal_handle.succeed()
         return result
 

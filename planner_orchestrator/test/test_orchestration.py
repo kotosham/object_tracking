@@ -2,12 +2,11 @@
 import math
 
 from planner_orchestrator.planner_logic import (
-    Action, TURN, DRIVE_FORWARD, DRIVE_TO_VISIBLE, GO_TO_FRONTIER, GET_OBSERVATION,
-    DONE, STOP,
+    Action, TURN, DRIVE_FORWARD, DRIVE_TO_VISIBLE, DETECT_ALL, DONE,
 )
 from planner_orchestrator.orchestration import (
     skill_for_action, is_terminal, relative_goal, wrap_angle, should_launch_lead_replan,
-    SKILL_GO_TO_POSE, SKILL_APPROACH, SKILL_EXPLORE, SKILL_GET_OBS, SKILL_STOP, SKILL_NONE,
+    describe_occupancy_grid, SKILL_GO_TO_POSE, SKILL_APPROACH, SKILL_NONE,
 )
 
 
@@ -15,15 +14,14 @@ def test_skill_mapping():
     assert skill_for_action(TURN) == SKILL_GO_TO_POSE
     assert skill_for_action(DRIVE_FORWARD) == SKILL_GO_TO_POSE
     assert skill_for_action(DRIVE_TO_VISIBLE) == SKILL_APPROACH
-    assert skill_for_action(GO_TO_FRONTIER) == SKILL_EXPLORE
-    assert skill_for_action(GET_OBSERVATION) == SKILL_GET_OBS
-    assert skill_for_action(STOP) == SKILL_STOP
+    assert skill_for_action(DETECT_ALL) == SKILL_NONE   # orchestrator-local
     assert skill_for_action(DONE) == SKILL_NONE
 
 
 def test_is_terminal():
-    assert is_terminal(DONE) and is_terminal(STOP)
-    assert not is_terminal(TURN) and not is_terminal(GO_TO_FRONTIER)
+    assert is_terminal(DONE)
+    assert not is_terminal(TURN) and not is_terminal(DRIVE_TO_VISIBLE)
+    assert not is_terminal(DETECT_ALL)
 
 
 def test_turn_rotates_in_place():
@@ -65,3 +63,12 @@ def test_lead_replan_suppressed_when_pending_or_disabled():
     assert not should_launch_lead_replan(2, 3, True, True)    # already pending
     assert not should_launch_lead_replan(2, 3, False, False)  # async off
     assert not should_launch_lead_replan(0, 0, True, False)   # empty batch
+
+
+def test_describe_occupancy_grid():
+    desc = describe_occupancy_grid(40, 40, 0.05, (0.5, -0.5),
+                                   n_free=600, n_occupied=200, n_unknown=800)
+    assert 'occupancy map' in desc.lower()
+    assert '0.50' in desc and '-0.50' in desc        # robot pose, %.2f
+    assert '50%' in desc                              # (600+200)/1600 explored
+    assert 'white=free' in desc and 'gray=unknown' in desc   # legend for the VLM

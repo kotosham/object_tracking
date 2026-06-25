@@ -371,7 +371,7 @@ class RGBTrackerNode(Node):
 
         score = getattr(self.segmentor, 'last_detection_score', None)
         mask = getattr(self.segmentor, 'last_mask', None)
-        self._update_best_candidate(center_coords, header, score, image.shape, mask)
+        self._update_best_candidate(center_coords, header, score, image.shape, mask, depth_frame)
 
         if self.tracking_mode == 'continuous':
             self.target_found = True
@@ -443,7 +443,8 @@ class RGBTrackerNode(Node):
         self.last_frame_received_time = now
         self.latest_burst_header = header
 
-    def _update_best_candidate(self, center_coords, header, score, image_shape, mask):
+    def _update_best_candidate(self, center_coords, header, score, image_shape, mask,
+                               depth_frame=None):
         image_height, image_width = image_shape[:2]
         center_distance = float(
             np.hypot(center_coords[0] - image_width / 2.0, center_coords[1] - image_height / 2.0)
@@ -455,6 +456,9 @@ class RGBTrackerNode(Node):
             'score': normalized_score,
             'center_distance': center_distance,
             'mask': None if mask is None else np.asarray(mask, dtype=np.uint8).copy(),
+            # Keep the matched depth frame so burst finalization can embed depth in
+            # /target_pixel.z (the ApproachDetection skill needs it; z=0.0 -> LOST).
+            'depth_frame': None if depth_frame is None else np.asarray(depth_frame, dtype=np.float32).copy(),
         }
 
         if self.best_candidate is None:
@@ -506,11 +510,27 @@ class RGBTrackerNode(Node):
             self._reset_burst_state()
             return
 
+        # Embed depth so the executive's ApproachDetection can backproject a 3D goal.
+        # Mirror continuous mode: pick the nearest depth-backed pixel inside the mask;
+        # fall back to the raw center with z=0.0 only when depth is unavailable.
+        center = self.best_candidate['center_coords']
+        target_u, target_v, target_z = float(center[0]), float(center[1]), 0.0
+        if self.use_depth_input:
+            nearest = self._select_nearest_mask_target(
+                center, self.best_candidate.get('mask'), self.best_candidate.get('depth_frame'))
+            if nearest is not None:
+                u, v, depth_m = nearest
+                target_u, target_v, target_z = float(u), float(v), float(depth_m)
+            else:
+                self.get_logger().warn(
+                    'Burst candidate has no depth-backed target point; publishing z=0.0 '
+                    '(ApproachDetection will treat it as LOST).')
+
         pixel = PointStamped()
         pixel.header = self.latest_burst_header or self.best_candidate['header']
-        pixel.point.x = float(self.best_candidate['center_coords'][0])
-        pixel.point.y = float(self.best_candidate['center_coords'][1])
-        pixel.point.z = 0.0
+        pixel.point.x = target_u
+        pixel.point.y = target_v
+        pixel.point.z = target_z
 
         target_mask = self.best_candidate.get('mask')
         if target_mask is not None:

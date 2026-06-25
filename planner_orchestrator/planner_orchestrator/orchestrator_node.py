@@ -2,14 +2,15 @@
 """Planner Orchestrator (Phase 4): VLM-mode planner over the FLAT executive.
 
 Replans every N ATOMIC steps. Each step: build an Observation from the latest
-frontiers + detections + notes (+ the camera frame for the VLM), ask the client
-(mock or OpenAI-compatible) for up to N atomic actions, and dispatch each to an
-EXISTING FLAT skill on the Pi executive:
+detections + notes (+ the camera frame for the VLM), ask the client (mock or
+OpenAI-compatible) for up to N atomic actions, and dispatch each:
   TURN / DRIVE_FORWARD -> GoToPose at a pose RELATIVE to the robot's real pose
-  DRIVE_TO_VISIBLE     -> ApproachDetection
-  GO_TO_FRONTIER       -> ExploreFrontier(id)
-  GET_OBSERVATION      -> GetObservation ; STOP -> Stop ; DONE -> finish
-The VLM is never on the reactive path; the executive owns motion + safety. A
+  DRIVE_TO_VISIBLE     -> ApproachDetection (drive to a detected object via Nav)
+  DETECT_ALL           -> broad-vocab detector call -> objects + classes into notes
+  DONE                 -> finish
+The vocabulary is deliberately small (raw motion + perception) so the VLM does its
+own navigation reasoning -- a fair comparison against the FLAT policy. The VLM is
+never on the reactive path; the executive owns motion + safety. A
 per-call timeout + circuit-breaker degrade VLM->FLAT on loss. Mock-first: with
 use_mock (or no credentials anywhere) the whole loop runs in sim/CI with no API
 key. Trigger a mission by publishing the target on /vlm_mission (std_msgs/String).
@@ -37,16 +38,17 @@ import rclpy
 from rclpy.action import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.node import Node
+from rclpy.qos import (DurabilityPolicy, HistoryPolicy, QoSProfile,
+                       ReliabilityPolicy)
 
 from geometry_msgs.msg import PointStamped, PoseStamped
+from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
 from tf2_ros import (Buffer, ConnectivityException, ExtrapolationException,
                      LookupException, TransformListener)
 
-from ar_project_msgs.action import (ApproachDetection, ExploreFrontier,
-                                    GetObservation, GoToPose, Stop)
-from ar_project_msgs.msg import FrontierArray
+from ar_project_msgs.action import ApproachDetection, GoToPose, Stop
 from object_tracking_msgs.action import DetectTarget
 from object_tracking_msgs.msg import Notes
 
@@ -55,13 +57,14 @@ from fleet_comms.qos import detection_stream_nodeadline
 from fleet_comms.heartbeat import HeartbeatPublisher
 from planner_orchestrator import orchestration as orch
 from planner_orchestrator.planner_logic import (
-    Candidate, CircuitBreaker, DegradationLatch, FrontierOpt, NotesBuffer, Observation,
-    DRIVE_FORWARD, DRIVE_TO_VISIBLE, GET_OBSERVATION, GO_TO_FRONTIER, STOP, TURN,
+    Candidate, CircuitBreaker, DegradationLatch, NotesBuffer, Observation,
+    DETECT_ALL, DRIVE_FORWARD, DRIVE_TO_VISIBLE, TURN,
 )
 from planner_orchestrator.vlm_client import make_client
 
 try:
     import cv2
+    import numpy as np
     from cv_bridge import CvBridge
     _HAVE_CV = True
 except Exception:                       # mock mode needs no image pipeline
@@ -70,6 +73,15 @@ except Exception:                       # mock mode needs no image pipeline
 
 def _yaw_to_quat(yaw):
     return (0.0, 0.0, math.sin(yaw / 2.0), math.cos(yaw / 2.0))
+
+
+def _map_latched_qos():
+    """QoS matching a SLAM /map publisher: reliable + transient_local + keep_last(1)."""
+    q = QoSProfile(depth=1)
+    q.history = HistoryPolicy.KEEP_LAST
+    q.reliability = ReliabilityPolicy.RELIABLE
+    q.durability = DurabilityPolicy.TRANSIENT_LOCAL
+    return q
 
 
 class PlannerOrchestrator(Node):
@@ -88,7 +100,6 @@ class PlannerOrchestrator(Node):
         self.declare_parameter('vlm_timeout_s', 8.0)
         self.declare_parameter('turn_step_rad', 0.6)
         self.declare_parameter('forward_step_m', 0.5)
-        self.declare_parameter('max_travel_m', 2.5)
         self.declare_parameter('approach_offset', 0.58)
         self.declare_parameter('max_steps', 60)
         self.declare_parameter('map_frame', 'map')
@@ -110,12 +121,21 @@ class PlannerOrchestrator(Node):
         # and feed the chosen mark's pixel to ApproachDetection on DRIVE_TO_VISIBLE.
         self.declare_parameter('detect_action_name', 'detect_target')
         self.declare_parameter('detect_timeout_s', 6.0)
+        # Confidence floor for detections the planner acts on. 0.0 keeps the detector's
+        # own default (0.25). Raise it (e.g. 0.5) to ignore weak/edge-of-frame matches --
+        # a natural-language query like "ride to bus" scores ~0.45 vs ~0.66 for "bus",
+        # so a higher floor with a bare label avoids acting on a marginal glimpse.
+        self.declare_parameter('detect_conf', 0.0)
         self.declare_parameter('camera_frame', 'camera_link_optical')
+        # Attach the top-down SLAM occupancy map as a 2nd image to the VLM. map_max_px
+        # bounds the rendered map's longest side (kept small to limit tokens/latency).
+        self.declare_parameter('map_topic', '/map')
+        self.declare_parameter('send_map', True)
+        self.declare_parameter('map_max_px', 384)
         g = lambda n: self.get_parameter(n).value
         self.replan_n = max(1, int(g('replan_every_n')))
         self.turn_step = float(g('turn_step_rad'))
         self.fwd_step = float(g('forward_step_m'))
-        self.max_travel = float(g('max_travel_m'))
         self.approach_offset = float(g('approach_offset'))
         self.max_steps = int(g('max_steps'))
         self.map_frame = g('map_frame')
@@ -124,8 +144,11 @@ class PlannerOrchestrator(Node):
         self.result_timeout_s = float(g('result_timeout_s'))
         self.min_step_s = float(g('min_step_s'))
         self.detect_timeout_s = float(g('detect_timeout_s'))
+        self.detect_conf = float(g('detect_conf'))
         self.vlm_timeout_s = float(g('vlm_timeout_s'))
         self.camera_frame = g('camera_frame')
+        self.send_map = bool(g('send_map')) and _HAVE_CV
+        self.map_max_px = int(g('map_max_px'))
         self.async_replan = bool(g('async_replan'))
         self._planner_pool = ThreadPoolExecutor(max_workers=1,
                                                 thread_name_prefix='replan')
@@ -150,16 +173,17 @@ class PlannerOrchestrator(Node):
         self._epoch = int(g('mission_epoch'))
 
         # ---- inputs ----
-        self._frontiers = None
         self._pixel = None
         self._jpeg = None
+        self._map = None                 # latest SLAM OccupancyGrid (for the VLM map)
         # guards the consistency of the (camera jpeg, /target_pixel) snapshot vs the
         # ROS executor threads that write them (_on_image / _on_pixel)
         self._lock = threading.Lock()
         self._bridge = CvBridge() if _HAVE_CV else None
         sub = ReentrantCallbackGroup()
-        self.create_subscription(FrontierArray, '/frontiers', self._on_frontiers, 1,
-                                 callback_group=sub)
+        if self.send_map:
+            self.create_subscription(OccupancyGrid, g('map_topic'), self._on_map,
+                                     _map_latched_qos(), callback_group=sub)
         # BEST_EFFORT/no-deadline to match the detector/tracker's offered QoS (a
         # RELIABLE sub would receive nothing from a BEST_EFFORT publisher)
         self.create_subscription(PointStamped, '/target_pixel', self._on_pixel,
@@ -174,10 +198,8 @@ class PlannerOrchestrator(Node):
         # ---- executive skill clients (loopback-style poll on a reentrant group) ----
         cg = ReentrantCallbackGroup()
         self._ac = {
-            orch.SKILL_EXPLORE: ActionClient(self, ExploreFrontier, 'explore_frontier', callback_group=cg),
             orch.SKILL_GO_TO_POSE: ActionClient(self, GoToPose, 'go_to_pose', callback_group=cg),
             orch.SKILL_APPROACH: ActionClient(self, ApproachDetection, 'approach_detection', callback_group=cg),
-            orch.SKILL_GET_OBS: ActionClient(self, GetObservation, 'get_observation', callback_group=cg),
             orch.SKILL_STOP: ActionClient(self, Stop, 'stop', callback_group=cg),
         }
         self._detect = ActionClient(self, DetectTarget, g('detect_action_name'),
@@ -195,8 +217,8 @@ class PlannerOrchestrator(Node):
             % (type(self.client).__name__, self._cred_src, self.replan_n))
 
     # ---- input callbacks ----
-    def _on_frontiers(self, msg):
-        self._frontiers = msg
+    def _on_map(self, msg):
+        self._map = msg
 
     def _on_pixel(self, msg):
         with self._lock:
@@ -226,17 +248,15 @@ class PlannerOrchestrator(Node):
 
     def _observation(self, target, step_index):
         """Pull candidates + the matching VLM image together, then build the
-        Observation. Returns (obs, pixels, jpeg) so the plan uses a CONSISTENT
-        (candidate ids, image) pair even while the camera/replan threads run."""
+        Observation. Returns (obs, pixels, jpeg, map_jpeg) so the plan uses a
+        CONSISTENT (candidate ids, camera image) pair even while the camera/replan
+        threads run; the top-down SLAM map is rendered alongside (or None)."""
         cands, pixels, jpeg = self._refresh_candidates(target)
-        fr = []
-        if self._frontiers is not None:
-            for f in self._frontiers.frontiers:
-                fr.append(FrontierOpt(id=int(f.id), distance_m=float(f.distance_m),
-                                      score=float(f.score)))
-        obs = Observation(target=target, candidates=cands, frontiers=fr,
-                          notes_facts=self.notes.facts, step_index=step_index)
-        return obs, pixels, jpeg
+        map_jpeg, map_text = self._render_map()
+        obs = Observation(target=target, candidates=cands,
+                          notes_facts=self.notes.facts, step_index=step_index,
+                          map_text=map_text)
+        return obs, pixels, jpeg, map_jpeg
 
     def _refresh_candidates(self, target):
         """Query the edge DetectTarget service. Returns (candidates, pixels, jpeg)
@@ -250,16 +270,25 @@ class PlannerOrchestrator(Node):
             g.mission_epoch = self._epoch
             g.query = target
             g.render_setofmark = True
-            g.conf_threshold = 0.0
+            g.conf_threshold = self.detect_conf
             res = self._call_action(self._detect, g, self.detect_timeout_s)
             if res is not None and getattr(res, 'candidates', None):
                 cands, pix = [], {}
                 for c in res.candidates:
                     cands.append(Candidate(mark_id=int(c.mark_id), label=c.label,
-                                           score=float(c.confidence)))
+                                           score=float(c.confidence),
+                                           distance_m=float(c.pixel.z)))  # z = depth_m
                     pix[int(c.mark_id)] = c.pixel    # Point: x=u, y=v, z=depth_m
                 jpeg = bytes(res.annotated.data) if res.annotated.data else self._camera_jpeg()
                 return cands, pix, jpeg
+            # Detector answered but found NOTHING -> report honestly empty. Must NOT fall
+            # back to /target_pixel here: during DRIVE_TO_VISIBLE the orchestrator keeps
+            # republishing the chosen pixel on /target_pixel, which would otherwise leak
+            # back as a PHANTOM stale detection (target still "1.7 m away" after we drove
+            # right up to it and YOLOE lost it at close range).
+            return [], {}, self._camera_jpeg()
+        # Detector server absent -> last-resort single /target_pixel candidate (lets the
+        # orchestrator also run against the continuous rgb_tracker instead of the service).
         return self._fallback_candidates(target)
 
     def _fallback_candidates(self, target):
@@ -267,7 +296,8 @@ class PlannerOrchestrator(Node):
             px = self._pixel
             jpeg = self._jpeg
         if px is not None:
-            return [Candidate(mark_id=1, label=target, score=1.0)], {1: px.point}, jpeg
+            return ([Candidate(mark_id=1, label=target, score=1.0,
+                               distance_m=float(px.point.z))], {1: px.point}, jpeg)
         return [], {}, jpeg
 
     def _robot_pose(self):
@@ -281,24 +311,83 @@ class PlannerOrchestrator(Node):
                          1.0 - 2.0 * (q.y * q.y + q.z * q.z))
         return (t.x, t.y, yaw)
 
+    def _render_map(self):
+        """Render the latest SLAM OccupancyGrid to a compact top-down JPEG with the
+        robot drawn on it (white=free, black=obstacle, gray=unknown; red dot+line =
+        robot pose+heading), plus a text description. North-up, metric. Returns
+        (jpeg_bytes | None, description | '')."""
+        grid = self._map
+        if not self.send_map or grid is None or not _HAVE_CV:
+            return None, ''
+        w, h = int(grid.info.width), int(grid.info.height)
+        res = float(grid.info.resolution)
+        if w <= 0 or h <= 0 or res <= 0.0:
+            return None, ''
+        ox = float(grid.info.origin.position.x)
+        oy = float(grid.info.origin.position.y)
+        try:
+            data = np.asarray(grid.data, dtype=np.int16).reshape(h, w)
+        except (ValueError, TypeError):
+            return None, ''
+        img = np.full((h, w), 127, dtype=np.uint8)        # unknown (-1)
+        img[(data >= 0) & (data < 50)] = 255              # free
+        img[data >= 50] = 0                               # occupied
+        n_unknown = int(np.count_nonzero(data < 0))
+        n_occ = int(np.count_nonzero(data >= 50))
+        n_free = w * h - n_unknown - n_occ
+        # OccupancyGrid origin is bottom-left; image row 0 is top -> flip to north-up.
+        img = cv2.cvtColor(cv2.flip(img, 0), cv2.COLOR_GRAY2BGR)
+        pose = self._robot_pose()
+        robot_xy = (pose[0], pose[1]) if pose else (ox + w * res / 2.0, oy + h * res / 2.0)
+        if pose is not None:
+            cx = int((pose[0] - ox) / res)
+            cy = int((pose[1] - oy) / res)
+            if 0 <= cx < w and 0 <= cy < h:
+                py = h - 1 - cy                            # world->flipped image row
+                r = max(2, w // 80)
+                cv2.circle(img, (cx, py), r, (0, 0, 255), -1)
+                ll = max(6, w // 12)
+                hx = int(cx + math.cos(pose[2]) * ll)
+                hy = int(py - math.sin(pose[2]) * ll)      # screen y is down
+                cv2.line(img, (cx, py), (hx, hy), (0, 0, 255), 2)
+        scale = self.map_max_px / float(max(w, h))
+        if scale < 1.0:                                    # cap size; keep cells crisp
+            img = cv2.resize(img, (max(1, int(w * scale)), max(1, int(h * scale))),
+                             interpolation=cv2.INTER_NEAREST)
+        ok, buf = cv2.imencode('.jpg', img)
+        if not ok:
+            return None, ''
+        return buf.tobytes(), orch.describe_occupancy_grid(
+            w, h, res, robot_xy, n_free, n_occ, n_unknown)
+
     # ---- anytime/async mission loop (Phase 4.6): replan overlaps execution ----
     def _compute_plan(self, target, step):
         """Build an observation and ask the planner for up to N atomic actions.
         Runs either inline (bootstrap) or on the planner pool concurrently with
         execution. Returns a _PlanBundle (actions + the candidate pixel snapshot
         the VLM chose from); empty actions on VLM failure (circuit-breaker fed)."""
-        # (obs, pixels, jpeg) captured together -> the plan's DRIVE_TO_VISIBLE pixels
-        # and the VLM image are a consistent pair (race-free vs camera/replan threads).
-        obs, pixels, jpeg = self._observation(target, step)
+        # (obs, pixels, jpeg, map_jpeg) captured together -> the plan's DRIVE_TO_VISIBLE
+        # pixels and the VLM images are a consistent set (race-free vs camera/replan).
+        obs, pixels, jpeg, map_jpeg = self._observation(target, step)
         # Phase 5.1: pick VLM or the latched FLAT fallback (once the breaker opens).
         client = self._degrade.select(self.client, self._fallback, self.cb.is_open)
         if self._degrade.just_degraded():
             self.get_logger().error('circuit-breaker OPEN -> degrade VLM->FLAT (mission '
                                      'continues as FLAT, DEGRADED)')
             self.notes.add_fact('DEGRADED: VLM lost -> continuing in FLAT fallback')
+        best = max(obs.candidates, key=lambda c: c.score, default=None)
+        det = ('' if best is None
+               else " best='%s' conf=%.2f @%.2fm" % (best.label, best.score, best.distance_m))
+        self.get_logger().info(
+            'observe@step %d: %d detection(s)%s, notes=%d, map=%s -> asking %s'
+            % (step, len(obs.candidates), det, len(obs.notes_facts),
+               'yes' if map_jpeg else 'no', type(client).__name__))
         try:
-            actions = list(client.plan_sequence(obs, jpeg, n=self.replan_n))
+            actions = list(client.plan_sequence(obs, jpeg, map_jpeg, n=self.replan_n))
             self.cb.record_success() if actions else self.cb.record_failure()
+            self.get_logger().info('plan@step %d: VLM returned %d action(s): %s'
+                                   % (step, len(actions),
+                                      ', '.join(self._action_brief(a) for a in actions) or '-'))
         except Exception as e:
             self.cb.record_failure()
             self.get_logger().warn('plan failed (%s); cb_open=%s' % (e, self.cb.is_open))
@@ -339,12 +428,11 @@ class PlannerOrchestrator(Node):
                     continue
                 terminate = False
                 for i, action in enumerate(bundle.actions):
-                    self.get_logger().info('step %d: %s (%s)'
-                                           % (step, action.name, action.rationale or ''))
-                    if orch.is_terminal(action.kind):
+                    self.get_logger().info('step %d: %s -- %s'
+                                           % (step, self._action_brief(action),
+                                              action.rationale or ''))
+                    if orch.is_terminal(action.kind):       # DONE
                         self.get_logger().info('VLM mission finished: %s' % action.name)
-                        if action.kind == STOP:
-                            self._dispatch_stop()
                         self._publish_notes(target)
                         step += 1            # count the terminal action too
                         terminate = True
@@ -388,8 +476,18 @@ class PlannerOrchestrator(Node):
             self._busy = False
 
     # ---- dispatch one atomic action to the matching FLAT skill ----
+    @staticmethod
+    def _action_brief(a):
+        """Compact human label incl. the numeric argument the VLM chose (for logs)."""
+        if a.kind == TURN:
+            return 'TURN %+.2frad' % a.turn_yaw_rad
+        if a.kind == DRIVE_FORWARD:
+            return 'DRIVE_FORWARD %+.2fm' % a.forward_dist_m
+        if a.kind == DRIVE_TO_VISIBLE:
+            return 'DRIVE_TO_VISIBLE mark=%d' % a.mark_id
+        return a.name
+
     def _dispatch(self, action, cand_pixels):
-        skill = orch.skill_for_action(action.kind)
         if action.kind in (TURN, DRIVE_FORWARD):
             pose = self._robot_pose()
             if pose is None:
@@ -397,12 +495,10 @@ class PlannerOrchestrator(Node):
                 return False
             gx, gy, gyaw = orch.relative_goal(pose[0], pose[1], pose[2], action)
             return self._send_goto(gx, gy, gyaw)
-        if action.kind == GO_TO_FRONTIER:
-            return self._send_explore(action.frontier_id)
         if action.kind == DRIVE_TO_VISIBLE:
             return self._send_approach_mark(action.mark_id, action.arg_label, cand_pixels)
-        if action.kind == GET_OBSERVATION:
-            return self._send_getobs()
+        if action.kind == DETECT_ALL:
+            return self._do_detect_all()
         return False
 
     def _goal_id(self):
@@ -423,14 +519,6 @@ class PlannerOrchestrator(Node):
         g.xy_tolerance = 0.25
         g.yaw_tolerance = 0.5
         return self._send_and_wait(orch.SKILL_GO_TO_POSE, g)
-
-    def _send_explore(self, frontier_id):
-        g = ExploreFrontier.Goal()
-        g.request_id = self._goal_id()
-        g.mission_epoch = self._epoch
-        g.frontier_id = int(frontier_id)
-        g.max_travel_m = self.max_travel
-        return self._send_and_wait(orch.SKILL_EXPLORE, g)
 
     def _send_approach(self, label):
         g = ApproachDetection.Goal()
@@ -489,12 +577,29 @@ class PlannerOrchestrator(Node):
             return None
         return getattr(res_box.get('res'), 'result', None)
 
-    def _send_getobs(self):
-        g = GetObservation.Goal()
+    def _do_detect_all(self):
+        """DETECT_ALL: run the detector over a broad object vocabulary (empty query =>
+        detect-all on the server) and record what is in view -- objects + their
+        classes -- into the notes the VLM reads next replan. Perception only; the
+        robot does not move. Returns True if anything was detected."""
+        if not self._detect.wait_for_server(timeout_sec=1.0):
+            self.get_logger().warn('DETECT_ALL: detector server unavailable')
+            return False
+        g = DetectTarget.Goal()
         g.request_id = self._goal_id()
         g.mission_epoch = self._epoch
-        g.with_setofmark = True
-        return self._send_and_wait(orch.SKILL_GET_OBS, g)
+        g.query = ''                      # empty query => broad-vocabulary detection
+        g.render_setofmark = True
+        g.conf_threshold = self.detect_conf
+        res = self._call_action(self._detect, g, self.detect_timeout_s)
+        cands = getattr(res, 'candidates', None) if res is not None else None
+        if not cands:
+            self.notes.add_fact('DETECT_ALL: nothing detected in view')
+            return False
+        seen = ', '.join('%s(%.2f)' % (c.label, c.confidence) for c in cands)
+        self.notes.add_fact('objects in view: ' + seen)
+        self.get_logger().info('DETECT_ALL: %d object(s): %s' % (len(cands), seen))
+        return True
 
     def _dispatch_stop(self):
         g = Stop.Goal()

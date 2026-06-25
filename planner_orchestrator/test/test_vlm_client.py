@@ -4,7 +4,7 @@ import json
 import pytest
 
 from planner_orchestrator.planner_logic import (
-    Candidate, FrontierOpt, Observation, DRIVE_TO_VISIBLE, GO_TO_FRONTIER, TURN,
+    Candidate, Observation, DRIVE_TO_VISIBLE, DETECT_ALL, TURN,
 )
 from planner_orchestrator.vlm_client import (
     ENV_API_KEY, ENV_BASE_URL, ENV_MODEL,
@@ -67,8 +67,7 @@ def test_mock_client_drives_loop():
 
 def test_build_messages_includes_image_and_options():
     c = OpenAICompatibleClient('http://x/v1', 'k', 'qwen')
-    obs = Observation(target='bus', candidates=[Candidate(2, 'bus', 0.9)],
-                      frontiers=[FrontierOpt(7, 1.0, 5.0)])
+    obs = Observation(target='bus', candidates=[Candidate(2, 'bus', 0.9)])
     msgs = c.build_messages(obs, image_jpeg=b'\xff\xd8jpegbytes')
     assert msgs[0]['role'] == 'system'
     user = msgs[1]['content']
@@ -85,13 +84,31 @@ def test_build_messages_text_only_when_no_image():
     assert all(p['type'] == 'text' for p in msgs[1]['content'])
 
 
+def test_build_messages_attaches_map_as_second_image():
+    c = OpenAICompatibleClient('http://x/v1', 'k', 'qwen')
+    obs = Observation(target='bus', candidates=[Candidate(2, 'bus', 0.9)],
+                      map_text='occupancy map')
+    msgs = c.build_messages(obs, image_jpeg=b'\xff\xd8camera', map_jpeg=b'\xff\xd8map')
+    images = [p for p in msgs[1]['content'] if p['type'] == 'image_url']
+    assert len(images) == 2                      # camera + map
+    assert 'occupancy map' in msgs[1]['content'][0]['text']   # map described in opts
+
+
 def test_parse_response_valid_tool_call():
     c = OpenAICompatibleClient('http://x/v1', 'k', 'qwen')
-    obs = Observation(target='bus', frontiers=[FrontierOpt(7, 1.0, 5.0)])
+    obs = Observation(target='bus', candidates=[Candidate(2, 'bus', 0.9)])
     resp = json.dumps({'choices': [{'message': {'content':
-           json.dumps({'action': 'GO_TO_FRONTIER', 'frontier_id': 7, 'rationale': 'explore'})}}]})
+           json.dumps({'action': 'DRIVE_TO_VISIBLE', 'mark_id': 2, 'rationale': 'approach'})}}]})
     act = c.parse_response(resp, obs)
-    assert act.kind == GO_TO_FRONTIER and act.frontier_id == 7
+    assert act.kind == DRIVE_TO_VISIBLE and act.mark_id == 2
+
+
+def test_parse_response_detect_all():
+    c = OpenAICompatibleClient('http://x/v1', 'k', 'qwen')
+    resp = json.dumps({'choices': [{'message': {'content':
+           json.dumps({'action': 'DETECT_ALL', 'rationale': 'survey'})}}]})
+    act = c.parse_response(resp, Observation(target='bus'))
+    assert act.kind == DETECT_ALL
 
 
 def test_parse_response_handles_list_content():
