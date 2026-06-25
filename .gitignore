@@ -1,4 +1,6 @@
-object_tracking/model_weights/*
+# Model weights (~600 MB, live only on edge; unanchored so it matches the
+# real nested path object_tracking/object_tracking/model_weights/ at any depth)
+model_weights/
 __pycache__/
 *.py[cod]
 
