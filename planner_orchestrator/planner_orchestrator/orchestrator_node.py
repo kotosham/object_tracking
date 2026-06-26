@@ -37,6 +37,7 @@ _PlanBundle = namedtuple('_PlanBundle', 'actions pixels')
 import rclpy
 from rclpy.action import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import (DurabilityPolicy, HistoryPolicy, QoSProfile,
                        ReliabilityPolicy)
@@ -104,6 +105,12 @@ class PlannerOrchestrator(Node):
         self.declare_parameter('max_steps', 60)
         self.declare_parameter('map_frame', 'map')
         self.declare_parameter('robot_frame', 'base_link')
+        # Relative VLM actions (TURN / DRIVE_FORWARD) only need a local metric
+        # frame. In sim startup / degraded SLAM, map->base_link can be briefly
+        # absent while odom->base_link is already valid, so fall back to odom
+        # instead of dropping the motion.
+        self.declare_parameter('motion_fallback_frame', 'odom')
+        self.declare_parameter('tf_lookup_timeout_s', 1.0)
         self.declare_parameter('skill_wait_s', 5.0)
         self.declare_parameter('result_timeout_s', 90.0)
         # Epoch the orchestrator's skill goals carry: must match the executive's
@@ -140,6 +147,8 @@ class PlannerOrchestrator(Node):
         self.max_steps = int(g('max_steps'))
         self.map_frame = g('map_frame')
         self.robot_frame = g('robot_frame')
+        self.motion_fallback_frame = g('motion_fallback_frame')
+        self.tf_lookup_timeout_s = float(g('tf_lookup_timeout_s'))
         self.skill_wait_s = float(g('skill_wait_s'))
         self.result_timeout_s = float(g('result_timeout_s'))
         self.min_step_s = float(g('min_step_s'))
@@ -300,16 +309,40 @@ class PlannerOrchestrator(Node):
                                distance_m=float(px.point.z))], {1: px.point}, jpeg)
         return [], {}, jpeg
 
-    def _robot_pose(self):
+    def _lookup_robot_pose(self, target_frame, timeout_s=0.0):
         try:
-            tf = self._tf.lookup_transform(self.map_frame, self.robot_frame, rclpy.time.Time())
+            if timeout_s > 0.0:
+                tf = self._tf.lookup_transform(
+                    target_frame, self.robot_frame, rclpy.time.Time(),
+                    timeout=Duration(seconds=float(timeout_s)))
+            else:
+                tf = self._tf.lookup_transform(
+                    target_frame, self.robot_frame, rclpy.time.Time())
         except (LookupException, ConnectivityException, ExtrapolationException):
             return None
         t = tf.transform.translation
         q = tf.transform.rotation
         yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
                          1.0 - 2.0 * (q.y * q.y + q.z * q.z))
-        return (t.x, t.y, yaw)
+        return (t.x, t.y, yaw, target_frame)
+
+    def _robot_pose(self):
+        return self._lookup_robot_pose(self.map_frame, timeout_s=0.0)
+
+    def _motion_pose(self):
+        frames = [self.map_frame]
+        if self.motion_fallback_frame and self.motion_fallback_frame not in frames:
+            frames.append(self.motion_fallback_frame)
+        for frame in frames:
+            pose = self._lookup_robot_pose(frame, timeout_s=self.tf_lookup_timeout_s)
+            if pose is not None:
+                if frame != self.map_frame:
+                    self.get_logger().warn(
+                        'no %s->%s TF; using %s->%s for relative motion'
+                        % (self.map_frame, self.robot_frame, frame, self.robot_frame),
+                        throttle_duration_sec=5.0)
+                return pose
+        return None
 
     def _render_map(self):
         """Render the latest SLAM OccupancyGrid to a compact top-down JPEG with the
@@ -489,12 +522,15 @@ class PlannerOrchestrator(Node):
 
     def _dispatch(self, action, cand_pixels):
         if action.kind in (TURN, DRIVE_FORWARD):
-            pose = self._robot_pose()
+            pose = self._motion_pose()
             if pose is None:
-                self.get_logger().warn('no %s->%s TF; skip motion' % (self.map_frame, self.robot_frame))
+                self.get_logger().warn(
+                    'no TF for relative motion (%s->%s or %s->%s); skip motion'
+                    % (self.map_frame, self.robot_frame,
+                       self.motion_fallback_frame, self.robot_frame))
                 return False
             gx, gy, gyaw = orch.relative_goal(pose[0], pose[1], pose[2], action)
-            return self._send_goto(gx, gy, gyaw)
+            return self._send_goto(gx, gy, gyaw, frame_id=pose[3])
         if action.kind == DRIVE_TO_VISIBLE:
             return self._send_approach_mark(action.mark_id, action.arg_label, cand_pixels)
         if action.kind == DETECT_ALL:
@@ -504,12 +540,12 @@ class PlannerOrchestrator(Node):
     def _goal_id(self):
         return uuid.uuid4().hex
 
-    def _send_goto(self, x, y, yaw):
+    def _send_goto(self, x, y, yaw, frame_id=None):
         g = GoToPose.Goal()
         g.request_id = self._goal_id()
         g.mission_epoch = self._epoch
         ps = PoseStamped()
-        ps.header.frame_id = self.map_frame
+        ps.header.frame_id = frame_id or self.map_frame
         ps.header.stamp = self.get_clock().now().to_msg()
         ps.pose.position.x, ps.pose.position.y = float(x), float(y)
         qx, qy, qz, qw = _yaw_to_quat(yaw)
