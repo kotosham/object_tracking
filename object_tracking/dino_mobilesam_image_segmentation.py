@@ -144,7 +144,7 @@ class GroundingDINOMobileSAMSegmentor:
         )
         return os.path.isdir(path) and all(os.path.isfile(os.path.join(path, name)) for name in required_files)
 
-    def segment(self, image_bgr, prompt, depth_map):
+    def segment(self, image_bgr, prompt, depth_map, min_mask_area=100, box_threshold=0.50):
         self.last_detection_score = None
         self.last_detection_label = None
         self.last_mask = None
@@ -178,8 +178,8 @@ class GroundingDINOMobileSAMSegmentor:
 
         result = results[0]
 
-        # Фильтрация по порогу
-        box_threshold = 0.55
+        # Фильтрация по уверенности GroundingDINO.
+        box_threshold = float(box_threshold)
         filtered = [
             (box.cpu().numpy(), score.item(), label)
             for box, score, label in zip(result["boxes"], result["scores"], result["labels"])
@@ -260,6 +260,11 @@ class GroundingDINOMobileSAMSegmentor:
         mask = masks[0][0].cpu().numpy() > 0.5
         ys, xs = np.where(mask)
         if xs.size == 0 or ys.size == 0:
+            return image_bgr, None, depth_map, DINO_time + SAM_time
+
+        mask_area = int(np.sum(mask))
+        if mask_area < min_mask_area and mask_area > 0:
+            print(f"Object ignored due to small area: {mask_area} pixels")
             return image_bgr, None, depth_map, DINO_time + SAM_time
 
         center_coords = self.get_center_coordinates(mask)

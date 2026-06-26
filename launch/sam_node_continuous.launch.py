@@ -28,9 +28,23 @@ def generate_launch_description():
     image_out_topic = LaunchConfiguration('image_out_topic')
     enable_search_rotation = LaunchConfiguration('enable_search_rotation')
     depth_match_tolerance = LaunchConfiguration('depth_match_tolerance')
+    nearest_depth_percentile = LaunchConfiguration('nearest_depth_percentile')
+    nearest_depth_min_pixels = LaunchConfiguration('nearest_depth_min_pixels')
     target_publish_rate = LaunchConfiguration('target_publish_rate')
     continuous_frame_max_age = LaunchConfiguration('continuous_frame_max_age')
+    continuous_rgb_stamp_max_age = LaunchConfiguration('continuous_rgb_stamp_max_age')
     publish_mask_in_continuous = LaunchConfiguration('publish_mask_in_continuous')
+    clip_min_mask_area = LaunchConfiguration('clip_min_mask_area')
+    dino_box_threshold = LaunchConfiguration('dino_box_threshold')
+    dino_mobilesam_min_mask_area = LaunchConfiguration('dino_mobilesam_min_mask_area')
+    florence2_model_id = LaunchConfiguration('florence2_model_id')
+    florence2_task_prompt = LaunchConfiguration('florence2_task_prompt')
+    florence2_max_new_tokens = LaunchConfiguration('florence2_max_new_tokens')
+    florence2_num_beams = LaunchConfiguration('florence2_num_beams')
+    clip_threshold = LaunchConfiguration('clip_threshold')
+    florence2_min_mask_area = LaunchConfiguration('florence2_min_mask_area')
+    yoloe_conf_threshold = LaunchConfiguration('yoloe_conf_threshold')
+    yoloe_min_mask_area = LaunchConfiguration('yoloe_min_mask_area')
 
     continuous_tracker = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(sam_node_launch),
@@ -53,9 +67,23 @@ def generate_launch_description():
             'use_depth_input': use_depth_input,
             'depth_topic': depth_topic,
             'depth_match_tolerance': depth_match_tolerance,
+            'nearest_depth_percentile': nearest_depth_percentile,
+            'nearest_depth_min_pixels': nearest_depth_min_pixels,
             'target_publish_rate': target_publish_rate,
             'continuous_frame_max_age': continuous_frame_max_age,
+            'continuous_rgb_stamp_max_age': continuous_rgb_stamp_max_age,
             'publish_mask_in_continuous': publish_mask_in_continuous,
+            'clip_min_mask_area': clip_min_mask_area,
+            'dino_box_threshold': dino_box_threshold,
+            'dino_mobilesam_min_mask_area': dino_mobilesam_min_mask_area,
+            'florence2_model_id': florence2_model_id,
+            'florence2_task_prompt': florence2_task_prompt,
+            'florence2_max_new_tokens': florence2_max_new_tokens,
+            'florence2_num_beams': florence2_num_beams,
+            'clip_threshold': clip_threshold,
+            'florence2_min_mask_area': florence2_min_mask_area,
+            'yoloe_conf_threshold': yoloe_conf_threshold,
+            'yoloe_min_mask_area': yoloe_min_mask_area,
             'enable_search_rotation': enable_search_rotation,
             'image_out_topic': image_out_topic,
         }.items(),
@@ -80,7 +108,7 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'model_mode',
             default_value='auto',
-            description='Segmentation backend: auto, clip, dino_mobilesam, or yoloe.',
+            description='Segmentation backend: auto, clip, dino_mobilesam, florence2, or yoloe.',
         ),
         DeclareLaunchArgument(
             'search_angular_speed',
@@ -148,6 +176,16 @@ def generate_launch_description():
             description='Maximum allowed timestamp mismatch in seconds between RGB and depth frames.',
         ),
         DeclareLaunchArgument(
+            'nearest_depth_percentile',
+            default_value='5.0',
+            description='Depth percentile used instead of a raw minimum when selecting the nearest target point on a mask.',
+        ),
+        DeclareLaunchArgument(
+            'nearest_depth_min_pixels',
+            default_value='3',
+            description='Minimum number of pixels required in the nearest-depth band before publishing a continuous target.',
+        ),
+        DeclareLaunchArgument(
             'target_publish_rate',
             default_value='3.0',
             description='Maximum continuous publication rate in Hz for /target_pixel and /target_mask.',
@@ -158,9 +196,69 @@ def generate_launch_description():
             description='Whether to publish /target_mask alongside /target_pixel in continuous mode. Keep false to reduce laptop -> Raspberry Pi bandwidth.',
         ),
         DeclareLaunchArgument(
+            'florence2_model_id',
+            default_value='microsoft/Florence-2-base-ft',
+            description='Florence-2 model id or local snapshot directory name used for segmentation mode.',
+        ),
+        DeclareLaunchArgument(
+            'florence2_task_prompt',
+            default_value='<REFERRING_EXPRESSION_SEGMENTATION>',
+            description='Florence-2 task token used for text-guided segmentation.',
+        ),
+        DeclareLaunchArgument(
+            'florence2_max_new_tokens',
+            default_value='1024',
+            description='Maximum generated tokens for Florence-2 decoding.',
+        ),
+        DeclareLaunchArgument(
+            'florence2_num_beams',
+            default_value='3',
+            description='Beam count for Florence-2 generation.',
+        ),
+        DeclareLaunchArgument(
+            'clip_threshold',
+            default_value='0.70',
+            description='CLIPSeg mask probability threshold. Lower values make CLIPSeg less strict.',
+        ),
+        DeclareLaunchArgument(
+            'clip_min_mask_area',
+            default_value='100',
+            description='Minimum accepted CLIPSeg mask area in pixels.',
+        ),
+        DeclareLaunchArgument(
+            'dino_box_threshold',
+            default_value='0.50',
+            description='GroundingDINO confidence threshold before MobileSAM segmentation.',
+        ),
+        DeclareLaunchArgument(
+            'dino_mobilesam_min_mask_area',
+            default_value='100',
+            description='Minimum accepted GroundingDINO + MobileSAM mask area in pixels.',
+        ),
+        DeclareLaunchArgument(
+            'florence2_min_mask_area',
+            default_value='100',
+            description='Minimum accepted Florence-2 mask area in pixels.',
+        ),
+        DeclareLaunchArgument(
+            'yoloe_conf_threshold',
+            default_value='0.12',
+            description='YOLOE-only confidence threshold.',
+        ),
+        DeclareLaunchArgument(
+            'yoloe_min_mask_area',
+            default_value='100',
+            description='YOLOE-only minimum accepted mask area in pixels.',
+        ),
+        DeclareLaunchArgument(
             'continuous_frame_max_age',
             default_value='2.0',
             description='Drop a cached frame if it remained unprocessed longer than this many seconds.',
+        ),
+        DeclareLaunchArgument(
+            'continuous_rgb_stamp_max_age',
+            default_value='1.0',
+            description='Drop a continuous RGB frame if its ROS header stamp is older than this many seconds at arrival/inference time.',
         ),
         continuous_tracker,
     ])

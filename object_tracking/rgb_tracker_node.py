@@ -33,10 +33,26 @@ class RGBTrackerNode(Node):
         self.declare_parameter('min_depth_m', 0.1)
         self.declare_parameter('max_depth_m', 6.0)
         self.declare_parameter('nearest_depth_band_m', 0.02)
+        self.declare_parameter('nearest_depth_percentile', 5.0)
+        self.declare_parameter('nearest_depth_min_pixels', 3)
         self.declare_parameter('target_publish_rate', 3.0)
         self.declare_parameter('continuous_frame_max_age', 2.0)
+        self.declare_parameter('continuous_rgb_stamp_max_age', 0.0)
         self.declare_parameter('publish_mask_in_continuous', False)
+        self.declare_parameter('target_anchor_timeout_s', 3.0)
+        self.declare_parameter('florence2_model_id', 'microsoft/Florence-2-base-ft')
+        self.declare_parameter('florence2_task_prompt', '<REFERRING_EXPRESSION_SEGMENTATION>')
+        self.declare_parameter('florence2_max_new_tokens', 1024)
+        self.declare_parameter('florence2_num_beams', 3)
+        self.declare_parameter('clip_threshold', 0.70)
+        self.declare_parameter('clip_min_mask_area', 100)
+        self.declare_parameter('dino_box_threshold', 0.50)
+        self.declare_parameter('dino_mobilesam_min_mask_area', 100)
+        self.declare_parameter('florence2_min_mask_area', 100)
+        self.declare_parameter('yoloe_conf_threshold', 0.12)
+        self.declare_parameter('yoloe_min_mask_area', 100)
         self.declare_parameter('cv_runtime_topic', '/experiment/cv_runtime')
+        self.declare_parameter('cv_model_topic', '/experiment/cv_model')
 
         use_sam = self.get_parameter('use_sam').get_parameter_value().bool_value
         requested_mode = self.get_parameter('model_mode').get_parameter_value().string_value.strip().lower()
@@ -54,10 +70,35 @@ class RGBTrackerNode(Node):
         self.min_depth_m = self.get_parameter('min_depth_m').get_parameter_value().double_value
         self.max_depth_m = self.get_parameter('max_depth_m').get_parameter_value().double_value
         self.nearest_depth_band_m = self.get_parameter('nearest_depth_band_m').get_parameter_value().double_value
+        self.nearest_depth_percentile = (
+            self.get_parameter('nearest_depth_percentile').get_parameter_value().double_value
+        )
+        self.nearest_depth_min_pixels = max(
+            1,
+            self.get_parameter('nearest_depth_min_pixels').get_parameter_value().integer_value,
+        )
         self.target_publish_rate = self.get_parameter('target_publish_rate').get_parameter_value().double_value
         self.continuous_frame_max_age = self.get_parameter('continuous_frame_max_age').get_parameter_value().double_value
+        self.continuous_rgb_stamp_max_age = (
+            self.get_parameter('continuous_rgb_stamp_max_age').get_parameter_value().double_value
+        )
         self.publish_mask_in_continuous = self.get_parameter('publish_mask_in_continuous').get_parameter_value().bool_value
+        self.target_anchor_timeout_s = self.get_parameter('target_anchor_timeout_s').get_parameter_value().double_value
+        self.florence2_model_id = self.get_parameter('florence2_model_id').get_parameter_value().string_value
+        self.florence2_task_prompt = self.get_parameter('florence2_task_prompt').get_parameter_value().string_value
+        self.florence2_max_new_tokens = self.get_parameter('florence2_max_new_tokens').get_parameter_value().integer_value
+        self.florence2_num_beams = self.get_parameter('florence2_num_beams').get_parameter_value().integer_value
+        self.clip_threshold = self.get_parameter('clip_threshold').get_parameter_value().double_value
+        self.clip_min_mask_area = self.get_parameter('clip_min_mask_area').get_parameter_value().integer_value
+        self.dino_box_threshold = self.get_parameter('dino_box_threshold').get_parameter_value().double_value
+        self.dino_mobilesam_min_mask_area = (
+            self.get_parameter('dino_mobilesam_min_mask_area').get_parameter_value().integer_value
+        )
+        self.florence2_min_mask_area = self.get_parameter('florence2_min_mask_area').get_parameter_value().integer_value
+        self.yoloe_conf_threshold = self.get_parameter('yoloe_conf_threshold').get_parameter_value().double_value
+        self.yoloe_min_mask_area = self.get_parameter('yoloe_min_mask_area').get_parameter_value().integer_value
         self.cv_runtime_topic = self.get_parameter('cv_runtime_topic').get_parameter_value().string_value
+        self.cv_model_topic = self.get_parameter('cv_model_topic').get_parameter_value().string_value
 
         if self.tracking_mode not in ('burst', 'continuous'):
             self.get_logger().warn(
@@ -77,6 +118,14 @@ class RGBTrackerNode(Node):
         if self.model_mode == 'dino_mobilesam':
             from object_tracking.dino_mobilesam_image_segmentation import GroundingDINOMobileSAMSegmentor
             self.segmentor = GroundingDINOMobileSAMSegmentor()
+        elif self.model_mode == 'florence2':
+            from object_tracking.florence2_image_segmentation import Florence2Segmentor
+            self.segmentor = Florence2Segmentor(
+                model_id=self.florence2_model_id,
+                task_prompt=self.florence2_task_prompt,
+                max_new_tokens=self.florence2_max_new_tokens,
+                num_beams=self.florence2_num_beams,
+            )
         elif self.model_mode == 'yoloe':
             from object_tracking.yoloe_image_segmentation import YOLOESegmentor
             self.segmentor = YOLOESegmentor()
@@ -94,7 +143,9 @@ class RGBTrackerNode(Node):
         self.get_logger().info(
             f'Tracking mode: {self.tracking_mode}. '
             f'Depth input is {"enabled" if self.use_depth_input else "disabled"}. '
-            f'Input QoS reliability: {self.input_reliability}.'
+            f'Input QoS reliability: {self.input_reliability}. '
+            f'Continuous RGB stamp age limit: '
+            f'{"disabled" if self.continuous_rgb_stamp_max_age <= 0.0 else f"{self.continuous_rgb_stamp_max_age:.2f}s"}.'
         )
 
         self.current_prompt = None
@@ -125,8 +176,11 @@ class RGBTrackerNode(Node):
         self.last_depth_sync_warn_time = 0.0
         self.depth_sync_warn_period = 2.0
         self.last_continuous_age_warn_time = 0.0
+        self.last_continuous_stamp_age_warn_time = 0.0
         self.last_no_frame_warn_time = 0.0
         self.target_publish_period = 0.0 if self.target_publish_rate <= 0.0 else 1.0 / self.target_publish_rate
+        self.last_published_target_coords = None
+        self.last_published_target_time = 0.0
         sensor_qos = QoSProfile(depth=1)
         sensor_qos.reliability = (
             ReliabilityPolicy.RELIABLE
@@ -175,14 +229,19 @@ class RGBTrackerNode(Node):
         self.pixel_pub = self.create_publisher(PointStamped, '/target_pixel', tracking_output_qos)
         self.mask_pub = self.create_publisher(Image, '/target_mask', tracking_output_qos)
         self.cv_runtime_pub = self.create_publisher(Float32, self.cv_runtime_topic, 10)
+        latched_state_qos = QoSProfile(depth=1)
+        latched_state_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        latched_state_qos.reliability = ReliabilityPolicy.RELIABLE
+        self.cv_model_pub = self.create_publisher(String, self.cv_model_topic, latched_state_qos)
 
         self.timer = self.create_timer(0.1, self.timer_callback)
+        self._publish_cv_model()
 
     def _resolve_model_mode(self, requested_mode, use_sam):
         if requested_mode in ('', 'auto'):
             return 'dino_mobilesam' if use_sam else 'clip'
 
-        valid_modes = {'clip', 'dino_mobilesam', 'yoloe'}
+        valid_modes = {'clip', 'dino_mobilesam', 'florence2', 'yoloe'}
         if requested_mode not in valid_modes:
             self.get_logger().warn(
                 f'Unknown model_mode "{requested_mode}", falling back to '
@@ -196,6 +255,7 @@ class RGBTrackerNode(Node):
         labels = {
             'clip': 'CLIPSeg',
             'dino_mobilesam': 'GroundingDINO + MobileSAM',
+            'florence2': 'Florence-2',
             'yoloe': 'YOLOE',
         }
         return labels.get(model_mode, model_mode)
@@ -207,6 +267,7 @@ class RGBTrackerNode(Node):
             )
             return
 
+        self._publish_cv_model()
         self.current_prompt = msg.data
         self.target_found = False
         self.goal_locked = False
@@ -221,9 +282,18 @@ class RGBTrackerNode(Node):
         self.last_rgb_frame_received_monotonic = 0.0
         self.frames_received_for_prompt = 0
         self.last_no_frame_warn_time = 0.0
+        self.last_continuous_stamp_age_warn_time = 0.0
         self.latest_continuous_frame = None
+        self.depth_buffer.clear()
+        self.last_published_target_coords = None
+        self.last_published_target_time = 0.0
         self._reset_burst_state()
         self.get_logger().info(f'New prompt received: "{self.current_prompt}"')
+
+    def _publish_cv_model(self):
+        msg = String()
+        msg.data = self.model_mode
+        self.cv_model_pub.publish(msg)
 
     def goal_locked_callback(self, msg):
         was_locked = self.goal_locked
@@ -239,6 +309,10 @@ class RGBTrackerNode(Node):
             self.prompt_started_monotonic = 0.0
             self.last_rgb_frame_received_monotonic = 0.0
             self.frames_received_for_prompt = 0
+            self.last_continuous_stamp_age_warn_time = 0.0
+            self.depth_buffer.clear()
+            self.last_published_target_coords = None
+            self.last_published_target_time = 0.0
             self.get_logger().info('Goal lock received from Raspberry Pi bridge. Pausing RGB tracking until the next prompt.')
             if completed_prompt:
                 self.get_logger().info(
@@ -305,6 +379,8 @@ class RGBTrackerNode(Node):
         self._note_rgb_frame_received(msg.header)
         if self.tracking_mode == 'burst':
             self._note_burst_frame_arrival(msg.header)
+        if self.tracking_mode == 'continuous' and self._is_continuous_rgb_stamp_stale(msg.header):
+            return
         try:
             image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         except CvBridgeError as exc:
@@ -323,6 +399,8 @@ class RGBTrackerNode(Node):
         self._note_rgb_frame_received(msg.header)
         if self.tracking_mode == 'burst':
             self._note_burst_frame_arrival(msg.header)
+        if self.tracking_mode == 'continuous' and self._is_continuous_rgb_stamp_stale(msg.header):
+            return
         np_arr = np.frombuffer(msg.data, np.uint8)
         image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
         if image is None:
@@ -388,11 +466,34 @@ class RGBTrackerNode(Node):
     def _process_image(self, image, header, depth_frame):
         if self.model_mode == 'dino_mobilesam':
             seg_img, center_coords, _unused_depth, segmentation_time = self.segmentor.segment(
-                image, self.current_prompt, depth_frame
+                image,
+                self.current_prompt,
+                depth_frame,
+                box_threshold=float(self.dino_box_threshold),
+                min_mask_area=int(self.dino_mobilesam_min_mask_area),
+            )
+        elif self.model_mode == 'florence2':
+            seg_img, center_coords, segmentation_time, _unused_depth = self.segmentor.segment(
+                image,
+                self.current_prompt,
+                depth_frame,
+                min_mask_area=int(self.florence2_min_mask_area),
+            )
+        elif self.model_mode == 'yoloe':
+            seg_img, center_coords, segmentation_time, _unused_depth = self.segmentor.segment(
+                image,
+                self.current_prompt,
+                depth_frame,
+                conf=float(self.yoloe_conf_threshold),
+                min_mask_area=int(self.yoloe_min_mask_area),
             )
         else:
             seg_img, center_coords, segmentation_time, _unused_depth = self.segmentor.segment(
-                image, self.current_prompt, depth_frame
+                image,
+                self.current_prompt,
+                depth_frame,
+                threshold=float(self.clip_threshold),
+                min_mask_area=int(self.clip_min_mask_area),
             )
 
         self.total_seg_time += segmentation_time
@@ -454,6 +555,10 @@ class RGBTrackerNode(Node):
             return
 
         frame = self.latest_continuous_frame
+        if self._is_continuous_rgb_stamp_stale(frame['header'], stage='before inference'):
+            self.latest_continuous_frame = None
+            return
+
         frame_age = time.monotonic() - frame['stored_monotonic']
         if self.continuous_frame_max_age > 0.0 and frame_age > self.continuous_frame_max_age:
             self.latest_continuous_frame = None
@@ -579,7 +684,8 @@ class RGBTrackerNode(Node):
         target_v = int(center_coords[1])
         target_depth = None
         if self.use_depth_input:
-            nearest_target = self._select_nearest_mask_target(center_coords, mask, depth_frame)
+            reference_coords = self._get_continuous_target_anchor(center_coords)
+            nearest_target = self._select_nearest_mask_target(reference_coords, mask, depth_frame)
             if nearest_target is None:
                 self._warn_depth_sync(
                     'Continuous target update skipped: no valid depth-backed target point was found in the mask.'
@@ -600,7 +706,20 @@ class RGBTrackerNode(Node):
 
         self.pixel_pub.publish(pixel)
         self.last_target_publish_time = now
+        self.last_published_target_coords = (int(target_u), int(target_v))
+        self.last_published_target_time = now
         return (target_u, target_v), target_depth
+
+    def _get_continuous_target_anchor(self, center_coords):
+        if self.last_published_target_coords is None:
+            return center_coords
+
+        if self.target_anchor_timeout_s > 0.0:
+            age_s = time.monotonic() - self.last_published_target_time
+            if age_s > self.target_anchor_timeout_s:
+                return center_coords
+
+        return self.last_published_target_coords
 
     def _select_nearest_mask_target(self, center_coords, mask, depth_frame):
         if mask is None:
@@ -634,8 +753,17 @@ class RGBTrackerNode(Node):
             self._warn_depth_sync('Continuous target update skipped: target mask has no valid depth pixels.')
             return None
 
-        nearest_depth = float(np.min(depth[valid]))
+        valid_depths = depth[valid].astype(np.float32)
+        percentile = min(100.0, max(0.0, float(self.nearest_depth_percentile)))
+        nearest_depth = float(np.percentile(valid_depths, percentile))
         front_band = valid & (depth <= (nearest_depth + self.nearest_depth_band_m))
+        front_band_count = int(np.count_nonzero(front_band))
+        if front_band_count < self.nearest_depth_min_pixels:
+            self._warn_depth_sync(
+                'Continuous target update skipped: nearest-depth candidate set is too sparse '
+                f'({front_band_count} < {self.nearest_depth_min_pixels}).'
+            )
+            return None
         candidate_pixels = np.argwhere(front_band if np.any(front_band) else valid)
         if candidate_pixels.size == 0:
             self._warn_depth_sync('Continuous target update skipped: nearest-depth candidate set is empty.')
@@ -678,6 +806,28 @@ class RGBTrackerNode(Node):
 
         self.last_depth_sync_warn_time = now
         self.get_logger().warn(message)
+
+    def _is_continuous_rgb_stamp_stale(self, header, stage='on arrival'):
+        if self.continuous_rgb_stamp_max_age <= 0.0:
+            return False
+
+        stamp_ns = self._stamp_to_ns(header.stamp)
+        if stamp_ns <= 0:
+            return False
+
+        now_ns = self.get_clock().now().nanoseconds
+        age_s = (now_ns - stamp_ns) / 1e9
+        if age_s <= self.continuous_rgb_stamp_max_age:
+            return False
+
+        now = time.monotonic()
+        if (now - self.last_continuous_stamp_age_warn_time) >= self.depth_sync_warn_period:
+            self.last_continuous_stamp_age_warn_time = now
+            self.get_logger().warn(
+                f'Dropping stale continuous RGB frame {stage}: '
+                f'stamp age {age_s:.3f}s exceeds limit {self.continuous_rgb_stamp_max_age:.3f}s.'
+            )
+        return True
 
     @staticmethod
     def _stamp_to_ns(stamp):

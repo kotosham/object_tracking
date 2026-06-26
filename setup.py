@@ -29,6 +29,8 @@ setup(
         'console_scripts': [
             'tracker_node = object_tracking.tracker_node:main',
             'rgb_tracker_node = object_tracking.rgb_tracker_node:main',
+            'download_florence2_model = object_tracking.download_florence2_model:main',
+            'capture_target_overlay = object_tracking.capture_target_overlay:main',
         ],
     },
 )

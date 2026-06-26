@@ -80,12 +80,7 @@ class YOLOESegmentor:
     def segment(self, image, prompt, depth_map, conf=0.25, min_mask_area=200):
         self.last_detection_score = None
         self.last_mask = None
-        """
-        Run YOLOE text-prompted detection and segmentation on the whole image.
-
-        Returns an overlay image, center coordinates, inference time and the
-        original depth map, mirroring the CLIPSeg interface.
-        """
+        # Mirror the CLIPSeg return contract so the tracker can treat all backends uniformly.
         self._set_prompt(prompt)
 
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
