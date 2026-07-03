@@ -44,7 +44,7 @@ class YOLOESegmentor:
                 "YOLOE support requires the `ultralytics` package with YOLOE support installed."
             ) from exc
 
-        self.weights_dir = self._get_weights_dir()
+        self.weights_dir = self._get_weights_dir(model_name, text_encoder_name)
         self.model_path = self._resolve_weight_path(model_name)
         self.text_encoder_path = self._resolve_weight_path(text_encoder_name)
 
@@ -66,16 +66,37 @@ class YOLOESegmentor:
             return f"YOLOE device={self.device}, CUDA device={gpu_name} ({total_memory_gib:.2f} GiB VRAM)"
         return f"YOLOE device={self.device}, CUDA unavailable"
 
-    def _get_weights_dir(self):
+    def _get_weights_dir(self, *required_weights):
+        candidates = []
         try:
             share_dir = Path(get_package_share_directory("object_tracking"))
             share_weights = share_dir / "model_weights"
-            if share_weights.is_dir():
-                return share_weights
+            candidates.append(share_weights)
         except PackageNotFoundError:
             pass
 
-        return Path(__file__).resolve().parent / "model_weights"
+        module_weights = Path(__file__).resolve().parent / "model_weights"
+        candidates.append(module_weights)
+
+        # In symlink/development workspaces, data_files can occasionally leave the
+        # installed share/model_weights directory empty while the checked-out source
+        # still has the large weights. Walk upward and try the common source layout
+        # before failing the backend.
+        for parent in Path(__file__).resolve().parents:
+            candidates.append(parent / "src" / "object_tracking" / "object_tracking" / "model_weights")
+
+        for candidate in candidates:
+            if not candidate.is_dir():
+                continue
+            if all((candidate / Path(name).name).is_file() for name in required_weights):
+                return candidate
+
+        # Preserve the old error location when possible, but only after trying all
+        # workspace/source fallbacks above.
+        for candidate in candidates:
+            if candidate.is_dir():
+                return candidate
+        return module_weights
 
     def _resolve_weight_path(self, weight_name):
         weight_path = Path(weight_name)
