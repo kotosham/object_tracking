@@ -44,7 +44,7 @@ from rclpy.qos import (DurabilityPolicy, HistoryPolicy, QoSProfile,
 
 from geometry_msgs.msg import PointStamped, PoseStamped
 from nav_msgs.msg import OccupancyGrid
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CompressedImage, Image
 from std_msgs.msg import String
 from tf2_ros import (Buffer, ConnectivityException, ExtrapolationException,
                      LookupException, TransformListener)
@@ -53,7 +53,7 @@ from ar_project_msgs.action import ApproachDetection, GoToPose, Stop
 from object_tracking_msgs.action import DetectTarget
 from object_tracking_msgs.msg import Notes
 
-from fleet_comms.qos import detection_stream_nodeadline
+from fleet_comms.qos import detection_stream_nodeadline, media_besteffort
 
 from fleet_comms.heartbeat import HeartbeatPublisher
 from planner_orchestrator import orchestration as orch
@@ -134,6 +134,9 @@ class PlannerOrchestrator(Node):
         # so a higher floor with a bare label avoids acting on a marginal glimpse.
         self.declare_parameter('detect_conf', 0.0)
         self.declare_parameter('camera_frame', 'camera_link_optical')
+        self.declare_parameter('subscribe_camera_image', True)
+        self.declare_parameter('camera_image_topic', '/camera/camera/color/image_raw')
+        self.declare_parameter('camera_use_compressed_input', False)
         # Attach the top-down SLAM occupancy map as a 2nd image to the VLM. map_max_px
         # bounds the rendered map's longest side (kept small to limit tokens/latency).
         self.declare_parameter('map_topic', '/map')
@@ -156,6 +159,9 @@ class PlannerOrchestrator(Node):
         self.detect_conf = float(g('detect_conf'))
         self.vlm_timeout_s = float(g('vlm_timeout_s'))
         self.camera_frame = g('camera_frame')
+        self.subscribe_camera_image = bool(g('subscribe_camera_image')) and _HAVE_CV
+        self.camera_image_topic = str(g('camera_image_topic'))
+        self.camera_use_compressed_input = bool(g('camera_use_compressed_input'))
         self.send_map = bool(g('send_map')) and _HAVE_CV
         self.map_max_px = int(g('map_max_px'))
         self.async_replan = bool(g('async_replan'))
@@ -197,9 +203,13 @@ class PlannerOrchestrator(Node):
         # RELIABLE sub would receive nothing from a BEST_EFFORT publisher)
         self.create_subscription(PointStamped, '/target_pixel', self._on_pixel,
                                  detection_stream_nodeadline(), callback_group=sub)
-        if _HAVE_CV:
-            self.create_subscription(Image, '/camera/camera/color/image_raw',
-                                     self._on_image, 1, callback_group=sub)
+        if self.subscribe_camera_image:
+            image_type = CompressedImage if self.camera_use_compressed_input else Image
+            self.create_subscription(image_type, self.camera_image_topic,
+                                     self._on_image, media_besteffort(), callback_group=sub)
+            self.get_logger().info(
+                'planner_orchestrator camera input: topic=%s compressed=%s'
+                % (self.camera_image_topic, self.camera_use_compressed_input))
         self.create_subscription(String, '/vlm_mission', self._on_mission, 1,
                                  callback_group=sub)
         self.notes_pub = self.create_publisher(Notes, '/planner/notes', 1)
@@ -235,7 +245,13 @@ class PlannerOrchestrator(Node):
 
     def _on_image(self, msg):
         try:
-            cv = self._bridge.imgmsg_to_cv2(msg, 'bgr8')
+            if self.camera_use_compressed_input:
+                arr = np.frombuffer(msg.data, np.uint8)
+                cv = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            else:
+                cv = self._bridge.imgmsg_to_cv2(msg, 'bgr8')
+            if cv is None:
+                return
             ok, buf = cv2.imencode('.jpg', cv)
             if ok:
                 with self._lock:
