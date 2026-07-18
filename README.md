@@ -239,6 +239,8 @@ Burst mode waits for an explicit `/tracker/burst_complete` signal from the robot
 
 ## Model Weights
 
+See [`docs/model_weights.md`](docs/model_weights.md) for the complete reproducibility checklist, expected filenames, lookup order, and source references.
+
 MobileSAM weights are expected in:
 
 ```text
