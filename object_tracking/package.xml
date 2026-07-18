@@ -27,6 +27,10 @@
 
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
+  <!-- Optional at runtime (import is guarded): fleet heartbeat for the
+       'detector' health row on the mission dashboard. -->
+  <exec_depend>fleet_comms</exec_depend>
+  <exec_depend>ar_project_msgs</exec_depend>
 
   <export>
     <build_type>ament_python</build_type>

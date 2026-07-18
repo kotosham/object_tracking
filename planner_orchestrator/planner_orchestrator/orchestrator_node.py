@@ -21,6 +21,7 @@ VLM_API_KEY / VLM_MODEL -- env fills in any param left blank, so keys never need
 to live in a launch file. A base_url from either source auto-engages the real
 OpenAI-compatible client unless use_mock:=true is set explicitly.
 """
+import json
 import math
 import os
 import threading
@@ -55,6 +56,7 @@ from object_tracking_msgs.msg import Notes
 
 from fleet_comms.qos import detection_stream_nodeadline, media_besteffort
 
+from ar_project_msgs.msg import Heartbeat
 from fleet_comms.heartbeat import HeartbeatPublisher
 from planner_orchestrator import orchestration as orch
 from planner_orchestrator.planner_logic import (
@@ -214,6 +216,22 @@ class PlannerOrchestrator(Node):
                                  callback_group=sub)
         self.notes_pub = self.create_publisher(Notes, '/planner/notes', 1)
 
+        # ---- monitoring outputs (mission dashboard) ----
+        # /vlm/activity: structured human-readable trace of what the VLM saw,
+        # decided and what actually happened (the same content that used to live
+        # only in ephemeral console logs). TRANSIENT_LOCAL with a short history
+        # so a late-joining monitor replays recent events. Consumed edge-locally.
+        activity_qos = QoSProfile(depth=50)
+        activity_qos.history = HistoryPolicy.KEEP_LAST
+        activity_qos.reliability = ReliabilityPolicy.RELIABLE
+        activity_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        self._activity_pub = self.create_publisher(String, '/vlm/activity', activity_qos)
+        self._activity_seq = 0
+        # Latest annotated Set-of-Mark frame ("what the robot sees + the mark ids
+        # the VLM chose from") and the top-down map image actually sent to the VLM.
+        self._setofmark_pub = self.create_publisher(CompressedImage, '/vlm/setofmark', 1)
+        self._map_view_pub = self.create_publisher(CompressedImage, '/vlm/map_view', 1)
+
         # ---- executive skill clients (loopback-style poll on a reentrant group) ----
         cg = ReentrantCallbackGroup()
         self._ac = {
@@ -266,6 +284,33 @@ class PlannerOrchestrator(Node):
         self._busy = True
         threading.Thread(target=self._run_mission, args=(target,), daemon=True).start()
 
+    # ---- monitoring trace ----
+    def _activity(self, event, **data):
+        """Publish one structured VLM activity event on /vlm/activity (JSON) for
+        the mission dashboard. Best-effort: monitoring must never break planning."""
+        try:
+            self._activity_seq += 1
+            payload = {'seq': self._activity_seq, 'event': event, 'stamp': time.time()}
+            payload.update(data)
+            msg = String()
+            msg.data = json.dumps(payload, ensure_ascii=False, default=str)
+            self._activity_pub.publish(msg)
+        except Exception:                             # pragma: no cover
+            pass
+
+    def _publish_view(self, pub, jpeg_bytes):
+        """Publish a JPEG byte string as CompressedImage (dashboard view topics)."""
+        if not jpeg_bytes:
+            return
+        try:
+            m = CompressedImage()
+            m.header.stamp = self.get_clock().now().to_msg()
+            m.format = 'jpeg'
+            m.data = bytes(jpeg_bytes)
+            pub.publish(m)
+        except Exception:                             # pragma: no cover
+            pass
+
     # ---- observation ----
     def _camera_jpeg(self):
         with self._lock:
@@ -305,6 +350,8 @@ class PlannerOrchestrator(Node):
                                            distance_m=float(c.pixel.z)))  # z = depth_m
                     pix[int(c.mark_id)] = c.pixel    # Point: x=u, y=v, z=depth_m
                 jpeg = bytes(res.annotated.data) if res.annotated.data else self._camera_jpeg()
+                # Dashboard view: what the robot sees + the mark ids offered to the VLM.
+                self._publish_view(self._setofmark_pub, jpeg)
                 return cands, pix, jpeg
             # Detector answered but found NOTHING -> report honestly empty. Must NOT fall
             # back to /target_pixel here: during DRIVE_TO_VISIBLE the orchestrator keeps
@@ -418,12 +465,16 @@ class PlannerOrchestrator(Node):
         # (obs, pixels, jpeg, map_jpeg) captured together -> the plan's DRIVE_TO_VISIBLE
         # pixels and the VLM images are a consistent set (race-free vs camera/replan).
         obs, pixels, jpeg, map_jpeg = self._observation(target, step)
+        # Dashboard views: the map image actually sent to the VLM this cycle.
+        self._publish_view(self._map_view_pub, map_jpeg)
         # Phase 5.1: pick VLM or the latched FLAT fallback (once the breaker opens).
         client = self._degrade.select(self.client, self._fallback, self.cb.is_open)
         if self._degrade.just_degraded():
             self.get_logger().error('circuit-breaker OPEN -> degrade VLM->FLAT (mission '
                                      'continues as FLAT, DEGRADED)')
             self.notes.add_fact('DEGRADED: VLM lost -> continuing in FLAT fallback')
+            self._activity('degraded', step=step,
+                           detail='VLM circuit-breaker OPEN -> continuing in FLAT fallback')
         best = max(obs.candidates, key=lambda c: c.score, default=None)
         det = ('' if best is None
                else " best='%s' conf=%.2f @%.2fm" % (best.label, best.score, best.distance_m))
@@ -431,16 +482,38 @@ class PlannerOrchestrator(Node):
             'observe@step %d: %d detection(s)%s, notes=%d, map=%s -> asking %s'
             % (step, len(obs.candidates), det, len(obs.notes_facts),
                'yes' if map_jpeg else 'no', type(client).__name__))
+        self._activity(
+            'observe', step=step, n_detections=len(obs.candidates),
+            detections=[{'mark_id': c.mark_id, 'label': c.label,
+                         'score': round(float(c.score), 3),
+                         'distance_m': round(float(c.distance_m), 2)}
+                        for c in obs.candidates],
+            notes=len(obs.notes_facts), map='yes' if map_jpeg else 'no',
+            client=type(client).__name__)
+        vlm_t0 = time.monotonic()
         try:
             actions = list(client.plan_sequence(obs, jpeg, map_jpeg, n=self.replan_n))
             self.cb.record_success() if actions else self.cb.record_failure()
             self.get_logger().info('plan@step %d: VLM returned %d action(s): %s'
                                    % (step, len(actions),
                                       ', '.join(self._action_brief(a) for a in actions) or '-'))
+            self._activity(
+                'plan', step=step,
+                latency_ms=round((time.monotonic() - vlm_t0) * 1e3, 1),
+                actions=[{'action': self._action_brief(a),
+                          'rationale': a.rationale or ''} for a in actions])
         except Exception as e:
             self.cb.record_failure()
             self.get_logger().warn('plan failed (%s); cb_open=%s' % (e, self.cb.is_open))
+            self._activity('plan_failed', step=step, error=str(e),
+                           cb_open=bool(self.cb.is_open))
             actions = []
+        # Real per-component health (was: heartbeat always OK). Latency feeds the
+        # p99 budget; DEGRADED reflects the breaker/latch and resets once healthy.
+        self.heartbeat.set_latency_ms((time.monotonic() - vlm_t0) * 1e3)
+        self.heartbeat.set_status(
+            Heartbeat.DEGRADED if (self.cb.is_open or self._degrade.degraded)
+            else Heartbeat.OK)
         return _PlanBundle(actions, pixels)
 
     def _next_bundle(self, pending, target, step):
@@ -455,6 +528,9 @@ class PlannerOrchestrator(Node):
 
     def _run_mission(self, target):
         self.get_logger().info('VLM mission start: target="%s"' % target)
+        self._activity('mission_start', target=target,
+                       client=type(self.client).__name__, creds=self._cred_src,
+                       replan_every_n=self.replan_n, max_steps=self.max_steps)
         self.notes = NotesBuffer()
         self.cb = CircuitBreaker()
         self._degrade = DegradationLatch()   # fresh mission retries the VLM
@@ -480,6 +556,9 @@ class PlannerOrchestrator(Node):
                     self.get_logger().info('step %d: %s -- %s'
                                            % (step, self._action_brief(action),
                                               action.rationale or ''))
+                    self._activity('step_start', step=step,
+                                   action=self._action_brief(action),
+                                   rationale=action.rationale or '')
                     if orch.is_terminal(action.kind):       # DONE
                         self.get_logger().info('VLM mission finished: %s' % action.name)
                         self._publish_notes(target)
@@ -497,6 +576,10 @@ class PlannerOrchestrator(Node):
                         action.name,
                         (' ' + action.rationale) if action.rationale else '',
                         'ok' if ok else 'failed'))
+                    self._activity('step_result', step=step,
+                                   action=self._action_brief(action),
+                                   result='ok' if ok else 'failed',
+                                   duration_s=round(time.monotonic() - t0, 2))
                     self._publish_notes(target)
                     step += 1
                     dt = time.monotonic() - t0
@@ -511,6 +594,8 @@ class PlannerOrchestrator(Node):
                 pending = None
             self.get_logger().info('VLM mission ended after %d steps%s' % (
                 step, ' (DEGRADED: ran in FLAT fallback)' if self._degrade.degraded else ''))
+            self._activity('mission_end', target=target, steps=step,
+                           degraded=bool(self._degrade.degraded))
         finally:
             # Join the in-flight replan BEFORE clearing _busy, so a stale pool worker
             # can never write this mission's circuit-breaker / degrade-latch / notes
@@ -647,10 +732,17 @@ class PlannerOrchestrator(Node):
         cands = getattr(res, 'candidates', None) if res is not None else None
         if not cands:
             self.notes.add_fact('DETECT_ALL: nothing detected in view')
+            self._activity('detect_all', objects=[])
             return False
+        if getattr(res, 'annotated', None) is not None and res.annotated.data:
+            self._publish_view(self._setofmark_pub, bytes(res.annotated.data))
         seen = ', '.join('%s(%.2f)' % (c.label, c.confidence) for c in cands)
         self.notes.add_fact('objects in view: ' + seen)
         self.get_logger().info('DETECT_ALL: %d object(s): %s' % (len(cands), seen))
+        self._activity('detect_all',
+                       objects=[{'label': c.label,
+                                 'score': round(float(c.confidence), 2)}
+                                for c in cands])
         return True
 
     def _dispatch_stop(self):
@@ -699,6 +791,10 @@ class PlannerOrchestrator(Node):
         m.facts = self.notes.facts
         m.token_estimate = self.notes.token_estimate()
         self.notes_pub.publish(m)
+        # Mirror into the activity trace so the dashboard reads the VLM's memory
+        # without a dependency on the Notes message type.
+        self._activity('notes', target=target, summary=m.summary,
+                       facts=list(m.facts), token_estimate=int(m.token_estimate))
 
 
 def main():

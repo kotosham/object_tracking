@@ -10,6 +10,7 @@ torch/ultralytics import is deferred to construction so this module imports with
 this node only perceives.
 """
 import threading
+import time
 
 import rclpy
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
@@ -33,6 +34,13 @@ try:
     _HAVE_CV = True
 except Exception:                       # pragma: no cover
     _HAVE_CV = False
+
+try:                                    # fleet-wide health bus (ar_project ws)
+    from ar_project_msgs.msg import Heartbeat
+    from fleet_comms.heartbeat import HeartbeatPublisher
+    _HAVE_HEARTBEAT = True
+except Exception:                       # standalone/sim without fleet_comms
+    _HAVE_HEARTBEAT = False
 
 
 class DetectTargetServer(Node):
@@ -80,7 +88,16 @@ class DetectTargetServer(Node):
                          else ReliabilityPolicy.RELIABLE)
         q.durability = DurabilityPolicy.VOLATILE
         msg_type = CompressedImage if self.use_compressed else Image
-        self.create_subscription(msg_type, self.image_topic, self._on_image, q,
+        # image_transport publishes CompressedImage on '<base>/compressed', not on
+        # the base topic. Subscribing CompressedImage to the bare base topic used
+        # to match NO publisher, so the detector silently received zero frames.
+        image_sub_topic = self.image_topic
+        if self.use_compressed and not image_sub_topic.endswith('/compressed'):
+            image_sub_topic = image_sub_topic + '/compressed'
+            self.get_logger().info(
+                'use_compressed_input: subscribing to "%s" (appended /compressed '
+                'to the base image topic)' % image_sub_topic)
+        self.create_subscription(msg_type, image_sub_topic, self._on_image, q,
                                  callback_group=sub_group)
         if self.use_depth:
             self.create_subscription(Image, str(g('depth_topic')), self._on_depth, q,
@@ -93,10 +110,33 @@ class DetectTargetServer(Node):
             cancel_callback=lambda _c: CancelResponse.ACCEPT,
             callback_group=ReentrantCallbackGroup())
 
+        # Fleet heartbeat ('detector' row on the mission dashboard): DOWN while
+        # the backend failed to load, DEGRADED until camera frames flow (and when
+        # they go stale), OK while frames are fresh. Inference latency is fed
+        # from _execute. No-op when fleet_comms is not on the path (bare sim).
+        self._last_frame_mono = 0.0
+        self._hb = None
+        if _HAVE_HEARTBEAT:
+            self._hb = HeartbeatPublisher(self, 'detector', period_s=0.5)
+            self._hb.set_status(Heartbeat.DOWN if self.segmentor is None
+                                else Heartbeat.DEGRADED)
+            self.create_timer(1.0, self._update_health)
+
         self.get_logger().info(
             'detect_target_server up (Phase 3.2): backend=%s topic=%s compressed=%s max_marks=%d%s'
             % (self.model_mode, self.image_topic, self.use_compressed, self.max_marks,
                '' if self.segmentor is not None else ' [BACKEND FAILED -> goals ABORT]'))
+
+    def _update_health(self):
+        """Roll the heartbeat status from backend + camera-frame freshness."""
+        if self._hb is None:
+            return
+        if self.segmentor is None:
+            self._hb.set_status(Heartbeat.DOWN)
+        elif (time.monotonic() - self._last_frame_mono) > 2.0:
+            self._hb.set_status(Heartbeat.DEGRADED)   # no/stale camera frames
+        else:
+            self._hb.set_status(Heartbeat.OK)
 
     # ---- detector backend (heavy import deferred here) ----
     def _load_segmentor(self):
@@ -133,6 +173,7 @@ class DetectTargetServer(Node):
             with self._lock:
                 self._frame = frame
                 self._frame_header = msg.header
+            self._last_frame_mono = time.monotonic()
 
     def _on_depth(self, msg):
         if not _HAVE_CV:
@@ -188,6 +229,7 @@ class DetectTargetServer(Node):
         query = (req.query or '').strip()
         conf = req.conf_threshold if req.conf_threshold > 0.0 else self.conf_default
         fb = DetectTarget.Feedback()
+        seg_t0 = time.monotonic()
         try:
             if query:
                 dets = self.segmentor.segment_all(frame, query, conf=conf,
@@ -200,6 +242,8 @@ class DetectTargetServer(Node):
             goal_handle.abort()
             result.outcome = DetectTarget.Result.ABORTED
             return result
+        if self._hb is not None:
+            self._hb.set_latency_ms((time.monotonic() - seg_t0) * 1e3)
 
         marked = assign_marks(dets, conf_threshold=conf, max_marks=self.max_marks)
         if self.use_depth:
