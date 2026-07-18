@@ -19,7 +19,11 @@ class RGBTrackerNode(Node):
 
         self.declare_parameter('use_sam', False)
         self.declare_parameter('model_mode', 'auto')
-        self.declare_parameter('search_angular_speed', 0.5)
+        self.declare_parameter('search_angular_speed', 0.25)
+        self.declare_parameter('search_failures_before_rotation', 3)
+        self.declare_parameter('search_rotation_duration_s', 0.45)
+        self.declare_parameter('search_settle_time_s', 1.0)
+        self.declare_parameter('search_max_rotation_steps', 6)
         self.declare_parameter('use_compressed_input', True)
         self.declare_parameter('input_reliability', 'best_effort')
         self.declare_parameter('goal_locked_topic', '/target_goal_locked')
@@ -47,6 +51,11 @@ class RGBTrackerNode(Node):
         self.declare_parameter('clip_threshold', 0.70)
         self.declare_parameter('clip_min_mask_area', 100)
         self.declare_parameter('dino_box_threshold', 0.50)
+        self.declare_parameter('dino_selection_policy', 'score')
+        self.declare_parameter('dino_center_weight', 0.6)
+        self.declare_parameter('dino_max_center_distance_norm', 0.0)
+        self.declare_parameter('dino_max_center_x_offset_norm', 0.0)
+        self.declare_parameter('dino_max_center_y_offset_norm', 0.0)
         self.declare_parameter('dino_mobilesam_min_mask_area', 100)
         self.declare_parameter('florence2_min_mask_area', 100)
         self.declare_parameter('yoloe_conf_threshold', 0.12)
@@ -57,6 +66,21 @@ class RGBTrackerNode(Node):
         use_sam = self.get_parameter('use_sam').get_parameter_value().bool_value
         requested_mode = self.get_parameter('model_mode').get_parameter_value().string_value.strip().lower()
         self.search_angular_speed = self.get_parameter('search_angular_speed').get_parameter_value().double_value
+        self.search_failures_before_rotation = max(
+            1,
+            self.get_parameter('search_failures_before_rotation').get_parameter_value().integer_value,
+        )
+        self.search_rotation_duration_s = max(
+            0.0,
+            self.get_parameter('search_rotation_duration_s').get_parameter_value().double_value,
+        )
+        self.search_settle_time_s = max(
+            0.0,
+            self.get_parameter('search_settle_time_s').get_parameter_value().double_value,
+        )
+        self.search_max_rotation_steps = (
+            self.get_parameter('search_max_rotation_steps').get_parameter_value().integer_value
+        )
         self.use_compressed_input = self.get_parameter('use_compressed_input').get_parameter_value().bool_value
         self.input_reliability = self.get_parameter('input_reliability').get_parameter_value().string_value.strip().lower()
         self.goal_locked_topic = self.get_parameter('goal_locked_topic').get_parameter_value().string_value
@@ -91,6 +115,19 @@ class RGBTrackerNode(Node):
         self.clip_threshold = self.get_parameter('clip_threshold').get_parameter_value().double_value
         self.clip_min_mask_area = self.get_parameter('clip_min_mask_area').get_parameter_value().integer_value
         self.dino_box_threshold = self.get_parameter('dino_box_threshold').get_parameter_value().double_value
+        self.dino_selection_policy = (
+            self.get_parameter('dino_selection_policy').get_parameter_value().string_value.strip().lower()
+        )
+        self.dino_center_weight = self.get_parameter('dino_center_weight').get_parameter_value().double_value
+        self.dino_max_center_distance_norm = (
+            self.get_parameter('dino_max_center_distance_norm').get_parameter_value().double_value
+        )
+        self.dino_max_center_x_offset_norm = (
+            self.get_parameter('dino_max_center_x_offset_norm').get_parameter_value().double_value
+        )
+        self.dino_max_center_y_offset_norm = (
+            self.get_parameter('dino_max_center_y_offset_norm').get_parameter_value().double_value
+        )
         self.dino_mobilesam_min_mask_area = (
             self.get_parameter('dino_mobilesam_min_mask_area').get_parameter_value().integer_value
         )
@@ -136,10 +173,22 @@ class RGBTrackerNode(Node):
         self.get_logger().info(f'Using segmentation backend: {self.model_label}')
         if hasattr(self.segmentor, 'runtime_info'):
             self.get_logger().info(f'Inference runtime: {self.segmentor.runtime_info()}')
-        self.get_logger().info(
-            f'Search rotation is {"enabled" if self.enable_search_rotation else "disabled"} '
-            f'(cmd_vel search topic remains available).'
-        )
+        if self.enable_search_rotation:
+            max_steps_label = (
+                'unlimited'
+                if self.search_max_rotation_steps <= 0
+                else str(self.search_max_rotation_steps)
+            )
+            self.get_logger().info(
+                'Search rotation is enabled in step mode: '
+                f'speed={self.search_angular_speed:.2f}rad/s, '
+                f'after {self.search_failures_before_rotation} missed detection(s), '
+                f'step={self.search_rotation_duration_s:.2f}s, '
+                f'settle={self.search_settle_time_s:.2f}s, '
+                f'max_steps={max_steps_label}.'
+            )
+        else:
+            self.get_logger().info('Search rotation is disabled (cmd_vel search topic remains available).')
         self.get_logger().info(
             f'Tracking mode: {self.tracking_mode}. '
             f'Depth input is {"enabled" if self.use_depth_input else "disabled"}. '
@@ -181,6 +230,12 @@ class RGBTrackerNode(Node):
         self.target_publish_period = 0.0 if self.target_publish_rate <= 0.0 else 1.0 / self.target_publish_rate
         self.last_published_target_coords = None
         self.last_published_target_time = 0.0
+        self.consecutive_not_found_frames = 0
+        self.search_rotation_steps_started = 0
+        self.search_rotation_active = False
+        self.search_rotation_active_until = 0.0
+        self.search_settle_until = 0.0
+        self.search_rotation_limit_logged = False
         sensor_qos = QoSProfile(depth=1)
         sensor_qos.reliability = (
             ReliabilityPolicy.RELIABLE
@@ -287,6 +342,8 @@ class RGBTrackerNode(Node):
         self.depth_buffer.clear()
         self.last_published_target_coords = None
         self.last_published_target_time = 0.0
+        self._stop_search_rotation()
+        self._reset_search_rotation_state()
         self._reset_burst_state()
         self.get_logger().info(f'New prompt received: "{self.current_prompt}"')
 
@@ -313,6 +370,8 @@ class RGBTrackerNode(Node):
             self.depth_buffer.clear()
             self.last_published_target_coords = None
             self.last_published_target_time = 0.0
+            self._stop_search_rotation()
+            self._reset_search_rotation_state()
             self.get_logger().info('Goal lock received from Raspberry Pi bridge. Pausing RGB tracking until the next prompt.')
             if completed_prompt:
                 self.get_logger().info(
@@ -336,8 +395,12 @@ class RGBTrackerNode(Node):
 
     def timer_callback(self):
         if self.current_prompt is None or not self.tracking_enabled:
+            self._stop_search_rotation()
             if self.tracking_mode == 'burst':
                 self._try_finalize_burst()
+            return
+
+        if self._service_search_rotation_step():
             return
 
         if self.tracking_mode == 'burst':
@@ -345,12 +408,6 @@ class RGBTrackerNode(Node):
         else:
             self._process_latest_continuous_frame()
         self._warn_if_no_rgb_frames_arrived()
-        if not self.enable_search_rotation or self.target_found:
-            return
-
-        msg = Twist()
-        msg.angular.z = self.search_angular_speed
-        self.search_cmd_pub.publish(msg)
 
     def _should_log_tracking_update(self, center_coords):
         now = time.time()
@@ -470,6 +527,11 @@ class RGBTrackerNode(Node):
                 self.current_prompt,
                 depth_frame,
                 box_threshold=float(self.dino_box_threshold),
+                selection_policy=self.dino_selection_policy,
+                center_weight=float(self.dino_center_weight),
+                max_center_distance_norm=float(self.dino_max_center_distance_norm),
+                max_center_x_offset_norm=float(self.dino_max_center_x_offset_norm),
+                max_center_y_offset_norm=float(self.dino_max_center_y_offset_norm),
                 min_mask_area=int(self.dino_mobilesam_min_mask_area),
             )
         elif self.model_mode == 'florence2':
@@ -505,12 +567,14 @@ class RGBTrackerNode(Node):
         if center_coords is None:
             if self.tracking_mode == 'continuous':
                 self.target_found = False
+            self._register_detection_miss()
             if not self.target_found and time.time() - self.last_not_found_log_time >= self.not_found_log_period:
                 self.get_logger().warn('Target object not found in RGB frame')
                 self.last_not_found_log_time = time.time()
             return
 
         self.burst_frames_with_detections += 1
+        self._register_detection_hit()
 
         score = getattr(self.segmentor, 'last_detection_score', None)
         mask = getattr(self.segmentor, 'last_mask', None)
@@ -646,6 +710,7 @@ class RGBTrackerNode(Node):
             )
 
         if self.best_candidate is None:
+            self._register_detection_miss()
             self.get_logger().warn(
                 f'RGB burst completed with no valid target detections '
                 f'({self.burst_frames_seen} frames processed).'
@@ -667,6 +732,7 @@ class RGBTrackerNode(Node):
 
         self.pixel_pub.publish(pixel)
         self.target_found = True
+        self._register_detection_hit()
         self.get_logger().info(
             f'Selected burst candidate center=({self.best_candidate["center_coords"][0]}, '
             f'{self.best_candidate["center_coords"][1]}) '
@@ -842,6 +908,86 @@ class RGBTrackerNode(Node):
         self.best_candidate = None
         self.burst_complete_received = False
         self.burst_expected_frames = 0
+
+    def _register_detection_hit(self):
+        self.consecutive_not_found_frames = 0
+        self._stop_search_rotation()
+
+    def _register_detection_miss(self):
+        if not self.enable_search_rotation or self.target_found or self.goal_locked:
+            return
+
+        now = time.monotonic()
+        if self.search_rotation_active or now < self.search_settle_until:
+            return
+
+        self.consecutive_not_found_frames += 1
+        if self.consecutive_not_found_frames < self.search_failures_before_rotation:
+            return
+
+        self._start_search_rotation_step(now)
+
+    def _start_search_rotation_step(self, now):
+        self.consecutive_not_found_frames = 0
+
+        if abs(self.search_angular_speed) <= 1e-6 or self.search_rotation_duration_s <= 0.0:
+            return
+
+        if (
+            self.search_max_rotation_steps > 0
+            and self.search_rotation_steps_started >= self.search_max_rotation_steps
+        ):
+            if not self.search_rotation_limit_logged:
+                self.search_rotation_limit_logged = True
+                self.get_logger().warn(
+                    'Search rotation step limit reached for this prompt; '
+                    'the tracker will keep analyzing the current view without rotating further.'
+                )
+            return
+
+        self.search_rotation_steps_started += 1
+        self.search_rotation_active = True
+        self.search_rotation_active_until = now + self.search_rotation_duration_s
+        self._publish_search_rotation_cmd()
+        self.get_logger().info(
+            f'Search step {self.search_rotation_steps_started}: rotating at '
+            f'{self.search_angular_speed:.2f}rad/s for {self.search_rotation_duration_s:.2f}s '
+            f'after {self.search_failures_before_rotation} missed detection(s).'
+        )
+
+    def _service_search_rotation_step(self):
+        if not self.search_rotation_active:
+            return False
+
+        now = time.monotonic()
+        if now < self.search_rotation_active_until:
+            self._publish_search_rotation_cmd()
+            return True
+
+        self._stop_search_rotation()
+        self.search_settle_until = now + self.search_settle_time_s
+        return False
+
+    def _publish_search_rotation_cmd(self):
+        msg = Twist()
+        msg.angular.z = self.search_angular_speed
+        self.search_cmd_pub.publish(msg)
+
+    def _stop_search_rotation(self):
+        if not self.search_rotation_active:
+            return
+
+        self.search_rotation_active = False
+        self.search_rotation_active_until = 0.0
+        self.search_cmd_pub.publish(Twist())
+
+    def _reset_search_rotation_state(self):
+        self.consecutive_not_found_frames = 0
+        self.search_rotation_steps_started = 0
+        self.search_rotation_active = False
+        self.search_rotation_active_until = 0.0
+        self.search_settle_until = 0.0
+        self.search_rotation_limit_logged = False
 
 
 def main(args=None):

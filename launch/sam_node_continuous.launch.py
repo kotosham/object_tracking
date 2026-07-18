@@ -16,6 +16,10 @@ def generate_launch_description():
     use_sam = LaunchConfiguration('use_sam')
     model_mode = LaunchConfiguration('model_mode')
     search_angular_speed = LaunchConfiguration('search_angular_speed')
+    search_failures_before_rotation = LaunchConfiguration('search_failures_before_rotation')
+    search_rotation_duration_s = LaunchConfiguration('search_rotation_duration_s')
+    search_settle_time_s = LaunchConfiguration('search_settle_time_s')
+    search_max_rotation_steps = LaunchConfiguration('search_max_rotation_steps')
     image_topic = LaunchConfiguration('image_topic')
     input_reliability = LaunchConfiguration('input_reliability')
     use_depth_input = LaunchConfiguration('use_depth_input')
@@ -36,6 +40,11 @@ def generate_launch_description():
     publish_mask_in_continuous = LaunchConfiguration('publish_mask_in_continuous')
     clip_min_mask_area = LaunchConfiguration('clip_min_mask_area')
     dino_box_threshold = LaunchConfiguration('dino_box_threshold')
+    dino_selection_policy = LaunchConfiguration('dino_selection_policy')
+    dino_center_weight = LaunchConfiguration('dino_center_weight')
+    dino_max_center_distance_norm = LaunchConfiguration('dino_max_center_distance_norm')
+    dino_max_center_x_offset_norm = LaunchConfiguration('dino_max_center_x_offset_norm')
+    dino_max_center_y_offset_norm = LaunchConfiguration('dino_max_center_y_offset_norm')
     dino_mobilesam_min_mask_area = LaunchConfiguration('dino_mobilesam_min_mask_area')
     florence2_model_id = LaunchConfiguration('florence2_model_id')
     florence2_task_prompt = LaunchConfiguration('florence2_task_prompt')
@@ -54,6 +63,10 @@ def generate_launch_description():
             'use_sam': use_sam,
             'model_mode': model_mode,
             'search_angular_speed': search_angular_speed,
+            'search_failures_before_rotation': search_failures_before_rotation,
+            'search_rotation_duration_s': search_rotation_duration_s,
+            'search_settle_time_s': search_settle_time_s,
+            'search_max_rotation_steps': search_max_rotation_steps,
             'use_compressed_input': 'true',
             'input_reliability': input_reliability,
             'image_topic': image_topic,
@@ -75,6 +88,11 @@ def generate_launch_description():
             'publish_mask_in_continuous': publish_mask_in_continuous,
             'clip_min_mask_area': clip_min_mask_area,
             'dino_box_threshold': dino_box_threshold,
+            'dino_selection_policy': dino_selection_policy,
+            'dino_center_weight': dino_center_weight,
+            'dino_max_center_distance_norm': dino_max_center_distance_norm,
+            'dino_max_center_x_offset_norm': dino_max_center_x_offset_norm,
+            'dino_max_center_y_offset_norm': dino_max_center_y_offset_norm,
             'dino_mobilesam_min_mask_area': dino_mobilesam_min_mask_area,
             'florence2_model_id': florence2_model_id,
             'florence2_task_prompt': florence2_task_prompt,
@@ -112,8 +130,28 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'search_angular_speed',
-            default_value='0.5',
-            description='Angular velocity used while searching for the target.',
+            default_value='0.25',
+            description='Angular velocity used for each search-rotation step.',
+        ),
+        DeclareLaunchArgument(
+            'search_failures_before_rotation',
+            default_value='3',
+            description='Number of consecutive missed detections before one small search rotation step.',
+        ),
+        DeclareLaunchArgument(
+            'search_rotation_duration_s',
+            default_value='0.45',
+            description='Duration in seconds of one search rotation step.',
+        ),
+        DeclareLaunchArgument(
+            'search_settle_time_s',
+            default_value='1.0',
+            description='Cooldown after each search rotation step before another step may start.',
+        ),
+        DeclareLaunchArgument(
+            'search_max_rotation_steps',
+            default_value='6',
+            description='Maximum number of search rotation steps per prompt. Set <=0 for unlimited.',
         ),
         DeclareLaunchArgument(
             'image_topic',
@@ -229,6 +267,31 @@ def generate_launch_description():
             'dino_box_threshold',
             default_value='0.50',
             description='GroundingDINO confidence threshold before MobileSAM segmentation.',
+        ),
+        DeclareLaunchArgument(
+            'dino_selection_policy',
+            default_value='score',
+            description='GroundingDINO candidate selection policy: score, center, or score_center.',
+        ),
+        DeclareLaunchArgument(
+            'dino_center_weight',
+            default_value='0.6',
+            description='Penalty weight for off-center boxes when dino_selection_policy:=score_center.',
+        ),
+        DeclareLaunchArgument(
+            'dino_max_center_distance_norm',
+            default_value='0.0',
+            description='Reject DINO boxes farther than this normalized image-diagonal distance from center. Set <=0 to disable.',
+        ),
+        DeclareLaunchArgument(
+            'dino_max_center_x_offset_norm',
+            default_value='0.0',
+            description='Reject DINO boxes whose center is farther than this normalized half-image-width offset from center. Set <=0 to disable.',
+        ),
+        DeclareLaunchArgument(
+            'dino_max_center_y_offset_norm',
+            default_value='0.0',
+            description='Reject DINO boxes whose center is farther than this normalized half-image-height offset from center. Set <=0 to disable.',
         ),
         DeclareLaunchArgument(
             'dino_mobilesam_min_mask_area',

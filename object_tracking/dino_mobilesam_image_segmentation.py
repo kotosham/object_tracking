@@ -144,10 +144,33 @@ class GroundingDINOMobileSAMSegmentor:
         )
         return os.path.isdir(path) and all(os.path.isfile(os.path.join(path, name)) for name in required_files)
 
-    def segment(self, image_bgr, prompt, depth_map, min_mask_area=100, box_threshold=0.50):
+    def segment(
+        self,
+        image_bgr,
+        prompt,
+        depth_map,
+        min_mask_area=100,
+        box_threshold=0.50,
+        selection_policy="score",
+        center_weight=0.6,
+        max_center_distance_norm=0.0,
+        max_center_x_offset_norm=0.0,
+        max_center_y_offset_norm=0.0,
+    ):
         self.last_detection_score = None
         self.last_detection_label = None
         self.last_mask = None
+        box_threshold = min(1.0, max(0.0, float(box_threshold)))
+        selection_policy = str(selection_policy).strip().lower()
+        if selection_policy not in ("score", "center", "score_center"):
+            selection_policy = "score"
+        center_weight = max(0.0, float(center_weight))
+        max_center_distance_norm = max(0.0, float(max_center_distance_norm))
+        max_center_x_offset_norm = max(0.0, float(max_center_x_offset_norm))
+        max_center_y_offset_norm = max(0.0, float(max_center_y_offset_norm))
+        # Keep post-processing permissive enough to log near misses when the
+        # final user-configured threshold rejects all candidates.
+        postprocess_threshold = min(0.3, box_threshold)
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
         image_pil = PILImage.fromarray(image_rgb)
         text_labels = [[prompt]]
@@ -163,7 +186,7 @@ class GroundingDINOMobileSAMSegmentor:
         results = self.dino_processor.post_process_grounded_object_detection(
             outputs,
             inputs.input_ids,
-            threshold=0.3,
+            threshold=postprocess_threshold,
             text_threshold=0.25,
             target_sizes=[image_pil.size[::-1]]
         )
@@ -178,24 +201,104 @@ class GroundingDINOMobileSAMSegmentor:
 
         result = results[0]
 
-        # Фильтрация по уверенности GroundingDINO.
-        box_threshold = float(box_threshold)
-        filtered = [
-            (box.cpu().numpy(), score.item(), label)
-            for box, score, label in zip(result["boxes"], result["scores"], result["labels"])
-            if score.item() >= box_threshold
-        ]
+        image_height, image_width = image_bgr.shape[:2]
+        image_center_x = image_width / 2.0
+        image_center_y = image_height / 2.0
+        image_diag = max(1.0, math.hypot(image_width, image_height))
+
+        # Фильтрация по уверенности GroundingDINO и, опционально, по близости к центру кадра.
+        filtered = []
+        center_rejected = []
+        for box_msg, score_msg, label in zip(result["boxes"], result["scores"], result["labels"]):
+            score = float(score_msg.item())
+            if score < box_threshold:
+                continue
+
+            box_array = box_msg.cpu().numpy()
+            x1, y1, x2, y2 = box_array
+            box_center_x = (float(x1) + float(x2)) / 2.0
+            box_center_y = (float(y1) + float(y2)) / 2.0
+            center_distance_norm = math.hypot(
+                box_center_x - image_center_x,
+                box_center_y - image_center_y,
+            ) / image_diag
+            center_x_offset_norm = abs(box_center_x - image_center_x) / max(1.0, image_width / 2.0)
+            center_y_offset_norm = abs(box_center_y - image_center_y) / max(1.0, image_height / 2.0)
+
+            candidate = (
+                box_array,
+                score,
+                label,
+                center_distance_norm,
+                center_x_offset_norm,
+                center_y_offset_norm,
+            )
+            if (
+                max_center_distance_norm > 0.0
+                and center_distance_norm > max_center_distance_norm
+            ):
+                center_rejected.append(candidate)
+                continue
+            if (
+                max_center_x_offset_norm > 0.0
+                and center_x_offset_norm > max_center_x_offset_norm
+            ):
+                center_rejected.append(candidate)
+                continue
+            if (
+                max_center_y_offset_norm > 0.0
+                and center_y_offset_norm > max_center_y_offset_norm
+            ):
+                center_rejected.append(candidate)
+                continue
+
+            filtered.append(candidate)
 
         if not filtered:
-            print("Объект не найден по уверенности")
+            scores = [score.item() for score in result["scores"]]
+            if center_rejected:
+                best_rejected = sorted(center_rejected, key=lambda x: -x[1])[0]
+                print(
+                    "Объект не найден в центральной области "
+                    f"(best_score={best_rejected[1]:.2f}, "
+                    f"center_dist={best_rejected[3]:.2f}, "
+                    f"x_offset={best_rejected[4]:.2f}, "
+                    f"y_offset={best_rejected[5]:.2f})"
+                )
+            elif scores:
+                print(
+                    f"Объект не найден по уверенности "
+                    f"(best_score={max(scores):.2f}, threshold={box_threshold:.2f})"
+                )
+            else:
+                print(f"Объект не найден по уверенности (threshold={box_threshold:.2f})")
             return image_bgr, None, depth_map, 0
 
-        # Выбери самый уверенный бокс
-        box, score, label = sorted(filtered, key=lambda x: -x[1])[0]
+        if selection_policy == "center":
+            box, score, label, center_distance_norm, center_x_offset_norm, center_y_offset_norm = sorted(
+                filtered,
+                key=lambda x: (x[3], -x[1]),
+            )[0]
+        elif selection_policy == "score_center":
+            box, score, label, center_distance_norm, center_x_offset_norm, center_y_offset_norm = sorted(
+                filtered,
+                key=lambda x: -(x[1] - center_weight * x[3]),
+            )[0]
+        else:
+            box, score, label, center_distance_norm, center_x_offset_norm, center_y_offset_norm = sorted(
+                filtered,
+                key=lambda x: -x[1],
+            )[0]
+
         input_box = np.array([box])
         self.last_detection_score = float(score)
         self.last_detection_label = str(label)
-        print(f"Найден объект: {label} (score={score:.2f})")
+        print(
+            f"Найден объект: {label} "
+            f"(score={score:.2f}, center_dist={center_distance_norm:.2f}, "
+            f"x_offset={center_x_offset_norm:.2f}, y_offset={center_y_offset_norm:.2f}, "
+            f"policy={selection_policy})"
+        )
 
         print("Received bounding boxes")
 
