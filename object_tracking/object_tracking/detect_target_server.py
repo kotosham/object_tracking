@@ -11,6 +11,7 @@ this node only perceives.
 """
 import threading
 import time
+from collections import deque
 
 import rclpy
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
@@ -59,6 +60,8 @@ class DetectTargetServer(Node):
         self.declare_parameter('min_depth_m', 0.1)
         self.declare_parameter('max_depth_m', 8.0)
         self.declare_parameter('depth_window', 2)        # +/- px median window
+        self.declare_parameter('depth_match_tolerance_s', 0.2)
+        self.declare_parameter('depth_buffer_size', 30)
 
         g = lambda n: self.get_parameter(n).value
         self.image_topic = g('image_topic')
@@ -72,11 +75,13 @@ class DetectTargetServer(Node):
         self.min_depth_m = float(g('min_depth_m'))
         self.max_depth_m = float(g('max_depth_m'))
         self.depth_window = int(g('depth_window'))
+        self.depth_match_tolerance_s = float(g('depth_match_tolerance_s'))
+        self.depth_buffer_size = max(1, int(g('depth_buffer_size')))
 
         self._bridge = CvBridge() if _HAVE_CV else None
         self._frame = None               # latest BGR frame
         self._frame_header = None
-        self._depth = None               # latest depth frame in METERS (float)
+        self._depth_frames = deque(maxlen=self.depth_buffer_size)
         self._lock = threading.Lock()    # single-in-flight detection
 
         self.segmentor = self._load_segmentor()
@@ -123,8 +128,10 @@ class DetectTargetServer(Node):
             self.create_timer(1.0, self._update_health)
 
         self.get_logger().info(
-            'detect_target_server up (Phase 3.2): backend=%s topic=%s compressed=%s max_marks=%d%s'
+            'detect_target_server up (Phase 3.2): backend=%s topic=%s compressed=%s '
+            'max_marks=%d depth_sync=%.3fs%s'
             % (self.model_mode, self.image_topic, self.use_compressed, self.max_marks,
+               self.depth_match_tolerance_s,
                '' if self.segmentor is not None else ' [BACKEND FAILED -> goals ABORT]'))
 
     def _update_health(self):
@@ -189,11 +196,37 @@ class DetectTargetServer(Node):
         else:
             depth = depth.astype(np.float32)
         with self._lock:
-            self._depth = depth
+            self._depth_frames.append((self._stamp_to_ns(msg.header.stamp), depth))
 
-    def _sample_depth(self, cx, cy):
+    @staticmethod
+    def _stamp_to_ns(stamp):
+        return int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+
+    def _match_depth_locked(self, image_header):
+        """Return the closest depth frame to the RGB stamp, or None if too far."""
+        if not self._depth_frames:
+            return None
+        if image_header is None:
+            return self._depth_frames[-1][1]
+        target_ns = self._stamp_to_ns(image_header.stamp)
+        if target_ns <= 0:
+            return self._depth_frames[-1][1]
+        best_ns, best_depth = min(
+            self._depth_frames,
+            key=lambda item: abs(item[0] - target_ns),
+        )
+        delta_s = abs(best_ns - target_ns) / 1e9
+        if delta_s > self.depth_match_tolerance_s:
+            self.get_logger().warn(
+                'detect_target: no synchronized depth for RGB stamp; closest delta '
+                '%.3fs > %.3fs' % (delta_s, self.depth_match_tolerance_s),
+                throttle_duration_sec=2.0,
+            )
+            return None
+        return best_depth
+
+    def _sample_depth(self, depth, cx, cy):
         """Median valid depth (m) in a small window around (cx,cy); 0.0 if none."""
-        depth = self._depth
         if depth is None:
             return 0.0
         h, w = depth.shape[:2]
@@ -217,6 +250,7 @@ class DetectTargetServer(Node):
         with self._lock:
             frame = None if self._frame is None else self._frame.copy()
             header = self._frame_header
+            depth = self._match_depth_locked(header) if self.use_depth else None
         if frame is None:
             self.get_logger().warn('detect_target: no camera frame yet')
             goal_handle.abort()
@@ -248,7 +282,7 @@ class DetectTargetServer(Node):
         marked = assign_marks(dets, conf_threshold=conf, max_marks=self.max_marks)
         if self.use_depth:
             for d in marked:                       # fill metric depth at each center
-                d.depth_m = self._sample_depth(d.cx, d.cy)
+                d.depth_m = self._sample_depth(depth, d.cx, d.cy)
         fb.frames_processed = 1
         fb.best_confidence = float(marked[0].confidence) if marked else 0.0
         goal_handle.publish_feedback(fb)

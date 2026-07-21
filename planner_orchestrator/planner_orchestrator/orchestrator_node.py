@@ -135,7 +135,7 @@ class PlannerOrchestrator(Node):
         # a natural-language query like "ride to bus" scores ~0.45 vs ~0.66 for "bus",
         # so a higher floor with a bare label avoids acting on a marginal glimpse.
         self.declare_parameter('detect_conf', 0.0)
-        self.declare_parameter('camera_frame', 'camera_link_optical')
+        self.declare_parameter('camera_frame', 'camera_color_optical_frame')
         self.declare_parameter('subscribe_camera_image', True)
         self.declare_parameter('camera_image_topic', '/camera/camera/color/image_raw')
         self.declare_parameter('camera_use_compressed_input', False)
