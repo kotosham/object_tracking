@@ -51,7 +51,7 @@ class DetectTargetServer(Node):
         self.declare_parameter('use_compressed_input', False)
         self.declare_parameter('input_reliability', 'best_effort')
         self.declare_parameter('model_mode', 'yoloe')
-        self.declare_parameter('conf_default', 0.25)
+        self.declare_parameter('conf_default', 0.20)
         self.declare_parameter('min_mask_area', 200)
         self.declare_parameter('max_marks', 9)           # Set-of-Mark legibility cap
         self.declare_parameter('jpeg_quality', 80)
@@ -225,18 +225,81 @@ class DetectTargetServer(Node):
             return None
         return best_depth
 
-    def _sample_depth(self, depth, cx, cy):
-        """Median valid depth (m) in a small window around (cx,cy); 0.0 if none."""
+    @staticmethod
+    def _unknown_depth():
+        return float('nan')
+
+    def _valid_depth_values(self, values):
+        values = np.asarray(values).ravel()
+        return values[(values >= self.min_depth_m) & (values <= self.max_depth_m)
+                      & np.isfinite(values)]
+
+    def _scale_rgb_point_to_depth(self, cx, cy, rgb_shape, depth_shape):
+        """Map RGB pixel coordinates into the aligned-depth image grid.
+
+        RealSense aligned_depth_to_color can still be published at a lower
+        resolution than RGB (e.g. RGB 640x480, depth 424x240). The detector runs
+        on RGB pixels, while depth sampling indexes the depth image, so coordinates
+        must be scaled before lookup.
+        """
+        dh, dw = depth_shape[:2]
+        if rgb_shape is None:
+            return int(round(cx)), int(round(cy))
+        rh, rw = rgb_shape[:2]
+        if rw <= 0 or rh <= 0:
+            return int(round(cx)), int(round(cy))
+        dx = int(round(float(cx) * float(dw) / float(rw)))
+        dy = int(round(float(cy) * float(dh) / float(rh)))
+        return dx, dy
+
+    def _scale_rgb_bbox_to_depth(self, bbox, rgb_shape, depth_shape):
+        if bbox is None or rgb_shape is None:
+            return None
+        dh, dw = depth_shape[:2]
+        rh, rw = rgb_shape[:2]
+        if rw <= 0 or rh <= 0:
+            return None
+        x1, y1, x2, y2 = bbox
+        sx = float(dw) / float(rw)
+        sy = float(dh) / float(rh)
+        return (
+            max(0, min(dw, int(round(float(x1) * sx)))),
+            max(0, min(dh, int(round(float(y1) * sy)))),
+            max(0, min(dw, int(round(float(x2) * sx)))),
+            max(0, min(dh, int(round(float(y2) * sy)))),
+        )
+
+    def _sample_depth(self, depth, cx, cy, rgb_shape=None, bbox=None):
+        """Metric depth near an RGB detection center; NaN if unknown.
+
+        Primary sample: median valid depth in a small window around the center,
+        after scaling RGB coordinates into the depth image grid. If the center is
+        a hole (common on chairs/mesh/reflective surfaces), fall back to a lower
+        percentile over the scaled bbox so we prefer the object surface over the
+        farther background.
+        """
         if depth is None:
-            return 0.0
+            return self._unknown_depth()
         h, w = depth.shape[:2]
-        if not (0 <= cy < h and 0 <= cx < w):
-            return 0.0
+        dx, dy = self._scale_rgb_point_to_depth(cx, cy, rgb_shape, depth.shape)
+        if not (0 <= dy < h and 0 <= dx < w):
+            return self._unknown_depth()
         r = max(0, self.depth_window)
-        patch = depth[max(0, cy - r):cy + r + 1, max(0, cx - r):cx + r + 1].ravel()
-        valid = patch[(patch >= self.min_depth_m) & (patch <= self.max_depth_m)
-                      & np.isfinite(patch)]
-        return float(np.median(valid)) if valid.size else 0.0
+        patch = depth[max(0, dy - r):dy + r + 1, max(0, dx - r):dx + r + 1]
+        valid = self._valid_depth_values(patch)
+        if valid.size:
+            return float(np.median(valid))
+
+        db = self._scale_rgb_bbox_to_depth(bbox, rgb_shape, depth.shape)
+        if db is None:
+            return self._unknown_depth()
+        x1, y1, x2, y2 = db
+        if x2 <= x1 or y2 <= y1:
+            return self._unknown_depth()
+        valid = self._valid_depth_values(depth[y1:y2, x1:x2])
+        if not valid.size:
+            return self._unknown_depth()
+        return float(np.percentile(valid, 20))
 
     # ---- DetectTarget goal ----
     def _execute(self, goal_handle):
@@ -282,7 +345,7 @@ class DetectTargetServer(Node):
         marked = assign_marks(dets, conf_threshold=conf, max_marks=self.max_marks)
         if self.use_depth:
             for d in marked:                       # fill metric depth at each center
-                d.depth_m = self._sample_depth(depth, d.cx, d.cy)
+                d.depth_m = self._sample_depth(depth, d.cx, d.cy, frame.shape, d.bbox)
         fb.frames_processed = 1
         fb.best_confidence = float(marked[0].confidence) if marked else 0.0
         goal_handle.publish_feedback(fb)

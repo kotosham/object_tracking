@@ -17,6 +17,7 @@ on the reactive control path; the Pi executive owns motion.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from typing import List, Optional, Tuple
 
 # Atomic action kinds (mirror object_tracking_msgs/msg/AtomicAction.msg).
@@ -41,11 +42,28 @@ ACTION_KINDS = {v: k for k, v in ACTION_NAMES.items()}
 @dataclass(frozen=True)
 class Candidate:
     """A Set-of-Mark detection the VLM may target by mark_id. distance_m is the
-    metric range to the object from the RealSense aligned depth (0.0 if unknown)."""
+    metric range to the object from the RealSense aligned depth. NaN/<=0 means
+    depth is unknown and cannot be used for ApproachDetection geometry."""
     mark_id: int
     label: str
     score: float = 0.0
     distance_m: float = 0.0
+
+
+def distance_is_known(distance_m: float) -> bool:
+    try:
+        d = float(distance_m)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(d) and d > 0.0
+
+
+def distance_for_options(distance_m: float):
+    return round(float(distance_m), 2) if distance_is_known(distance_m) else None
+
+
+def format_distance(distance_m: float) -> str:
+    return 'unknown' if not distance_is_known(distance_m) else '%.2fm' % float(distance_m)
 
 
 @dataclass(frozen=True)
@@ -94,8 +112,11 @@ def validate_action(action: Action, obs: Observation) -> Tuple[bool, str]:
     if action.kind not in ACTION_NAMES:
         return False, 'unknown action kind %r' % action.kind
     if action.kind == DRIVE_TO_VISIBLE:
-        if action.mark_id not in {c.mark_id for c in obs.candidates}:
+        by_id = {c.mark_id: c for c in obs.candidates}
+        if action.mark_id not in by_id:
             return False, 'mark_id %d not in candidates' % action.mark_id
+        if not distance_is_known(by_id[action.mark_id].distance_m):
+            return False, 'mark_id %d has unknown distance' % action.mark_id
     return True, 'OK'
 
 
@@ -234,9 +255,21 @@ class MockPlanner:
         if matches:
             best = max(matches, key=lambda c: c.score)
             self._scans = 0
+            if not distance_is_known(best.distance_m):
+                if self._approaches > 0:
+                    self._approaches = 0
+                    return Action(DONE, rationale='target "%s" still visible after approach '
+                                  'but depth is unknown -> stopping' % obs.target)
+                if not self._looked:
+                    self._looked = True
+                    return Action(DETECT_ALL, rationale='target "%s" visible but depth unknown; '
+                                  'refresh all detections' % obs.target)
+                return Action(TURN, turn_yaw_rad=self.turn_step_rad,
+                              rationale='target "%s" visible but depth unknown; change view'
+                              % obs.target)
             self._looked = False
             # arrived: within the RealSense reached range -> done.
-            if 0.0 < best.distance_m <= self.reached_dist_m:
+            if best.distance_m <= self.reached_dist_m:
                 self._approaches = 0
                 return Action(DONE, rationale='target "%s" reached (%.2fm)'
                               % (obs.target, best.distance_m))
@@ -279,7 +312,7 @@ def build_vlm_options(obs: Observation) -> dict:
         'actions': list(ACTION_NAMES.values()),
         'visible_marks': [{'mark_id': c.mark_id, 'label': c.label,
                            'score': round(c.score, 3),
-                           'distance_m': round(c.distance_m, 2)}
+                           'distance_m': distance_for_options(c.distance_m)}
                           for c in obs.candidates],
         'notes': obs.notes_facts,
         'step_index': obs.step_index,

@@ -28,7 +28,7 @@ class Detection:
     cx: int                              # detection center u (px)
     cy: int                              # detection center v (px)
     bbox: Tuple[int, int, int, int]      # x1, y1, x2, y2 (px)
-    depth_m: float = 0.0                 # 0.0 if no depth
+    depth_m: float = 0.0                 # NaN when depth is unknown
     mark_id: int = 0                     # 0 until assign_marks() numbers it
 
 

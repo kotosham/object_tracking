@@ -10,14 +10,16 @@ from planner_orchestrator.planner_logic import (
 
 def test_mock_approaches_visible_target():
     obs = Observation(target='bus',
-                      candidates=[Candidate(2, 'bus', 0.9), Candidate(5, 'person', 0.8)])
+                      candidates=[Candidate(2, 'bus', 0.9, distance_m=2.0),
+                                  Candidate(5, 'person', 0.8, distance_m=1.0)])
     a = MockPlanner().plan(obs)
     assert a.kind == DRIVE_TO_VISIBLE and a.mark_id == 2
 
 
 def test_mock_picks_best_matching_candidate():
     obs = Observation(target='chair',
-                      candidates=[Candidate(1, 'chair', 0.4), Candidate(3, 'office chair', 0.9)])
+                      candidates=[Candidate(1, 'chair', 0.4, distance_m=2.5),
+                                  Candidate(3, 'office chair', 0.9, distance_m=3.0)])
     a = MockPlanner().plan(obs)
     assert a.kind == DRIVE_TO_VISIBLE and a.mark_id == 3   # best score among matches
 
@@ -48,10 +50,16 @@ def test_mock_approaches_until_close():
 
 def test_mock_done_when_lost_after_approach():
     mp = MockPlanner()
-    seen = Observation(target='bus', candidates=[Candidate(2, 'bus', 0.9)])  # distance unknown
+    seen = Observation(target='bus', candidates=[Candidate(2, 'bus', 0.9, distance_m=2.0)])
     assert mp.plan(seen).kind == DRIVE_TO_VISIBLE     # drove toward it
     # at point-blank the bus overflows the frame and YOLOE drops it -> treated as arrived.
     assert mp.plan(Observation(target='bus')).kind == DONE
+
+
+def test_mock_does_not_approach_unknown_depth_target_before_drive():
+    mp = MockPlanner()
+    unknown = Observation(target='bus', candidates=[Candidate(2, 'bus', 0.9)])
+    assert mp.plan(unknown).kind == DETECT_ALL
 
 
 def test_mock_approach_is_bounded():
@@ -64,15 +72,21 @@ def test_mock_approach_is_bounded():
 # ---- enum-tool-call validation (anti-hallucination) ------------------------
 
 def test_validate_rejects_phantom_mark():
-    obs = Observation(target='bus', candidates=[Candidate(2, 'bus')])
+    obs = Observation(target='bus', candidates=[Candidate(2, 'bus', distance_m=2.0)])
     ok, _ = validate_action(Action(DRIVE_TO_VISIBLE, mark_id=99), obs)
     assert not ok
 
 
 def test_validate_accepts_real_mark():
-    obs = Observation(target='bus', candidates=[Candidate(2, 'bus')])
+    obs = Observation(target='bus', candidates=[Candidate(2, 'bus', distance_m=2.0)])
     ok, _ = validate_action(Action(DRIVE_TO_VISIBLE, mark_id=2), obs)
     assert ok
+
+
+def test_validate_rejects_unknown_depth_mark():
+    obs = Observation(target='bus', candidates=[Candidate(2, 'bus')])
+    ok, reason = validate_action(Action(DRIVE_TO_VISIBLE, mark_id=2), obs)
+    assert not ok and 'unknown distance' in reason
 
 
 def test_validate_accepts_argless_actions():
@@ -96,20 +110,26 @@ def test_build_options_lists_real_marks():
     assert 'frontiers' not in opt          # frontier options removed from the vocab
 
 
+def test_build_options_serializes_unknown_distance_as_null():
+    obs = Observation(target='bus', candidates=[Candidate(2, 'bus', 0.9)])
+    mark = build_vlm_options(obs)['visible_marks'][0]
+    assert mark['distance_m'] is None
+
+
 def test_build_options_omits_map_when_absent():
     opt = build_vlm_options(Observation(target='bus'))
     assert 'map' not in opt
 
 
 def test_parse_valid_tool_call():
-    obs = Observation(target='bus', candidates=[Candidate(2, 'bus')])
+    obs = Observation(target='bus', candidates=[Candidate(2, 'bus', distance_m=2.0)])
     act, reason = parse_vlm_action({'action': 'DRIVE_TO_VISIBLE', 'mark_id': 2,
                                     'rationale': 'see bus'}, obs)
     assert act is not None and act.kind == DRIVE_TO_VISIBLE and reason == 'OK'
 
 
 def test_parse_rejects_hallucinated_mark():
-    obs = Observation(target='bus', candidates=[Candidate(2, 'bus')])
+    obs = Observation(target='bus', candidates=[Candidate(2, 'bus', distance_m=2.0)])
     act, reason = parse_vlm_action({'action': 'DRIVE_TO_VISIBLE', 'mark_id': 7}, obs)
     assert act is None and 'not in candidates' in reason
 

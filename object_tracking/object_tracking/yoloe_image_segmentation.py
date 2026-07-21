@@ -125,7 +125,7 @@ class YOLOESegmentor:
     def _set_prompt(self, prompt):
         self._set_classes([prompt])
 
-    def segment(self, image, prompt, depth_map, conf=0.25, min_mask_area=200):
+    def segment(self, image, prompt, depth_map, conf=0.20, min_mask_area=200):
         """Run YOLOE text-prompted detection and segmentation on the whole image.
 
         Returns an overlay image, center coordinates, inference time and the
@@ -214,7 +214,7 @@ class YOLOESegmentor:
         y_mean = int(np.mean(y_indices))
         return (x_mean, y_mean)
 
-    def segment_all(self, image, prompt, conf=0.25, min_mask_area=200):
+    def segment_all(self, image, prompt, conf=0.20, min_mask_area=200):
         """Open-vocab detection returning ALL matches as setofmark.Detection objects
         (best-first by confidence) -- the multi-candidate path for the DetectTarget
         Set-of-Mark service (Phase 3.2/3.3), vs. segment() which returns only the
@@ -254,7 +254,7 @@ class YOLOESegmentor:
         dets.sort(key=lambda d: d.confidence, reverse=True)
         return dets
 
-    def segment_vocab(self, image, classes=None, conf=0.25, min_mask_area=200):
+    def segment_vocab(self, image, classes=None, conf=0.20, min_mask_area=200):
         """DETECT_ALL: detect every object from a BROAD vocabulary (vs segment_all's
         single text prompt) and label each Detection with its OWN predicted class.
         Defaults to DEFAULT_VOCAB. YOLOE here is text-prompted, so "all objects" =

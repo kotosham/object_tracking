@@ -61,7 +61,8 @@ from fleet_comms.heartbeat import HeartbeatPublisher
 from planner_orchestrator import orchestration as orch
 from planner_orchestrator.planner_logic import (
     Candidate, CircuitBreaker, DegradationLatch, NotesBuffer, Observation,
-    DETECT_ALL, DRIVE_FORWARD, DRIVE_TO_VISIBLE, TURN,
+    DETECT_ALL, DRIVE_FORWARD, DRIVE_TO_VISIBLE, TURN, distance_for_options,
+    distance_is_known, format_distance,
 )
 from planner_orchestrator.vlm_client import make_client
 
@@ -131,7 +132,7 @@ class PlannerOrchestrator(Node):
         self.declare_parameter('detect_action_name', 'detect_target')
         self.declare_parameter('detect_timeout_s', 6.0)
         # Confidence floor for detections the planner acts on. 0.0 keeps the detector's
-        # own default (0.25). Raise it (e.g. 0.5) to ignore weak/edge-of-frame matches --
+        # own default (0.20). Raise it (e.g. 0.5) to ignore weak/edge-of-frame matches --
         # a natural-language query like "ride to bus" scores ~0.45 vs ~0.66 for "bus",
         # so a higher floor with a bare label avoids acting on a marginal glimpse.
         self.declare_parameter('detect_conf', 0.0)
@@ -476,8 +477,8 @@ class PlannerOrchestrator(Node):
             self._activity('degraded', step=step,
                            detail='VLM circuit-breaker OPEN -> continuing in FLAT fallback')
         best = max(obs.candidates, key=lambda c: c.score, default=None)
-        det = ('' if best is None
-               else " best='%s' conf=%.2f @%.2fm" % (best.label, best.score, best.distance_m))
+        det = ('' if best is None else " best='%s' conf=%.2f @%s"
+               % (best.label, best.score, format_distance(best.distance_m)))
         self.get_logger().info(
             'observe@step %d: %d detection(s)%s, notes=%d, map=%s -> asking %s'
             % (step, len(obs.candidates), det, len(obs.notes_facts),
@@ -486,7 +487,7 @@ class PlannerOrchestrator(Node):
             'observe', step=step, n_detections=len(obs.candidates),
             detections=[{'mark_id': c.mark_id, 'label': c.label,
                          'score': round(float(c.score), 3),
-                         'distance_m': round(float(c.distance_m), 2)}
+                         'distance_m': distance_for_options(c.distance_m)}
                         for c in obs.candidates],
             notes=len(obs.notes_facts), map='yes' if map_jpeg else 'no',
             client=type(client).__name__)
@@ -675,6 +676,11 @@ class PlannerOrchestrator(Node):
         pt = (cand_pixels or {}).get(int(mark_id))
         if pt is None:
             self.get_logger().warn('DRIVE_TO_VISIBLE: no pixel for mark %s' % mark_id)
+            return False
+        if not distance_is_known(pt.z):
+            self.get_logger().warn(
+                'DRIVE_TO_VISIBLE: mark %s has unknown depth; refusing ApproachDetection'
+                % mark_id)
             return False
         stop = threading.Event()
 

@@ -60,14 +60,14 @@ def test_resolve_credentials_strips_and_falls_back(monkeypatch):
 
 
 def test_mock_client_drives_loop():
-    obs = Observation(target='bus', candidates=[Candidate(2, 'bus', 0.9)])
+    obs = Observation(target='bus', candidates=[Candidate(2, 'bus', 0.9, distance_m=2.0)])
     a = MockVlmClient().plan(obs)
     assert a.kind == DRIVE_TO_VISIBLE and a.mark_id == 2
 
 
 def test_build_messages_includes_image_and_options():
     c = OpenAICompatibleClient('http://x/v1', 'k', 'qwen')
-    obs = Observation(target='bus', candidates=[Candidate(2, 'bus', 0.9)])
+    obs = Observation(target='bus', candidates=[Candidate(2, 'bus', 0.9, distance_m=2.0)])
     msgs = c.build_messages(obs, image_jpeg=b'\xff\xd8jpegbytes')
     assert msgs[0]['role'] == 'system'
     user = msgs[1]['content']
@@ -86,7 +86,7 @@ def test_build_messages_text_only_when_no_image():
 
 def test_build_messages_attaches_map_as_second_image():
     c = OpenAICompatibleClient('http://x/v1', 'k', 'qwen')
-    obs = Observation(target='bus', candidates=[Candidate(2, 'bus', 0.9)],
+    obs = Observation(target='bus', candidates=[Candidate(2, 'bus', 0.9, distance_m=2.0)],
                       map_text='occupancy map')
     msgs = c.build_messages(obs, image_jpeg=b'\xff\xd8camera', map_jpeg=b'\xff\xd8map')
     images = [p for p in msgs[1]['content'] if p['type'] == 'image_url']
@@ -96,7 +96,7 @@ def test_build_messages_attaches_map_as_second_image():
 
 def test_parse_response_valid_tool_call():
     c = OpenAICompatibleClient('http://x/v1', 'k', 'qwen')
-    obs = Observation(target='bus', candidates=[Candidate(2, 'bus', 0.9)])
+    obs = Observation(target='bus', candidates=[Candidate(2, 'bus', 0.9, distance_m=2.0)])
     resp = json.dumps({'choices': [{'message': {'content':
            json.dumps({'action': 'DRIVE_TO_VISIBLE', 'mark_id': 2, 'rationale': 'approach'})}}]})
     act = c.parse_response(resp, obs)
