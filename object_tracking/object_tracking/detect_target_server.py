@@ -4,10 +4,11 @@
 The service-mode counterpart to the continuous rgb_tracker_node: instead of streaming
 /target_pixel, it answers a DetectTarget goal (open-vocab ``query`` + ``conf_threshold``)
 with a numbered Candidate[] and an optional annotated Set-of-Mark frame, so the VLM can
-pick a target by ``mark_id`` (DRIVE_TO_VISIBLE). YOLOE is the default backend; the heavy
-torch/ultralytics import is deferred to construction so this module imports without a GPU
-(node returns ABORTED if the backend can't load). The VLM/executive owns all motion --
-this node only perceives.
+pick a target by ``mark_id`` (DRIVE_TO_VISIBLE). In hybrid mode, concrete target
+queries use GroundingDINO+MobileSAM while DETECT_ALL stays on YOLOE's broad
+vocabulary. The heavy torch/ultralytics imports are deferred to construction so
+this module imports without a GPU (node returns ABORTED if a required backend
+can't load). The VLM/executive owns all motion -- this node only perceives.
 """
 import threading
 import time
@@ -51,7 +52,9 @@ class DetectTargetServer(Node):
         self.declare_parameter('use_compressed_input', False)
         self.declare_parameter('input_reliability', 'best_effort')
         self.declare_parameter('model_mode', 'yoloe')
-        self.declare_parameter('conf_default', 0.20)
+        self.declare_parameter('conf_default', -1.0)  # legacy override for both paths
+        self.declare_parameter('target_conf_default', 0.50)
+        self.declare_parameter('vocab_conf_default', 0.12)
         self.declare_parameter('min_mask_area', 200)
         self.declare_parameter('max_marks', 9)           # Set-of-Mark legibility cap
         self.declare_parameter('jpeg_quality', 80)
@@ -60,6 +63,8 @@ class DetectTargetServer(Node):
         self.declare_parameter('min_depth_m', 0.1)
         self.declare_parameter('max_depth_m', 8.0)
         self.declare_parameter('depth_window', 2)        # +/- px median window
+        self.declare_parameter('depth_point_strategy', 'nearest_mask')
+        self.declare_parameter('nearest_depth_percentile', 2.0)
         self.declare_parameter('depth_match_tolerance_s', 0.2)
         self.declare_parameter('depth_buffer_size', 30)
 
@@ -67,7 +72,12 @@ class DetectTargetServer(Node):
         self.image_topic = g('image_topic')
         self.use_compressed = bool(g('use_compressed_input'))
         self.model_mode = str(g('model_mode')).strip().lower()
-        self.conf_default = float(g('conf_default'))
+        legacy_conf_default = float(g('conf_default'))
+        self.target_conf_default = float(g('target_conf_default'))
+        self.vocab_conf_default = float(g('vocab_conf_default'))
+        if legacy_conf_default > 0.0:
+            self.target_conf_default = legacy_conf_default
+            self.vocab_conf_default = legacy_conf_default
         self.min_mask_area = int(g('min_mask_area'))
         self.max_marks = int(g('max_marks'))
         self.jpeg_quality = int(g('jpeg_quality'))
@@ -75,6 +85,8 @@ class DetectTargetServer(Node):
         self.min_depth_m = float(g('min_depth_m'))
         self.max_depth_m = float(g('max_depth_m'))
         self.depth_window = int(g('depth_window'))
+        self.depth_point_strategy = str(g('depth_point_strategy')).strip().lower()
+        self.nearest_depth_percentile = float(g('nearest_depth_percentile'))
         self.depth_match_tolerance_s = float(g('depth_match_tolerance_s'))
         self.depth_buffer_size = max(1, int(g('depth_buffer_size')))
 
@@ -84,7 +96,10 @@ class DetectTargetServer(Node):
         self._depth_frames = deque(maxlen=self.depth_buffer_size)
         self._lock = threading.Lock()    # single-in-flight detection
 
-        self.segmentor = self._load_segmentor()
+        self.target_segmentor, self.vocab_segmentor = self._load_segmentors()
+        # Backward-compatible alias for older tests/tools that only check that a
+        # backend exists. Query routing below uses target_segmentor/vocab_segmentor.
+        self.segmentor = self.target_segmentor or self.vocab_segmentor
 
         sub_group = ReentrantCallbackGroup()
         q = QoSProfile(depth=1)
@@ -123,22 +138,32 @@ class DetectTargetServer(Node):
         self._hb = None
         if _HAVE_HEARTBEAT:
             self._hb = HeartbeatPublisher(self, 'detector', period_s=0.5)
-            self._hb.set_status(Heartbeat.DOWN if self.segmentor is None
+            self._hb.set_status(Heartbeat.DOWN if not self._backends_ready()
                                 else Heartbeat.DEGRADED)
             self.create_timer(1.0, self._update_health)
 
         self.get_logger().info(
-            'detect_target_server up (Phase 3.2): backend=%s topic=%s compressed=%s '
-            'max_marks=%d depth_sync=%.3fs%s'
-            % (self.model_mode, self.image_topic, self.use_compressed, self.max_marks,
+            'detect_target_server up (Phase 3.2): mode=%s target_backend=%s '
+            'vocab_backend=%s topic=%s compressed=%s '
+            'max_marks=%d target_conf=%.2f vocab_conf=%.2f depth_sync=%.3fs%s'
+            % (
+               self.model_mode,
+               self._backend_name(self.target_segmentor),
+               self._backend_name(self.vocab_segmentor),
+               self.image_topic,
+               self.use_compressed,
+               self.max_marks,
+               self.target_conf_default,
+               self.vocab_conf_default,
                self.depth_match_tolerance_s,
-               '' if self.segmentor is not None else ' [BACKEND FAILED -> goals ABORT]'))
+               '' if self._backends_ready() else ' [BACKEND FAILED -> some goals ABORT]',
+            ))
 
     def _update_health(self):
         """Roll the heartbeat status from backend + camera-frame freshness."""
         if self._hb is None:
             return
-        if self.segmentor is None:
+        if not self._backends_ready():
             self._hb.set_status(Heartbeat.DOWN)
         elif (time.monotonic() - self._last_frame_mono) > 2.0:
             self._hb.set_status(Heartbeat.DEGRADED)   # no/stale camera frames
@@ -146,22 +171,62 @@ class DetectTargetServer(Node):
             self._hb.set_status(Heartbeat.OK)
 
     # ---- detector backend (heavy import deferred here) ----
-    def _load_segmentor(self):
+    def _load_segmentors(self):
         if not _HAVE_CV:
             self.get_logger().error('cv2/cv_bridge unavailable; detector disabled')
-            return None
+            return None, None
+
+        mode = self.model_mode
+        if mode in ('hybrid', 'hybrid_dino_yoloe', 'dino_yoloe'):
+            return self._load_backend('dino_mobilesam'), self._load_backend('yoloe')
+        if mode == 'dino_mobilesam':
+            # Concrete target mode only. DETECT_ALL is unavailable in this mode.
+            return self._load_backend('dino_mobilesam'), None
+        if mode == 'yoloe':
+            yoloe = self._load_backend('yoloe')
+            return yoloe, yoloe
+
+        self.get_logger().error('model_mode "%s" not supported by DetectTarget' % mode)
+        return None, None
+
+    def _load_backend(self, backend_name):
         try:
-            if self.model_mode == 'yoloe':
+            if backend_name == 'yoloe':
                 from object_tracking.yoloe_image_segmentation import YOLOESegmentor
                 seg = YOLOESegmentor()
-                self.get_logger().info(seg.runtime_info())
-                return seg
-            self.get_logger().error('model_mode "%s" not supported by DetectTarget yet'
-                                     % self.model_mode)
-            return None
+            elif backend_name == 'dino_mobilesam':
+                from object_tracking.dino_mobilesam_image_segmentation import (
+                    GroundingDINOMobileSAMSegmentor,
+                )
+                seg = GroundingDINOMobileSAMSegmentor()
+            else:
+                self.get_logger().error('unknown detector backend "%s"' % backend_name)
+                return None
+            if hasattr(seg, 'runtime_info'):
+                self.get_logger().info('%s: %s' % (backend_name, seg.runtime_info()))
+            return seg
         except Exception as exc:                       # torch/weights missing, etc.
-            self.get_logger().error('detector backend load failed: %r' % (exc,))
+            self.get_logger().error('detector backend "%s" load failed: %r'
+                                    % (backend_name, exc))
             return None
+
+    @staticmethod
+    def _backend_name(segmentor):
+        if segmentor is None:
+            return 'none'
+        return type(segmentor).__name__
+
+    def _backends_ready(self):
+        if self.model_mode in ('hybrid', 'hybrid_dino_yoloe', 'dino_yoloe'):
+            return self.target_segmentor is not None and self.vocab_segmentor is not None
+        if self.model_mode == 'dino_mobilesam':
+            return self.target_segmentor is not None
+        return self.target_segmentor is not None and self.vocab_segmentor is not None
+
+    def _conf_for_query(self, query, request_conf):
+        if request_conf > 0.0:
+            return float(request_conf)
+        return self.target_conf_default if query else self.vocab_conf_default
 
     # ---- camera ----
     def _on_image(self, msg):
@@ -269,6 +334,74 @@ class DetectTargetServer(Node):
             max(0, min(dh, int(round(float(y2) * sy)))),
         )
 
+    def _scale_depth_point_to_rgb(self, dx, dy, rgb_shape, depth_shape):
+        dh, dw = depth_shape[:2]
+        if rgb_shape is None:
+            return int(dx), int(dy)
+        rh, rw = rgb_shape[:2]
+        if rw <= 0 or rh <= 0 or dw <= 0 or dh <= 0:
+            return int(dx), int(dy)
+        # Use pixel-center mapping so 424x240 depth maps back into 640x480 RGB.
+        rx = int(round((float(dx) + 0.5) * float(rw) / float(dw) - 0.5))
+        ry = int(round((float(dy) + 0.5) * float(rh) / float(dh) - 0.5))
+        return max(0, min(rw - 1, rx)), max(0, min(rh - 1, ry))
+
+    def _scale_rgb_mask_to_depth(self, mask, rgb_shape, depth_shape):
+        if mask is None or rgb_shape is None:
+            return None
+        mask = np.asarray(mask).astype(np.uint8)
+        if mask.ndim > 2:
+            mask = mask[:, :, 0]
+        rh, rw = rgb_shape[:2]
+        dh, dw = depth_shape[:2]
+        if rw <= 0 or rh <= 0 or dw <= 0 or dh <= 0:
+            return None
+        if mask.shape[:2] != (rh, rw):
+            mask = cv2.resize(mask, (rw, rh), interpolation=cv2.INTER_NEAREST)
+        return cv2.resize(mask, (dw, dh), interpolation=cv2.INTER_NEAREST).astype(bool)
+
+    def _bbox_mask_in_depth(self, bbox, rgb_shape, depth_shape):
+        db = self._scale_rgb_bbox_to_depth(bbox, rgb_shape, depth_shape)
+        if db is None:
+            return None
+        x1, y1, x2, y2 = db
+        if x2 <= x1 or y2 <= y1:
+            return None
+        mask = np.zeros(depth_shape[:2], dtype=bool)
+        mask[y1:y2, x1:x2] = True
+        return mask
+
+    def _front_surface_point_in_depth(self, depth, mask):
+        """Pick a robust nearest valid depth point inside a depth-resolution mask."""
+        if depth is None or mask is None:
+            return None
+        mask = np.asarray(mask, dtype=bool)
+        if mask.shape[:2] != depth.shape[:2]:
+            return None
+        valid_mask = mask & np.isfinite(depth) & (depth >= self.min_depth_m) & (depth <= self.max_depth_m)
+        if not np.any(valid_mask):
+            return None
+
+        valid_depths = depth[valid_mask]
+        pct = max(0.0, min(100.0, float(getattr(self, 'nearest_depth_percentile', 2.0))))
+        cutoff = float(np.percentile(valid_depths, pct))
+        front_mask = valid_mask & (depth <= cutoff)
+        if not np.any(front_mask):
+            min_depth = float(np.min(valid_depths))
+            front_mask = valid_mask & (depth <= min_depth)
+
+        ys, xs = np.where(front_mask)
+        if xs.size == 0:
+            return None
+
+        # If multiple pixels are equally near, choose a representative point on that
+        # front surface instead of a random edge pixel.
+        mx = float(np.median(xs))
+        my = float(np.median(ys))
+        idx = int(np.argmin((xs.astype(np.float32) - mx) ** 2 + (ys.astype(np.float32) - my) ** 2))
+        dx, dy = int(xs[idx]), int(ys[idx])
+        return dx, dy, float(depth[dy, dx])
+
     def _sample_depth(self, depth, cx, cy, rgb_shape=None, bbox=None):
         """Metric depth near an RGB detection center; NaN if unknown.
 
@@ -301,15 +434,33 @@ class DetectTargetServer(Node):
             return self._unknown_depth()
         return float(np.percentile(valid, 20))
 
+    def _sample_depth_point(self, depth, cx, cy, rgb_shape=None, bbox=None, mask=None):
+        """Return (rgb_x, rgb_y, depth_m) for navigation.
+
+        In nearest_mask mode we prefer the nearest valid depth point inside the
+        segmentation mask (or bbox fallback). This makes DRIVE_TO_VISIBLE aim at the
+        visible front surface of the object rather than the mask's geometric center.
+        """
+        if depth is None:
+            return int(round(cx)), int(round(cy)), self._unknown_depth()
+
+        if self.depth_point_strategy in ('nearest', 'nearest_mask', 'front_surface'):
+            depth_mask = self._scale_rgb_mask_to_depth(mask, rgb_shape, depth.shape)
+            if depth_mask is None:
+                depth_mask = self._bbox_mask_in_depth(bbox, rgb_shape, depth.shape)
+            front = self._front_surface_point_in_depth(depth, depth_mask)
+            if front is not None:
+                dx, dy, z = front
+                rx, ry = self._scale_depth_point_to_rgb(dx, dy, rgb_shape, depth.shape)
+                return rx, ry, z
+
+        return int(round(cx)), int(round(cy)), self._sample_depth(
+            depth, cx, cy, rgb_shape=rgb_shape, bbox=bbox)
+
     # ---- DetectTarget goal ----
     def _execute(self, goal_handle):
         req = goal_handle.request
         result = DetectTarget.Result()
-        if self.segmentor is None:
-            goal_handle.abort()
-            result.outcome = DetectTarget.Result.ABORTED
-            return result
-
         with self._lock:
             frame = None if self._frame is None else self._frame.copy()
             header = self._frame_header
@@ -324,16 +475,23 @@ class DetectTargetServer(Node):
         # query means DETECT_ALL: detect every object in a broad built-in vocabulary
         # and report each with its OWN predicted class, rather than one named target.
         query = (req.query or '').strip()
-        conf = req.conf_threshold if req.conf_threshold > 0.0 else self.conf_default
         fb = DetectTarget.Feedback()
         seg_t0 = time.monotonic()
         try:
             if query:
-                dets = self.segmentor.segment_all(frame, query, conf=conf,
-                                                  min_mask_area=self.min_mask_area)
+                if self.target_segmentor is None:
+                    raise RuntimeError('target detector backend is not available')
+                segmentor = self.target_segmentor
+                conf = self._conf_for_query(query, float(req.conf_threshold))
+                dets = segmentor.segment_all(frame, query, conf=conf,
+                                             min_mask_area=self.min_mask_area)
             else:
-                dets = self.segmentor.segment_vocab(frame, conf=conf,
-                                                    min_mask_area=self.min_mask_area)
+                if self.vocab_segmentor is None:
+                    raise RuntimeError('DETECT_ALL backend is not available')
+                segmentor = self.vocab_segmentor
+                conf = self._conf_for_query(query, float(req.conf_threshold))
+                dets = segmentor.segment_vocab(frame, conf=conf,
+                                               min_mask_area=self.min_mask_area)
         except Exception as exc:
             self.get_logger().error('segment failed: %r' % (exc,))
             goal_handle.abort()
@@ -344,8 +502,9 @@ class DetectTargetServer(Node):
 
         marked = assign_marks(dets, conf_threshold=conf, max_marks=self.max_marks)
         if self.use_depth:
-            for d in marked:                       # fill metric depth at each center
-                d.depth_m = self._sample_depth(depth, d.cx, d.cy, frame.shape, d.bbox)
+            for d in marked:                       # fill metric depth and navigation pixel
+                d.cx, d.cy, d.depth_m = self._sample_depth_point(
+                    depth, d.cx, d.cy, frame.shape, d.bbox, getattr(d, 'mask', None))
         fb.frames_processed = 1
         fb.best_confidence = float(marked[0].confidence) if marked else 0.0
         goal_handle.publish_feedback(fb)
@@ -357,8 +516,9 @@ class DetectTargetServer(Node):
             result.annotated = self._encode_setofmark(frame, marked, stamp, frame_id)
         result.outcome = (DetectTarget.Result.FOUND if marked
                           else DetectTarget.Result.NOT_FOUND)
-        self.get_logger().info('detect_target "%s": %d candidate(s) (conf>=%.2f)'
-                               % (query or '<all>', len(marked), conf))
+        self.get_logger().info('detect_target "%s": %d candidate(s) via %s (conf>=%.2f)'
+                               % (query or '<all>', len(marked),
+                                  self._backend_name(segmentor), conf))
         goal_handle.succeed()
         return result
 

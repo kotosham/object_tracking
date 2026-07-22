@@ -247,10 +247,13 @@ class YOLOESegmentor:
                     continue
                 center = self.get_center_coordinates(mask)
                 cx, cy = center if center else ((x1 + x2) // 2, (y1 + y2) // 2)
+                mask_for_det = mask.astype(bool)
             else:
                 cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                mask_for_det = None
             dets.append(Detection(label=prompt, confidence=float(confs[i]),
-                                  cx=int(cx), cy=int(cy), bbox=(x1, y1, x2, y2)))
+                                  cx=int(cx), cy=int(cy), bbox=(x1, y1, x2, y2),
+                                  mask=mask_for_det))
         dets.sort(key=lambda d: d.confidence, reverse=True)
         return dets
 
@@ -299,9 +302,12 @@ class YOLOESegmentor:
                     continue
                 center = self.get_center_coordinates(mask)
                 cx, cy = center if center else ((x1 + x2) // 2, (y1 + y2) // 2)
+                mask_for_det = mask.astype(bool)
             else:
                 cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                mask_for_det = None
             dets.append(Detection(label=str(label), confidence=float(confs[i]),
-                                  cx=int(cx), cy=int(cy), bbox=(x1, y1, x2, y2)))
+                                  cx=int(cx), cy=int(cy), bbox=(x1, y1, x2, y2),
+                                  mask=mask_for_det))
         dets.sort(key=lambda d: d.confidence, reverse=True)
         return dets

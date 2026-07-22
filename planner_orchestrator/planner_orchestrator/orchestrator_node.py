@@ -131,11 +131,12 @@ class PlannerOrchestrator(Node):
         # and feed the chosen mark's pixel to ApproachDetection on DRIVE_TO_VISIBLE.
         self.declare_parameter('detect_action_name', 'detect_target')
         self.declare_parameter('detect_timeout_s', 6.0)
-        # Confidence floor for detections the planner acts on. 0.0 keeps the detector's
-        # own default (0.20). Raise it (e.g. 0.5) to ignore weak/edge-of-frame matches --
-        # a natural-language query like "ride to bus" scores ~0.45 vs ~0.66 for "bus",
-        # so a higher floor with a bare label avoids acting on a marginal glimpse.
+        # Legacy override: if >0, applies one confidence floor to both target
+        # detection and DETECT_ALL. Prefer the split thresholds below: they mirror
+        # the diploma tracker (DINO strict for target, YOLOE permissive for overview).
         self.declare_parameter('detect_conf', 0.0)
+        self.declare_parameter('target_detect_conf', 0.50)
+        self.declare_parameter('detect_all_conf', 0.12)
         self.declare_parameter('camera_frame', 'camera_color_optical_frame')
         self.declare_parameter('subscribe_camera_image', True)
         self.declare_parameter('camera_image_topic', '/camera/camera/color/image_raw')
@@ -160,6 +161,11 @@ class PlannerOrchestrator(Node):
         self.min_step_s = float(g('min_step_s'))
         self.detect_timeout_s = float(g('detect_timeout_s'))
         self.detect_conf = float(g('detect_conf'))
+        self.target_detect_conf = float(g('target_detect_conf'))
+        self.detect_all_conf = float(g('detect_all_conf'))
+        if self.detect_conf > 0.0:
+            self.target_detect_conf = self.detect_conf
+            self.detect_all_conf = self.detect_conf
         self.vlm_timeout_s = float(g('vlm_timeout_s'))
         self.camera_frame = g('camera_frame')
         self.subscribe_camera_image = bool(g('subscribe_camera_image')) and _HAVE_CV
@@ -341,7 +347,7 @@ class PlannerOrchestrator(Node):
             g.mission_epoch = self._epoch
             g.query = target
             g.render_setofmark = True
-            g.conf_threshold = self.detect_conf
+            g.conf_threshold = self.target_detect_conf
             res = self._call_action(self._detect, g, self.detect_timeout_s)
             if res is not None and getattr(res, 'candidates', None):
                 cands, pix = [], {}
@@ -733,7 +739,7 @@ class PlannerOrchestrator(Node):
         g.mission_epoch = self._epoch
         g.query = ''                      # empty query => broad-vocabulary detection
         g.render_setofmark = True
-        g.conf_threshold = self.detect_conf
+        g.conf_threshold = self.detect_all_conf
         res = self._call_action(self._detect, g, self.detect_timeout_s)
         cands = getattr(res, 'candidates', None) if res is not None else None
         if not cands:

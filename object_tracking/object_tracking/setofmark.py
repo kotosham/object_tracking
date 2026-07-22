@@ -9,8 +9,8 @@ VLM can pick a target by number (``DRIVE_TO_VISIBLE mark_id``) instead of pixels
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
-from typing import List, Sequence, Tuple
+from dataclasses import dataclass, replace
+from typing import Any, List, Sequence, Tuple
 
 try:
     import cv2
@@ -30,6 +30,7 @@ class Detection:
     bbox: Tuple[int, int, int, int]      # x1, y1, x2, y2 (px)
     depth_m: float = 0.0                 # NaN when depth is unknown
     mark_id: int = 0                     # 0 until assign_marks() numbers it
+    mask: Any = None                     # optional bool mask in RGB image coordinates
 
 
 def assign_marks(detections: Sequence[Detection], conf_threshold: float = 0.0,

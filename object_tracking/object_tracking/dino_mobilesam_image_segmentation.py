@@ -27,13 +27,14 @@ class GroundingDINOMobileSAMSegmentor:
         self.last_mask = None
 
         share_dir = get_package_share_directory('object_tracking')
-        checkpoint_path_SAM = os.path.join(share_dir, 'model_weights', 'mobile_sam.pt')
+        checkpoint_path_SAM = self._resolve_mobile_sam_checkpoint(share_dir)
 
-        if not os.path.isfile(checkpoint_path_SAM):
+        if checkpoint_path_SAM is None:
             raise FileNotFoundError(
-                f"\n[ERROR] MobileSAM checkpoint not found at:\n  {checkpoint_path_SAM}\n\n"
+                f"\n[ERROR] MobileSAM checkpoint not found.\n\n"
                 f"Please download `mobile_sam.pt` from the official MobileSAM repository\n"
-                f"and place it in:\n  {os.path.join(share_dir, 'model_weights')}\n"
+                f"and place it in one of:\n"
+                + "\n".join(f"  {d}" for d in self._model_weight_dirs(share_dir))
             )
 
         # MobileSAM + DINO
@@ -90,6 +91,48 @@ class GroundingDINOMobileSAMSegmentor:
 
         return "cuda", "cuda"
 
+    def _model_weight_dirs(self, share_dir):
+        candidates = [
+            os.path.join(share_dir, "model_weights"),
+            os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, "model_weights")),
+        ]
+
+        # In symlink/development workspaces the module may execute from
+        # build/object_tracking/object_tracking/*.py while large weights stay in
+        # src/object_tracking/object_tracking/model_weights.
+        for parent in self._parents(os.path.abspath(__file__)):
+            candidates.append(
+                os.path.join(parent, "src", "object_tracking", "object_tracking", "model_weights")
+            )
+
+        seen = set()
+        unique = []
+        for candidate in candidates:
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            unique.append(candidate)
+        return unique
+
+    @staticmethod
+    def _parents(path):
+        current = os.path.abspath(path)
+        if os.path.isfile(current):
+            current = os.path.dirname(current)
+        while True:
+            yield current
+            parent = os.path.dirname(current)
+            if parent == current:
+                break
+            current = parent
+
+    def _resolve_mobile_sam_checkpoint(self, share_dir):
+        for weights_dir in self._model_weight_dirs(share_dir):
+            candidate = os.path.join(weights_dir, "mobile_sam.pt")
+            if os.path.isfile(candidate):
+                return candidate
+        return None
+
     def _resolve_dino_model_source(self, share_dir):
         candidates = []
 
@@ -97,7 +140,8 @@ class GroundingDINOMobileSAMSegmentor:
         if env_model_dir:
             candidates.append(os.path.expanduser(env_model_dir))
 
-        candidates.append(os.path.join(share_dir, "model_weights", "grounding-dino-tiny"))
+        for weights_dir in self._model_weight_dirs(share_dir):
+            candidates.append(os.path.join(weights_dir, "grounding-dino-tiny"))
 
         hf_snapshot_dir = self._find_local_hf_snapshot_dir()
         if hf_snapshot_dir:
@@ -148,6 +192,7 @@ class GroundingDINOMobileSAMSegmentor:
         self.last_detection_score = None
         self.last_detection_label = None
         self.last_mask = None
+        self.last_bbox = None
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
         image_pil = PILImage.fromarray(image_rgb)
         text_labels = [[prompt]]
@@ -195,6 +240,7 @@ class GroundingDINOMobileSAMSegmentor:
         input_box = np.array([box])
         self.last_detection_score = float(score)
         self.last_detection_label = str(label)
+        self.last_bbox = tuple(int(v) for v in box.tolist())
         print(f"Найден объект: {label} (score={score:.2f})")
 
         print("Received bounding boxes")
@@ -279,6 +325,146 @@ class GroundingDINOMobileSAMSegmentor:
                 cv2.putText(image_out, text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
 
         return image_out, center_coords, depth_map, DINO_time+SAM_time
+
+    def segment_all(self, image_bgr, prompt, conf=0.20, min_mask_area=200):
+        """Return all GroundingDINO+MobileSAM matches as Set-of-Mark detections.
+
+        This is the service-mode path used by DetectTarget for a concrete target
+        query. DETECT_ALL should still use YOLOE's broad vocabulary; DINO is most
+        useful here for phrase grounding such as "office chair" or "swivel chair".
+        """
+        from object_tracking.setofmark import Detection
+
+        self.last_detection_score = None
+        self.last_detection_label = None
+        self.last_mask = None
+        self.last_bbox = None
+
+        conf = float(conf)
+        box_threshold = max(0.01, min(conf, 1.0))
+        text_threshold = min(0.25, max(0.01, box_threshold))
+
+        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        image_pil = PILImage.fromarray(image_rgb)
+        text_labels = [[prompt]]
+
+        start_time_dino = time.time()
+        inputs = self.dino_processor(
+            images=image_pil,
+            text=text_labels,
+            return_tensors="pt",
+        ).to(self.dino_device)
+        with torch.inference_mode():
+            outputs = self.dino_model(**inputs)
+        results = self.dino_processor.post_process_grounded_object_detection(
+            outputs,
+            inputs.input_ids,
+            threshold=box_threshold,
+            text_threshold=text_threshold,
+            target_sizes=[image_pil.size[::-1]],
+        )
+        dino_time = time.time() - start_time_dino
+
+        result = results[0]
+        filtered = [
+            (box.detach().cpu().numpy(), float(score.item()), str(label))
+            for box, score, label in zip(result["boxes"], result["scores"], result["labels"])
+            if float(score.item()) >= box_threshold
+        ]
+        if not filtered:
+            print(f"GroundingDINO found no '{prompt}' candidates at conf>={box_threshold:.2f}")
+            return []
+
+        filtered.sort(key=lambda item: item[1], reverse=True)
+        boxes_np = np.asarray([item[0] for item in filtered], dtype=np.float32)
+
+        start_time_sam = time.time()
+        try:
+            masks = self._predict_sam_masks(image_rgb, image_bgr.shape[:2], boxes_np)
+        except torch.OutOfMemoryError:
+            if self.sam_device != "cuda":
+                raise
+            print("CUDA OOM during SAM inference, switching SAM to CPU and retrying.")
+            self.sam_device = "cpu"
+            self.sam = self.sam.to(self.sam_device)
+            self.predictor = SamPredictor(self.sam)
+            torch.cuda.empty_cache()
+            masks = self._predict_sam_masks(image_rgb, image_bgr.shape[:2], boxes_np)
+        sam_time = time.time() - start_time_sam
+        print(f"GroundingDINO time={dino_time:.3f}s, MobileSAM time={sam_time:.3f}s")
+
+        dets = []
+        for idx, (box, score, label) in enumerate(filtered):
+            x1, y1, x2, y2 = self._clamp_box(box, image_bgr.shape[:2])
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            mask = masks[idx] if idx < len(masks) else None
+            mask_for_det = None
+            if mask is not None:
+                area = int(np.sum(mask))
+                if area < min_mask_area:
+                    continue
+                center = self.get_center_coordinates(mask)
+                cx, cy = center if center else ((x1 + x2) // 2, (y1 + y2) // 2)
+                mask_for_det = mask.astype(bool)
+            else:
+                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+
+            dets.append(
+                Detection(
+                    label=prompt,
+                    confidence=float(score),
+                    cx=int(cx),
+                    cy=int(cy),
+                    bbox=(x1, y1, x2, y2),
+                    mask=mask_for_det,
+                )
+            )
+
+        dets.sort(key=lambda d: d.confidence, reverse=True)
+        if dets:
+            self.last_detection_score = dets[0].confidence
+            self.last_detection_label = dets[0].label
+            self.last_bbox = dets[0].bbox
+            self.last_mask = dets[0].mask.astype(np.uint8) if dets[0].mask is not None else None
+        return dets
+
+    def _predict_sam_masks(self, image_rgb, image_shape_hw, boxes_np):
+        if self.sam_device == "cuda":
+            torch.cuda.empty_cache()
+        boxes_t = torch.as_tensor(boxes_np, dtype=torch.float32)
+        transformed = self.predictor.transform.apply_boxes_torch(boxes_t, image_shape_hw)
+        transformed = transformed.to(self.sam_device)
+        self.predictor.set_image(image_rgb)
+        with torch.inference_mode():
+            if self.sam_device == "cuda":
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    masks, _, _ = self.predictor.predict_torch(
+                        point_coords=None,
+                        point_labels=None,
+                        boxes=transformed,
+                        multimask_output=False,
+                    )
+            else:
+                masks, _, _ = self.predictor.predict_torch(
+                    point_coords=None,
+                    point_labels=None,
+                    boxes=transformed,
+                    multimask_output=False,
+                )
+        return (masks[:, 0].detach().cpu().numpy() > 0.5)
+
+    @staticmethod
+    def _clamp_box(box, image_shape_hw):
+        h, w = image_shape_hw
+        x1, y1, x2, y2 = (int(round(float(v))) for v in box.tolist())
+        return (
+            max(0, min(w, x1)),
+            max(0, min(h, y1)),
+            max(0, min(w, x2)),
+            max(0, min(h, y2)),
+        )
     
     def get_center_coordinates(self, mask):
         y_indices, x_indices = np.where(mask)
