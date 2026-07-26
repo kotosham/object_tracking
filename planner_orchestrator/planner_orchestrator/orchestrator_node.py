@@ -198,7 +198,7 @@ class PlannerOrchestrator(Node):
 
         # ---- inputs ----
         self._pixel = None
-        self._jpeg = None
+        self._cam_bgr = None      # latest camera frame; encoded to JPEG lazily
         self._map = None                 # latest SLAM OccupancyGrid (for the VLM map)
         # guards the consistency of the (camera jpeg, /target_pixel) snapshot vs the
         # ROS executor threads that write them (_on_image / _on_pixel)
@@ -277,12 +277,14 @@ class PlannerOrchestrator(Node):
                 cv = self._bridge.imgmsg_to_cv2(msg, 'bgr8')
             if cv is None:
                 return
-            ok, buf = cv2.imencode('.jpg', cv)
-            if ok:
-                with self._lock:
-                    self._jpeg = buf.tobytes()
+            # Store the frame; encode to JPEG lazily in _camera_jpeg. The camera
+            # arrives at 6-15 Hz but a JPEG is needed at most once per replan (and
+            # usually superseded by the detector's annotated frame), so encoding
+            # every frame here just burned CPU.
+            with self._lock:
+                self._cam_bgr = cv
         except Exception as e:
-            self.get_logger().warn('image encode failed: %s' % e, throttle_duration_sec=5.0)
+            self.get_logger().warn('image decode failed: %s' % e, throttle_duration_sec=5.0)
 
     def _on_mission(self, msg):
         target = (msg.data or '').strip()
@@ -320,8 +322,15 @@ class PlannerOrchestrator(Node):
 
     # ---- observation ----
     def _camera_jpeg(self):
+        # Encode on demand (rare: ~once per replan). _on_image always stores a
+        # fresh frame object, so the reference we grab under the lock is safe to
+        # encode after releasing it.
         with self._lock:
-            return self._jpeg
+            frame = self._cam_bgr
+        if frame is None or not _HAVE_CV:
+            return None
+        ok, buf = cv2.imencode('.jpg', frame)
+        return buf.tobytes() if ok else None
 
     def _observation(self, target, step_index):
         """Pull candidates + the matching VLM image together, then build the
@@ -373,7 +382,7 @@ class PlannerOrchestrator(Node):
     def _fallback_candidates(self, target):
         with self._lock:
             px = self._pixel
-            jpeg = self._jpeg
+        jpeg = self._camera_jpeg()
         if px is not None:
             return ([Candidate(mark_id=1, label=target, score=1.0,
                                distance_m=float(px.point.z))], {1: px.point}, jpeg)

@@ -66,7 +66,12 @@ class DetectTargetServer(Node):
         self.declare_parameter('depth_point_strategy', 'nearest_mask')
         self.declare_parameter('nearest_depth_percentile', 2.0)
         self.declare_parameter('depth_match_tolerance_s', 0.2)
-        self.declare_parameter('depth_buffer_size', 30)
+        # Depth history for RGB<->depth stamp matching. Only frames within
+        # depth_match_tolerance_s (0.2 s) of the RGB stamp are ever used, so a few
+        # frames suffice: 8 @6 FPS = 1.3 s of history (>>0.2 s), still >0.2 s at
+        # 15 FPS. The old default of 30 kept ~5 s and each frame is a full float32
+        # depth image (~0.4 MB @640x480) held resident -- pure waste above ~8.
+        self.declare_parameter('depth_buffer_size', 8)
 
         g = lambda n: self.get_parameter(n).value
         self.image_topic = g('image_topic')
