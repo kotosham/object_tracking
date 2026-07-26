@@ -96,6 +96,10 @@ class DetectTargetServer(Node):
         self._depth_frames = deque(maxlen=self.depth_buffer_size)
         self._lock = threading.Lock()    # single-in-flight detection
 
+        # Name of a backend to load lazily on first use (set by _load_segmentors
+        # for the DETECT_ALL/vocab path in hybrid mode). None once loaded or when
+        # the mode loads everything eagerly.
+        self._vocab_pending = None
         self.target_segmentor, self.vocab_segmentor = self._load_segmentors()
         # Backward-compatible alias for older tests/tools that only check that a
         # backend exists. Query routing below uses target_segmentor/vocab_segmentor.
@@ -149,7 +153,7 @@ class DetectTargetServer(Node):
             % (
                self.model_mode,
                self._backend_name(self.target_segmentor),
-               self._backend_name(self.vocab_segmentor),
+               self._vocab_backend_display(),
                self.image_topic,
                self.use_compressed,
                self.max_marks,
@@ -178,7 +182,13 @@ class DetectTargetServer(Node):
 
         mode = self.model_mode
         if mode in ('hybrid', 'hybrid_dino_yoloe', 'dino_yoloe'):
-            return self._load_backend('dino_mobilesam'), self._load_backend('yoloe')
+            # Target (GroundingDINO) is on the common path -> load eagerly. The
+            # vocab backend (YOLOE + text encoder) is only used by DETECT_ALL,
+            # which is rare and often never called in a mission, so defer it: a
+            # target-only mission never pays its VRAM / startup cost. It loads on
+            # the first DETECT_ALL via _get_vocab_segmentor().
+            self._vocab_pending = 'yoloe'
+            return self._load_backend('dino_mobilesam'), None
         if mode == 'dino_mobilesam':
             # Concrete target mode only. DETECT_ALL is unavailable in this mode.
             return self._load_backend('dino_mobilesam'), None
@@ -216,9 +226,36 @@ class DetectTargetServer(Node):
             return 'none'
         return type(segmentor).__name__
 
+    def _vocab_backend_display(self):
+        """Human-readable vocab backend for the startup log (may be deferred)."""
+        if self.vocab_segmentor is not None:
+            return self._backend_name(self.vocab_segmentor)
+        pending = getattr(self, '_vocab_pending', None)
+        return '%s (lazy)' % pending if pending else 'none'
+
+    def _get_vocab_segmentor(self):
+        """Return the DETECT_ALL/vocab backend, loading it on first use.
+
+        In hybrid mode YOLOE is deferred (see _load_segmentors) so a target-only
+        mission never loads it. The first DETECT_ALL pays a one-time load here;
+        the model then stays resident for the rest of the process."""
+        if self.vocab_segmentor is None and getattr(self, '_vocab_pending', None):
+            name = self._vocab_pending
+            self.get_logger().info(
+                'DETECT_ALL: loading deferred "%s" backend on first use' % name)
+            self.vocab_segmentor = self._load_backend(name)
+            self._vocab_pending = None
+            if self.segmentor is None:
+                self.segmentor = self.vocab_segmentor
+        return self.vocab_segmentor
+
     def _backends_ready(self):
         if self.model_mode in ('hybrid', 'hybrid_dino_yoloe', 'dino_yoloe'):
-            return self.target_segmentor is not None and self.vocab_segmentor is not None
+            # A deferred (not-yet-loaded) vocab backend still counts as ready:
+            # the target path works now, and DETECT_ALL will load YOLOE on demand.
+            vocab_ok = (self.vocab_segmentor is not None
+                        or bool(getattr(self, '_vocab_pending', None)))
+            return self.target_segmentor is not None and vocab_ok
         if self.model_mode == 'dino_mobilesam':
             return self.target_segmentor is not None
         return self.target_segmentor is not None and self.vocab_segmentor is not None
@@ -486,9 +523,9 @@ class DetectTargetServer(Node):
                 dets = segmentor.segment_all(frame, query, conf=conf,
                                              min_mask_area=self.min_mask_area)
             else:
-                if self.vocab_segmentor is None:
+                segmentor = self._get_vocab_segmentor()   # loads YOLOE on first use
+                if segmentor is None:
                     raise RuntimeError('DETECT_ALL backend is not available')
-                segmentor = self.vocab_segmentor
                 conf = self._conf_for_query(query, float(req.conf_threshold))
                 dets = segmentor.segment_vocab(frame, conf=conf,
                                                min_mask_area=self.min_mask_area)

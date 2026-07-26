@@ -69,9 +69,17 @@ def test_sample_depth_point_prefers_nearest_valid_point_inside_mask():
     assert z == pytest.approx(1.5)
 
 
-def test_hybrid_mode_routes_target_to_dino_and_detect_all_to_yoloe(monkeypatch):
+def test_hybrid_mode_loads_dino_eagerly_and_defers_yoloe(monkeypatch):
+    import types
+
     srv = DetectTargetServer.__new__(DetectTargetServer)
     srv.model_mode = "hybrid_dino_yoloe"
+    srv._vocab_pending = None
+    srv.segmentor = None
+    # Bare (__new__) node has no rcl logger; the lazy-load path logs, so stub it.
+    srv._logger = types.SimpleNamespace(info=lambda *a, **k: None,
+                                        warn=lambda *a, **k: None,
+                                        error=lambda *a, **k: None)
     loaded = []
 
     def fake_load_backend(_self, name):
@@ -82,9 +90,23 @@ def test_hybrid_mode_routes_target_to_dino_and_detect_all_to_yoloe(monkeypatch):
 
     target, vocab = srv._load_segmentors()
 
-    assert loaded == ["dino_mobilesam", "yoloe"]
+    # Only the target (DINO) loads at construction; YOLOE is deferred.
+    assert loaded == ["dino_mobilesam"]
     assert target is not None
-    assert vocab is not None
+    assert vocab is None
+    assert srv._vocab_pending == "yoloe"
+
+    # A deferred vocab backend still counts as ready (target path works now).
+    srv.target_segmentor, srv.vocab_segmentor = target, vocab
+    assert srv._backends_ready() is True
+
+    # First DETECT_ALL loads YOLOE on demand and caches it.
+    got = srv._get_vocab_segmentor()
+    assert loaded == ["dino_mobilesam", "yoloe"]
+    assert got is not None
+    assert srv.vocab_segmentor is got
+    assert srv._vocab_pending is None
+    assert srv._get_vocab_segmentor() is got          # no second load
 
 
 def test_yoloe_mode_uses_one_backend_for_target_and_detect_all(monkeypatch):
