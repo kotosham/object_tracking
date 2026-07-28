@@ -26,7 +26,7 @@ ENV_API_KEY = 'VLM_API_KEY'
 ENV_MODEL = 'VLM_MODEL'
 
 from planner_orchestrator.planner_logic import (
-    Action, MockPlanner, Observation, build_vlm_options, parse_vlm_action,
+    DONE, Action, MockPlanner, Observation, build_vlm_options, parse_vlm_action,
 )
 
 SYSTEM_PROMPT = (
@@ -58,6 +58,27 @@ SYSTEM_PROMPT = (
     '"arg_label": str, "rationale": str}.'
 )
 
+# Добавка к системному промпту при replan_every_n > 1. Идёт ОТДЕЛЬНЫМ сообщением
+# после SYSTEM_PROMPT и явно переопределяет его требование «ровно одно действие»:
+# переписывать сам SYSTEM_PROMPT нельзя, иначе путь n=1 (дефолт) перестал бы быть
+# байт-в-байт прежним, и сравнивать прогоны до/после стало бы нечестно.
+#
+# Честное предупреждение модели про слепое исполнение здесь обязательно: свежие
+# кадр, карта и список меток есть только у ПЕРВОГО действия пачки, остальные
+# выполняются без новой перцепции. Без этой строки модель охотно планирует
+# «доехать до метки 2, затем повернуть к метке 3», хотя метки к тому моменту уже
+# пересчитаны и mark_id значит совсем другое.
+SEQUENCE_PROMPT = (
+    "REPLY FORMAT OVERRIDE (replaces the 'exactly ONE action' rule above): reply "
+    'with a single JSON object {"actions": [...]} whose "actions" is a list of 1 to '
+    '%d actions, in execution order, each object using exactly the schema above. '
+    'Only the FIRST action is chosen with fresh perception: the rest are executed '
+    'blind, without a new camera image, map or detection list, so mark_id values may '
+    'be stale by then. Therefore: put DRIVE_TO_VISIBLE only as the FIRST action, '
+    'prefer short conservative sequences of TURN/DRIVE_FORWARD, and emit fewer than '
+    '%d actions whenever the situation is uncertain. Anything after DONE is ignored.'
+)
+
 
 class VlmClient:
     """Observation (+ optional camera JPEG + optional map JPEG) -> Action. Raises on
@@ -69,10 +90,12 @@ class VlmClient:
 
     def plan_sequence(self, obs: Observation, image_jpeg: Optional[bytes] = None,
                       map_jpeg: Optional[bytes] = None, n: int = 1) -> list:
-        """A short plan of up to n atomic actions (replan-every-N). Default: one
-        action (reactive); the real VLM client may override to plan n steps ahead
-        from a single observation. The orchestrator executes the returned list,
-        then replans with a fresh observation."""
+        """A short plan of up to n atomic actions (replan-every-N).
+
+        Базовая реализация ИГНОРИРУЕТ n и всегда возвращает одно действие — это
+        честно для MockVlmClient, чей MockPlanner вперёд не планирует.
+        OpenAICompatibleClient переопределяет метод и реально просит у модели до n
+        действий за один запрос; см. его plan_sequence."""
         return [self.plan(obs, image_jpeg, map_jpeg)]
 
 
@@ -103,10 +126,12 @@ class OpenAICompatibleClient(VlmClient):
                 'image_url': {'url': 'data:image/jpeg;base64,' + b64}}
 
     def build_messages(self, obs: Observation, image_jpeg: Optional[bytes],
-                       map_jpeg: Optional[bytes] = None) -> list:
+                       map_jpeg: Optional[bytes] = None, n: int = 1) -> list:
         opts = build_vlm_options(obs)
-        text = ('Target: %s\nOptions (JSON):\n%s\nReply with ONE JSON action.'
-                % (obs.target, json.dumps(opts)))
+        tail = ('Reply with ONE JSON action.' if n <= 1 else
+                'Reply with a JSON object {"actions": [...]} of up to %d actions.' % n)
+        text = ('Target: %s\nOptions (JSON):\n%s\n%s'
+                % (obs.target, json.dumps(opts), tail))
         content = [{'type': 'text', 'text': text}]
         if image_jpeg:                       # 1st image: live camera (Set-of-Mark)
             content.append({'type': 'text', 'text': 'Live camera (numbered marks):'})
@@ -114,8 +139,12 @@ class OpenAICompatibleClient(VlmClient):
         if map_jpeg:                         # 2nd image: top-down SLAM map
             content.append({'type': 'text', 'text': 'Top-down SLAM map:'})
             content.append(self._image_part(map_jpeg))
-        return [{'role': 'system', 'content': SYSTEM_PROMPT},
-                {'role': 'user', 'content': content}]
+        messages = [{'role': 'system', 'content': SYSTEM_PROMPT}]
+        if n > 1:
+            messages.append({'role': 'system',
+                             'content': SEQUENCE_PROMPT % (n, n)})
+        messages.append({'role': 'user', 'content': content})
+        return messages
 
     def parse_response(self, resp_text: str, obs: Observation) -> Action:
         """Extract the tool-call JSON from a chat-completions response + validate."""
@@ -149,6 +178,71 @@ class OpenAICompatibleClient(VlmClient):
             'response_format': {'type': 'json_object'},
         }
         return self.parse_response(self._post(body), obs)
+
+    def parse_sequence_response(self, resp_text: str, obs: Observation,
+                                n: int) -> list:
+        """Ответ вида {"actions":[...]} -> список валидных Action.
+
+        Невалидное действие НЕ роняет всю пачку: список обрезается по последнему
+        валидному. Причина в цене — пачка стоит один запрос к модели, и выкидывать
+        три корректных шага из-за четвёртого с несуществующим mark_id значит
+        платить ещё раз за то, что уже получено. Но если невалидно ПЕРВОЕ действие,
+        поднимается ValueError — ровно как в plan(), чтобы circuit-breaker увидел
+        отказ и на третий раз ушёл в FLAT.
+        """
+        data = json.loads(resp_text)
+        content = data['choices'][0]['message']['content']
+        if isinstance(content, list):   # some servers return content as parts
+            content = ''.join(p.get('text', '') for p in content if isinstance(p, dict))
+        payload = json.loads(content)
+        raw = None
+        if isinstance(payload, dict):
+            raw = payload.get('actions')
+            # Модель могла проигнорировать override и прислать одиночное действие
+            # старой схемы — это корректный ответ, а не сбой: принимаем как пачку из
+            # одного, иначе каждый такой ответ считался бы отказом и открывал бы
+            # circuit-breaker на ровном месте.
+            if raw is None and 'action' in payload:
+                raw = [payload]
+        elif isinstance(payload, list):
+            raw = payload
+        if not isinstance(raw, list) or not raw:
+            raise ValueError('VLM sequence rejected: нет непустого списка actions')
+
+        actions = []
+        for item in raw[:max(1, int(n))]:
+            act, reason = parse_vlm_action(item, obs)
+            if act is None:
+                if not actions:
+                    raise ValueError('VLM action rejected: %s' % reason)
+                break
+            actions.append(act)
+            if act.kind == DONE:     # всё после DONE смысла не имеет
+                break
+        return actions
+
+    def plan_sequence(self, obs: Observation, image_jpeg: Optional[bytes] = None,
+                      map_jpeg: Optional[bytes] = None, n: int = 1) -> list:
+        """До n атомарных действий за ОДИН запрос к модели (replan_every_n).
+
+        n <= 1 идёт ровно прежним путём (plan(): тот же промпт, та же схема, тот же
+        max_tokens) — это дефолт, и он обязан остаться неизменным, чтобы прогоны
+        до и после этой правки были сравнимы.
+        """
+        n = max(1, int(n))
+        if n == 1:
+            return [self.plan(obs, image_jpeg, map_jpeg)]
+        body = {
+            'model': self.model,
+            'messages': self.build_messages(obs, image_jpeg, map_jpeg, n=n),
+            'temperature': 0,
+            # Бюджет на пачку: 256 токенов это потолок ОДНОГО действия с rationale.
+            # Оставить его для списка значило бы обрывать JSON на середине и ловить
+            # JSONDecodeError вместо плана.
+            'max_tokens': 256 * n,
+            'response_format': {'type': 'json_object'},
+        }
+        return self.parse_sequence_response(self._post(body), obs, n)
 
 
 def resolve_credentials(base_url: str = '', api_key: str = '', model: str = ''):
