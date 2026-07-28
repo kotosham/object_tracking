@@ -13,7 +13,11 @@ own navigation reasoning -- a fair comparison against the FLAT policy. The VLM i
 never on the reactive path; the executive owns motion + safety. A
 per-call timeout + circuit-breaker degrade VLM->FLAT on loss. Mock-first: with
 use_mock (or no credentials anywhere) the whole loop runs in sim/CI with no API
-key. Trigger a mission by publishing the target on /vlm_mission (std_msgs/String).
+key. Trigger a mission by publishing the target on /vlm_mission (std_msgs/String);
+abort one by publishing on /vlm_mission/cancel (std_msgs/Empty) -- the flag is
+checked on step boundaries, so the skill already in flight finishes and no new
+one is issued. Without it there was no abort at all: /vlm_mission is ignored
+while a mission runs, so the loop always ran to max_steps.
 
 Real-VLM credentials: set the ROS params vlm_base_url / vlm_api_key / vlm_model,
 OR (preferred for secrets) export the environment variables VLM_BASE_URL /
@@ -45,8 +49,8 @@ from rclpy.qos import (DurabilityPolicy, HistoryPolicy, QoSProfile,
 
 from geometry_msgs.msg import PointStamped, PoseStamped
 from nav_msgs.msg import OccupancyGrid
-from sensor_msgs.msg import CompressedImage, Image
-from std_msgs.msg import String
+from sensor_msgs.msg import CompressedImage, Image, LaserScan
+from std_msgs.msg import Empty, String
 from tf2_ros import (Buffer, ConnectivityException, ExtrapolationException,
                      LookupException, TransformListener)
 
@@ -74,6 +78,11 @@ try:
 except Exception:                       # mock mode needs no image pipeline
     _HAVE_CV = False
 
+# Период обновления «что видит робот» и «вид сверху», пока миссия не идёт.
+# 1 Гц совпадает с частотой кадра SSE у дашборда: чаще — впустую жечь JPEG-кодек
+# и рендер карты на изображения, которые никто не успеет увидеть.
+IDLE_VIEW_PERIOD_S = 1.0
+
 
 def _yaw_to_quat(yaw):
     return (0.0, 0.0, math.sin(yaw / 2.0), math.cos(yaw / 2.0))
@@ -96,7 +105,7 @@ class PlannerOrchestrator(Node):
         self.heartbeat = HeartbeatPublisher(self, 'planner_orchestrator',
                                             period_s=self.HEARTBEAT_PERIOD_S)
         # ---- params ----
-        self.declare_parameter('replan_every_n', 3)
+        self.declare_parameter('replan_every_n', 1)
         self.declare_parameter('use_mock', False)
         self.declare_parameter('vlm_base_url', '')
         self.declare_parameter('vlm_api_key', '')
@@ -137,6 +146,28 @@ class PlannerOrchestrator(Node):
         self.declare_parameter('detect_conf', 0.0)
         self.declare_parameter('target_detect_conf', 0.50)
         self.declare_parameter('detect_all_conf', 0.12)
+        # Период холостой детекции: пока миссия не идёт, оркестратор раз в столько
+        # секунд гоняет детектор широким словарём и отдаёт в дашборд кадр С РАЗМЕТКОЙ,
+        # а не сырой. Иначе «что видит робот» до задания показывает картинку, по
+        # которой нельзя понять, распознаёт ли детектор вообще хоть что-то, — а
+        # именно это оператор и проверяет перед пуском. 0 = выключить (детектор
+        # тогда в простое не трогается совсем).
+        self.declare_parameter('idle_detect_period_s', 5.0)
+        # Пауза перед ПЕРВОЙ холостой детекцией, отсчитывается от старта узла.
+        # Не косметика: первый вызов YOLOE грузит веса на GPU и надолго занимает
+        # ядро, а оркестратор поднимается ровно тогда, когда lifecycle_manager
+        # конфигурирует Nav2. Без паузы это измеримо ломало запуск — на этой машине
+        # цепочка вставала после «Configuring controller_server» и не доходила до
+        # активации ВООБЩЕ (проверено: преflight не зеленел и через 210 с, при 1000%+
+        # CPU в контейнере). Украшение интерфейса не имеет права мешать подъёму стека.
+        self.declare_parameter('idle_detect_warmup_s', 60.0)
+        # Порог уверенности ДЛЯ ПОКАЗА в простое. Отдельный от detect_all_conf (0.12)
+        # намеренно: тот низкий порог существует ради полноты списка для VLM, где
+        # лишний кандидат безобиден. На картинке же всё, что около порога, живёт
+        # ровно один кадр — метки появляются и исчезают между прогонами, номера
+        # переприсваиваются, и оператор смотрит на мельтешение вместо обстановки.
+        # Показываем только то, в чём детектор уверен.
+        self.declare_parameter('idle_detect_conf', 0.35)
         self.declare_parameter('camera_frame', 'camera_color_optical_frame')
         self.declare_parameter('subscribe_camera_image', True)
         self.declare_parameter('camera_image_topic', '/camera/camera/color/image_raw')
@@ -146,6 +177,16 @@ class PlannerOrchestrator(Node):
         self.declare_parameter('map_topic', '/map')
         self.declare_parameter('send_map', True)
         self.declare_parameter('map_max_px', 384)
+        # Executive-side forward-clearance clamp for DRIVE_FORWARD (see
+        # orchestration.forward_clearance for the failure it closes). standoff is
+        # the gap kept between the scan frame and the nearest obstacle after the
+        # drive: the episode collision guard trips at 0.16 m, Nav2's inflation
+        # settles around 0.25, so 0.40 stays clear of both. corridor_half_width
+        # is half the robot's body width (~0.35 m wide) plus a small margin.
+        # scan_topic '' disables the clamp (real robot without a front scan).
+        self.declare_parameter('scan_topic', '/scan')
+        self.declare_parameter('forward_standoff_m', 0.40)
+        self.declare_parameter('forward_corridor_half_width_m', 0.25)
         g = lambda n: self.get_parameter(n).value
         self.replan_n = max(1, int(g('replan_every_n')))
         self.turn_step = float(g('turn_step_rad'))
@@ -163,6 +204,9 @@ class PlannerOrchestrator(Node):
         self.detect_conf = float(g('detect_conf'))
         self.target_detect_conf = float(g('target_detect_conf'))
         self.detect_all_conf = float(g('detect_all_conf'))
+        self.idle_detect_period_s = float(g('idle_detect_period_s'))
+        self.idle_detect_warmup_s = float(g('idle_detect_warmup_s'))
+        self.idle_detect_conf = float(g('idle_detect_conf'))
         if self.detect_conf > 0.0:
             self.target_detect_conf = self.detect_conf
             self.detect_all_conf = self.detect_conf
@@ -173,9 +217,25 @@ class PlannerOrchestrator(Node):
         self.camera_use_compressed_input = bool(g('camera_use_compressed_input'))
         self.send_map = bool(g('send_map')) and _HAVE_CV
         self.map_max_px = int(g('map_max_px'))
+        self.scan_topic = str(g('scan_topic'))
+        self.forward_standoff_m = float(g('forward_standoff_m'))
+        self.forward_corridor_half_width_m = float(g('forward_corridor_half_width_m'))
         self.async_replan = bool(g('async_replan'))
         self._planner_pool = ThreadPoolExecutor(max_workers=1,
                                                 thread_name_prefix='replan')
+        # ОТДЕЛЬНЫЙ пул для детекции в простое, а не _planner_pool: тот занят
+        # упреждающим replan во время миссии, и общая очередь означала бы, что
+        # холостая картинка задерживает план. _call_action блокирует поток целиком
+        # (ждёт Event), поэтому вызывать его прямо из таймера нельзя — таймер бы
+        # встал вместе с исполнителем.
+        self._idle_pool = ThreadPoolExecutor(max_workers=1,
+                                             thread_name_prefix='idleview')
+        self._idle_future = None
+        # Первый холостой прогон разрешён только после прогрева (см. параметр).
+        self._idle_detect_next = time.monotonic() + max(0.0,
+                                                        self.idle_detect_warmup_s)
+        self._idle_last_problem = ''    # последняя причина «кадр без разметки»
+        self._idle_detect_started = False   # был ли хоть один прогон детекции
 
         self.client = make_client(use_mock=bool(g('use_mock')), base_url=g('vlm_base_url'),
                                   api_key=g('vlm_api_key'), model=g('vlm_model'),
@@ -219,8 +279,25 @@ class PlannerOrchestrator(Node):
             self.get_logger().info(
                 'planner_orchestrator camera input: topic=%s compressed=%s'
                 % (self.camera_image_topic, self.camera_use_compressed_input))
+        # Операторская отмена. Без неё прервать миссию было НЕЧЕМ: _on_mission
+        # молча игнорирует всё, пока _busy, а цикл крутится до max_steps -- то
+        # есть нажать "стоп" в интерфейсе означало бы остановить движение
+        # skill'ом Stop и смотреть, как планировщик на следующем шаге выдаёт
+        # новую цель и робот едет дальше. Это НЕ ограничение планировщика: флаг
+        # проверяется между шагами и только прекращает миссию целиком, он не
+        # влияет ни на один выбор модели.
+        # Событие создаётся ДО обеих подписок: обработчики читают его, и порядок
+        # "сначала состояние, потом подписка" исключает callback по недосозданному полю.
+        self._cancel = threading.Event()
         self.create_subscription(String, '/vlm_mission', self._on_mission, 1,
                                  callback_group=sub)
+        self.create_subscription(Empty, '/vlm_mission/cancel', self._on_cancel, 1,
+                                 callback_group=sub)
+        self._scan = None                # latest LaserScan (forward-clearance clamp)
+        self._exec_note = None           # honest per-step execution detail for notes
+        if self.scan_topic:
+            self.create_subscription(LaserScan, self.scan_topic, self._on_scan,
+                                     media_besteffort(), callback_group=sub)
         self.notes_pub = self.create_publisher(Notes, '/planner/notes', 1)
 
         # ---- monitoring outputs (mission dashboard) ----
@@ -238,6 +315,14 @@ class PlannerOrchestrator(Node):
         # the VLM chose from") and the top-down map image actually sent to the VLM.
         self._setofmark_pub = self.create_publisher(CompressedImage, '/vlm/setofmark', 1)
         self._map_view_pub = self.create_publisher(CompressedImage, '/vlm/map_view', 1)
+        # Живые виды, пока миссия НЕ идёт. Без этого таймера оба вида обновлялись
+        # только внутри цикла миссии, и в простое оператор видел либо пустоту, либо
+        # кадр и карту многоминутной давности с подписью «отправлено VLM N с назад» —
+        # то есть не мог проверить, где робот и что он видит, ПЕРЕД тем как дать
+        # задание. Во время миссии таймер молчит: там ценнее показывать ровно то
+        # изображение, которое реально ушло в модель, а не более свежее.
+        self._idle_view_timer = self.create_timer(IDLE_VIEW_PERIOD_S,
+                                                  self._publish_idle_views)
 
         # ---- executive skill clients (loopback-style poll on a reentrant group) ----
         cg = ReentrantCallbackGroup()
@@ -263,6 +348,9 @@ class PlannerOrchestrator(Node):
     # ---- input callbacks ----
     def _on_map(self, msg):
         self._map = msg
+
+    def _on_scan(self, msg):
+        self._scan = msg
 
     def _on_pixel(self, msg):
         with self._lock:
@@ -291,7 +379,20 @@ class PlannerOrchestrator(Node):
         if not target or self._busy:
             return
         self._busy = True
+        self._cancel.clear()
         threading.Thread(target=self._run_mission, args=(target,), daemon=True).start()
+
+    def _on_cancel(self, _msg):
+        """Оператор прервал миссию. Флаг проверяется на границах шагов, поэтому
+        текущее уже выданное skill-действие доигрывается до конца (прерывать его
+        на полпути небезопасно -- исполнитель владеет движением), а нового не
+        будет. Движение при этом гасится сразу через skill Stop."""
+        if not self._busy:
+            return
+        self._cancel.set()
+        self.get_logger().warn('VLM mission cancel requested by operator')
+        self._activity('mission_cancel_requested')
+        self._dispatch_stop()
 
     # ---- monitoring trace ----
     def _activity(self, event, **data):
@@ -374,7 +475,15 @@ class PlannerOrchestrator(Node):
             # republishing the chosen pixel on /target_pixel, which would otherwise leak
             # back as a PHANTOM stale detection (target still "1.7 m away" after we drove
             # right up to it and YOLOE lost it at close range).
-            return [], {}, self._camera_jpeg()
+            #
+            # Кадр в дашборд отдаём ДАЖЕ когда детектор не нашёл ничего. Раньше
+            # публикация стояла только в ветке «есть кандидаты», и панель «что видит
+            # робот» оставалась пустой ровно в том случае, когда оператору нужнее
+            # всего посмотреть на картинку — цель не найдена, и вопрос «а что вообще
+            # в кадре?» без изображения не разрешить.
+            empty_jpeg = self._camera_jpeg()
+            self._publish_view(self._setofmark_pub, empty_jpeg)
+            return [], {}, empty_jpeg
         # Detector server absent -> last-resort single /target_pixel candidate (lets the
         # orchestrator also run against the continuous rgb_tracker instead of the service).
         return self._fallback_candidates(target)
@@ -422,6 +531,110 @@ class PlannerOrchestrator(Node):
                         throttle_duration_sec=5.0)
                 return pose
         return None
+
+    def _publish_idle_views(self):
+        """Свежие «что видит робот» и «вид сверху» в простое (см. _idle_view_timer).
+
+        Исключения глушатся: это украшение интерфейса, и упавший таймер rclpy больше
+        не вызовет — уронить им узел, который в этот момент обязан принимать миссию,
+        нельзя.
+        """
+        if self._busy:
+            return
+        try:
+            map_jpeg, _ = self._render_map()
+            if map_jpeg:
+                self._publish_view(self._map_view_pub, map_jpeg)
+
+            # Кадр С РАЗМЕТКОЙ детектора, если подошёл срок и предыдущий прогон уже
+            # закончился. Детекция уходит в отдельный поток: она ходит в action-сервер
+            # и блокирует вызывающего до ответа.
+            if self.idle_detect_period_s > 0.0:
+                busy_run = self._idle_future is not None and not self._idle_future.done()
+                if not busy_run and time.monotonic() >= self._idle_detect_next:
+                    self._idle_detect_next = (time.monotonic()
+                                              + self.idle_detect_period_s)
+                    self._idle_future = self._idle_pool.submit(self._idle_detect_once)
+                    self._idle_detect_started = True
+                    return          # кадр опубликует сам прогон детекции
+                if busy_run:
+                    return          # не перетираем размеченный кадр сырым
+                if self._idle_detect_started:
+                    # Прогон детекции уже был: кадр в дашборде обновляет ТОЛЬКО он.
+                    # Иначе таймер (1 Гц) затирал бы размеченный кадр сырым четыре
+                    # раза из пяти, и разметка мелькала бы на секунду — ровно то,
+                    # из-за чего «отработанной детекции» в дашборде было не видно,
+                    # хотя детектор её исправно возвращал.
+                    return
+
+            # Досюда доходим, только пока холостая детекция выключена или ещё не
+            # стартовала (прогрев): пустая панель в эту минуту хуже сырого кадра.
+            jpeg = self._camera_jpeg()
+            if jpeg:
+                self._publish_view(self._setofmark_pub, jpeg)
+        except Exception:                              # noqa: BLE001
+            pass
+
+    def shutdown_pools(self):
+        """Остановить фоновые пулы (см. вызов в main)."""
+        self._cancel.set()
+        for pool in (self._idle_pool, self._planner_pool):
+            try:
+                pool.shutdown(wait=False, cancel_futures=True)
+            except TypeError:          # cancel_futures появился в 3.9
+                pool.shutdown(wait=False)
+            except Exception:          # noqa: BLE001
+                pass
+
+    def _idle_detect_once(self):
+        """Один холостой прогон детектора -> размеченный кадр в дашборд.
+
+        Широкий словарь (пустой query), как у DETECT_ALL: оператор перед пуском
+        смотрит, что робот вообще различает, а не ищет конкретную цель — её ещё
+        не задали. Результат НЕ попадает ни в notes, ни в ленту активности: это
+        не шаг миссии, и подмешивать его в журнал прогона нельзя.
+        """
+        problem = ''
+        try:
+            if self._busy:                # миссия стартовала, пока мы стояли в очереди
+                return
+            annotated = None
+            # Таймаут как в _observation (1.0 с), а не короче: под нагрузкой
+            # (Gazebo + SLAM + Nav2) обнаружение сервера занимает заметно больше,
+            # чем на холостой машине, и слишком жадный таймаут молча уводил в
+            # ветку «детектора нет» — кадр публиковался сырым, а сервер при этом
+            # был жив и не получал НИ ОДНОГО запроса.
+            if not self._detect.wait_for_server(timeout_sec=1.0):
+                problem = 'detect_target_server не отвечает'
+            else:
+                g = DetectTarget.Goal()
+                g.request_id = self._goal_id()
+                g.mission_epoch = self._epoch
+                g.query = ''
+                g.render_setofmark = True
+                g.conf_threshold = self.idle_detect_conf
+                res = self._call_action(self._detect, g, self.detect_timeout_s)
+                if res is None:
+                    problem = 'детектор не ответил за %.1f с' % self.detect_timeout_s
+                elif getattr(res, 'annotated', None) is None or not res.annotated.data:
+                    problem = 'детектор ответил без размеченного кадра'
+                else:
+                    annotated = bytes(res.annotated.data)
+            # Детектора нет или он промолчал — лучше сырой кадр, чем пустая панель.
+            jpeg = annotated or self._camera_jpeg()
+            if jpeg and not self._busy:
+                self._publish_view(self._setofmark_pub, jpeg)
+        except Exception as exc:                       # noqa: BLE001
+            problem = '%s: %s' % (type(exc).__name__, exc)
+        # Логируем ТОЛЬКО смену причины: молчаливый except здесь уже один раз стоил
+        # часа диагностики (кадр шёл, а детектор не получал запросов), но писать в
+        # журнал каждые несколько секунд одно и то же — значит утопить в шуме лог
+        # миссии, ради которого журнал и читают.
+        if problem != self._idle_last_problem:
+            self._idle_last_problem = problem
+            if problem:
+                self.get_logger().warn('холостая детекция: %s '
+                                       '(в дашборд идёт кадр без разметки)' % problem)
 
     def _render_map(self):
         """Render the latest SLAM OccupancyGrid to a compact top-down JPEG with the
@@ -555,6 +768,8 @@ class PlannerOrchestrator(Node):
         try:
             bundle = self._compute_plan(target, step)   # bootstrap (the only idle point)
             while rclpy.ok() and step < self.max_steps:
+                if self._cancel.is_set():
+                    break
                 if not bundle.actions:
                     # Degradation (cb open) does NOT stop the mission -- _compute_plan
                     # has already switched to the FLAT fallback. Only stop if even the
@@ -569,6 +784,9 @@ class PlannerOrchestrator(Node):
                     continue
                 terminate = False
                 for i, action in enumerate(bundle.actions):
+                    if self._cancel.is_set():
+                        terminate = True
+                        break
                     self.get_logger().info('step %d: %s -- %s'
                                            % (step, self._action_brief(action),
                                               action.rationale or ''))
@@ -587,14 +805,21 @@ class PlannerOrchestrator(Node):
                                                       self.async_replan, pending is not None):
                         pending = self._planner_pool.submit(self._compute_plan, target, step + 1)
                     t0 = time.monotonic()
+                    self._exec_note = None
                     ok = self._dispatch(action, bundle.pixels)
-                    self.notes.add_fact('%s%s -> %s' % (
+                    # honest execution detail (e.g. a clamped DRIVE_FORWARD): the
+                    # model must learn what PHYSICALLY happened, not just ok/failed
+                    detail = self._exec_note
+                    self._exec_note = None
+                    self.notes.add_fact('%s%s -> %s%s' % (
                         action.name,
                         (' ' + action.rationale) if action.rationale else '',
-                        'ok' if ok else 'failed'))
+                        'ok' if ok else 'failed',
+                        (' | ' + detail) if detail else ''))
                     self._activity('step_result', step=step,
                                    action=self._action_brief(action),
                                    result='ok' if ok else 'failed',
+                                   detail=detail or '',
                                    duration_s=round(time.monotonic() - t0, 2))
                     self._publish_notes(target)
                     step += 1
@@ -608,10 +833,15 @@ class PlannerOrchestrator(Node):
                 # commit-point: adopt the plan computed during execution
                 bundle = self._next_bundle(pending, target, step)
                 pending = None
-            self.get_logger().info('VLM mission ended after %d steps%s' % (
-                step, ' (DEGRADED: ran in FLAT fallback)' if self._degrade.degraded else ''))
+            cancelled = self._cancel.is_set()
+            if cancelled:
+                self._dispatch_stop()
+            self.get_logger().info('VLM mission ended after %d steps%s%s' % (
+                step, ' (CANCELLED by operator)' if cancelled else '',
+                ' (DEGRADED: ran in FLAT fallback)' if self._degrade.degraded else ''))
             self._activity('mission_end', target=target, steps=step,
-                           degraded=bool(self._degrade.degraded))
+                           degraded=bool(self._degrade.degraded),
+                           cancelled=bool(cancelled))
         finally:
             # Join the in-flight replan BEFORE clearing _busy, so a stale pool worker
             # can never write this mission's circuit-breaker / degrade-latch / notes
@@ -637,6 +867,16 @@ class PlannerOrchestrator(Node):
             return 'DRIVE_TO_VISIBLE mark=%d' % a.mark_id
         return a.name
 
+    def _forward_clearance_m(self):
+        """Forward clearance from the latest /scan via the pure geometry helper;
+        None when there is no scan (topic disabled / sensor dark)."""
+        scan = self._scan
+        if scan is None:
+            return None
+        return orch.forward_clearance(scan.ranges, scan.angle_min,
+                                      scan.angle_increment,
+                                      self.forward_corridor_half_width_m)
+
     def _dispatch(self, action, cand_pixels):
         if action.kind in (TURN, DRIVE_FORWARD):
             pose = self._motion_pose()
@@ -646,6 +886,8 @@ class PlannerOrchestrator(Node):
                     % (self.map_frame, self.robot_frame,
                        self.motion_fallback_frame, self.robot_frame))
                 return False
+            if action.kind == DRIVE_FORWARD:
+                return self._drive_forward_clamped(action, pose)
             gx, gy, gyaw = orch.relative_goal(pose[0], pose[1], pose[2], action)
             return self._send_goto(gx, gy, gyaw, frame_id=pose[3])
         if action.kind == DRIVE_TO_VISIBLE:
@@ -653,6 +895,44 @@ class PlannerOrchestrator(Node):
         if action.kind == DETECT_ALL:
             return self._do_detect_all()
         return False
+
+    def _drive_forward_clamped(self, action, pose):
+        """Execute DRIVE_FORWARD truncated to the physically free distance ahead,
+        and leave an honest one-line account in _exec_note for the step's fact.
+
+        This is the executive's safety layer, not plan editing: the VLM's chosen
+        action always runs as far as physics allows, and when physics said no the
+        model is TOLD so ("asked +1.00m, obstacle ~0.6m ahead, drove +0.20m")
+        instead of the old unconditional "-> ok". Without the clamp Nav2 accepts
+        a goal inside a wall, NavFn's tolerance shifts it to the inflation
+        boundary, the drive "succeeds", and five repeats walk the robot into the
+        collision guard (measured: s7 ended at scan min 0.154 m). Without the
+        note the model cannot know its forward motion is being eaten by a wall --
+        the map alone was demonstrably not enough for it to stop ramming.
+        Clearances are rounded to 0.1 m so a repeated ram produces the SAME fact
+        and the notes buffer dedups it instead of flooding."""
+        asked = float(action.forward_dist_m)
+        clearance = self._forward_clearance_m()   # scan-frame (camera, robot front)
+        if clearance is None:                     # no scan info -> old behaviour
+            drive = asked
+        else:
+            # standoff already contains the camera->footprint-front offset margin
+            drive = min(asked, max(0.0, clearance - self.forward_standoff_m))
+        if drive <= 0.05:
+            self._exec_note = ('blocked: obstacle ~%.1fm ahead, no safe forward motion'
+                               % clearance)
+            self.get_logger().warn('DRIVE_FORWARD %.2fm refused: clearance %.2fm'
+                                   % (asked, clearance))
+            return False
+        x, y, yaw, frame = pose
+        ok = self._send_goto(x + drive * math.cos(yaw), y + drive * math.sin(yaw),
+                             yaw, frame_id=frame)
+        if drive < asked - 1e-6:
+            self._exec_note = ('asked %+.2fm, obstacle ~%.1fm ahead, drove %+.2fm'
+                               % (asked, clearance, drive))
+            self.get_logger().info('DRIVE_FORWARD clamped %.2f -> %.2fm (clearance %.2fm)'
+                                   % (asked, drive, clearance))
+        return ok
 
     def _goal_id(self):
         return uuid.uuid4().hex
@@ -829,6 +1109,10 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        # Пулы гасим ДО destroy_node: рабочий поток холостой детекции может в этот
+        # момент ждать ответа action-сервера, а обращение к уничтоженному узлу из
+        # него роняет процесс уже на выходе — и маскирует настоящую причину останова.
+        node.shutdown_pools()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
