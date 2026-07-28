@@ -90,3 +90,43 @@ def relative_goal(x: float, y: float, yaw: float, action: Action) -> Tuple[float
         d = action.forward_dist_m
         return (x + d * math.cos(yaw), y + d * math.sin(yaw), yaw)
     return (x, y, yaw)
+
+
+def forward_clearance(ranges, angle_min: float, angle_increment: float,
+                      corridor_half_width_m: float):
+    """Distance the robot can advance along its heading before its swept corridor
+    hits the nearest scan return; None when the scan says nothing about that
+    corridor (no rays, or all NaN/inf).
+
+    Geometry, not a cone: a ray at bearing theta with range r only blocks forward
+    motion if its hit point lies inside the strip the robot's body sweeps, i.e.
+    |r*sin(theta)| <= corridor_half_width_m; the blocking depth is then
+    r*cos(theta) (rear hits, cos<=0, never block). A fixed angular cone would
+    get this wrong on both ends: at 0.4 m it misses a wall edge 0.2 m off-axis
+    (outside the cone, inside the body sweep), and at 4 m it "blocks" on a
+    doorframe 0.8 m off-axis that the robot clears with half a metre to spare.
+
+    Why this exists at all: Nav2 accepts a goal pressed against (or inside) a
+    wall -- NavFn's tolerance just shifts it to the nearest reachable cell, the
+    drive "succeeds" flush with the inflation boundary, and repeating the same
+    forward command walks the robot into the collision guard. Measured in the
+    house world (s7): five DRIVE_FORWARD into a blank partition ended at scan
+    min 0.154 m. The executive owns safety, so the clamp lives here, executive-
+    side; the planner's choice is never edited, only truncated by physics, and
+    the truncation is reported back honestly in the step note.
+    """
+    if not ranges or angle_increment == 0.0:
+        return None
+    best = None
+    for i, r in enumerate(ranges):
+        if r is None or not math.isfinite(r) or r <= 0.0:
+            continue
+        theta = angle_min + i * angle_increment
+        depth = r * math.cos(theta)
+        if depth <= 0.0:
+            continue
+        if abs(r * math.sin(theta)) > corridor_half_width_m:
+            continue
+        if best is None or depth < best:
+            best = depth
+    return best

@@ -72,6 +72,12 @@ class DetectTargetServer(Node):
         # 15 FPS. The old default of 30 kept ~5 s and each frame is a full float32
         # depth image (~0.4 MB @640x480) held resident -- pure waste above ~8.
         self.declare_parameter('depth_buffer_size', 8)
+        # Hard freshness gate for _execute (see the comment there): a detect on a
+        # frame older than this ABORTS instead of reporting "0 candidates" from a
+        # stale world state. 3.0 s tolerates camera hiccups at the sim's 6-15 FPS
+        # (and the real camera's), while a dead subscription blows past it at
+        # once. <= 0 disables the gate.
+        self.declare_parameter('max_frame_age_s', 3.0)
 
         g = lambda n: self.get_parameter(n).value
         self.image_topic = g('image_topic')
@@ -94,6 +100,7 @@ class DetectTargetServer(Node):
         self.nearest_depth_percentile = float(g('nearest_depth_percentile'))
         self.depth_match_tolerance_s = float(g('depth_match_tolerance_s'))
         self.depth_buffer_size = max(1, int(g('depth_buffer_size')))
+        self.max_frame_age_s = float(g('max_frame_age_s'))
 
         self._bridge = CvBridge() if _HAVE_CV else None
         self._frame = None               # latest BGR frame
@@ -509,6 +516,24 @@ class DetectTargetServer(Node):
             depth = self._match_depth_locked(header) if self.use_depth else None
         if frame is None:
             self.get_logger().warn('detect_target: no camera frame yet')
+            goal_handle.abort()
+            result.outcome = DetectTarget.Result.ABORTED
+            return result
+        # A dead image subscription must FAIL LOUDLY, not lie quietly. Measured
+        # in the house benchmark: the detector's subscriber froze pre-episode
+        # while the orchestrator's own (same topic, different process) kept
+        # flowing -- every detect then ran on a frame from BEFORE the target
+        # was spawned and returned an honest-looking "0 candidates" for the
+        # whole mission, indistinguishable from a perception miss. The VLM
+        # meanwhile SAW the target in its fresh frame and was punished for
+        # asking to drive to it. Abort instead: the orchestrator logs the
+        # failure and the episode attributes to perception, not the planner.
+        age_s = time.monotonic() - self._last_frame_mono
+        if age_s > self.max_frame_age_s > 0.0:
+            self.get_logger().error(
+                'detect_target: camera frame is %.1fs old (limit %.1fs) -- image '
+                'subscription is stale/dead; refusing to detect on an old world state'
+                % (age_s, self.max_frame_age_s))
             goal_handle.abort()
             result.outcome = DetectTarget.Result.ABORTED
             return result

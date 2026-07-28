@@ -6,7 +6,8 @@ from planner_orchestrator.planner_logic import (
 )
 from planner_orchestrator.orchestration import (
     skill_for_action, is_terminal, relative_goal, wrap_angle, should_launch_lead_replan,
-    describe_occupancy_grid, SKILL_GO_TO_POSE, SKILL_APPROACH, SKILL_NONE,
+    describe_occupancy_grid, forward_clearance,
+    SKILL_GO_TO_POSE, SKILL_APPROACH, SKILL_NONE,
 )
 
 
@@ -63,6 +64,50 @@ def test_lead_replan_suppressed_when_pending_or_disabled():
     assert not should_launch_lead_replan(2, 3, True, True)    # already pending
     assert not should_launch_lead_replan(2, 3, False, False)  # async off
     assert not should_launch_lead_replan(0, 0, True, False)   # empty batch
+
+
+def _scan(ranges, fov=math.radians(62.4)):
+    """(ranges, angle_min, angle_increment) for a symmetric camera-like scan."""
+    n = len(ranges)
+    inc = fov / max(1, n - 1)
+    return ranges, -fov / 2.0, inc
+
+
+def test_forward_clearance_wall_dead_ahead():
+    # 21 rays, wall at 1.0 m: central rays block at ~1.0, oblique ones farther
+    ranges, a0, inc = _scan([1.0 / math.cos(-math.radians(31.2) + i * math.radians(62.4) / 20)
+                             for i in range(21)])
+    c = forward_clearance(ranges, a0, inc, 0.25)
+    assert c is not None and math.isclose(c, 1.0, abs_tol=0.02)
+
+
+def test_forward_clearance_doorframe_outside_corridor_ignored():
+    # hit 0.8 m off-axis at 2 m depth: outside the 0.25 m body corridor -> free
+    theta = math.atan2(0.8, 2.0)
+    r = math.hypot(0.8, 2.0)
+    c = forward_clearance([r], theta, 1.0, 0.25)
+    assert c is None
+    # the SAME hit with a wider corridor (0.9) becomes a real block at depth 2.0
+    c2 = forward_clearance([r], theta, 1.0, 0.9)
+    assert c2 is not None and math.isclose(c2, 2.0, abs_tol=1e-6)
+
+
+def test_forward_clearance_near_edge_inside_corridor_blocks():
+    # a wall edge 0.2 m off-axis at 0.4 m depth is INSIDE the body sweep: a
+    # fixed 12-degree cone would miss it (bearing ~27 deg), the corridor must not
+    theta = math.atan2(0.2, 0.4)
+    r = math.hypot(0.2, 0.4)
+    c = forward_clearance([r], theta, 1.0, 0.25)
+    assert c is not None and math.isclose(c, 0.4, abs_tol=1e-6)
+
+
+def test_forward_clearance_rear_and_invalid_rays_never_block():
+    nan = float('nan')
+    # rear hit (cos<0), NaN, inf, zero -> no information about the forward corridor
+    ranges, a0, inc = _scan([nan, float('inf'), 0.0])
+    assert forward_clearance(ranges, a0, inc, 0.25) is None
+    assert forward_clearance([1.0], math.pi, 1.0, 0.25) is None      # behind
+    assert forward_clearance([], 0.0, 0.0, 0.25) is None             # empty scan
 
 
 def test_describe_occupancy_grid():

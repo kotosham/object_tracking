@@ -8,7 +8,11 @@ setup(
     packages=find_packages(exclude=['test']),
     data_files=[
         ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
-        ('share/' + package_name, ['package.xml']),
+        # vlm.env.example ставится в share намеренно: консоль оператора создаёт
+        # vlm.env из этого шаблона, чтобы не потерять документацию про формат
+        # VLM_BASE_URL для Qwen/OpenAI/локального vLLM. Без установки шаблон
+        # существует только в исходниках и в контейнере не находится.
+        ('share/' + package_name, ['package.xml', 'vlm.env.example']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
