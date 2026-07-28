@@ -1,5 +1,6 @@
 import torch
 import os
+import re
 import numpy as np
 from ament_index_python.packages import get_package_share_directory
 import cv2
@@ -188,6 +189,43 @@ class GroundingDINOMobileSAMSegmentor:
         )
         return os.path.isdir(path) and all(os.path.isfile(os.path.join(path, name)) for name in required_files)
 
+    @staticmethod
+    def _split_prompt_labels(prompt):
+        """GroundingDINO supports multiple text labels in one request. Keep a plain
+        single-object prompt unchanged, but allow context requests such as
+        "desk | table | drawer cabinet" to return class-specific labels."""
+        prompt = str(prompt or "").strip()
+        if not prompt:
+            return []
+        labels = [p.strip() for p in re.split(r"\s*(?:\||;|\n|,\s*|\.\s*)\s*", prompt)
+                  if p.strip()]
+        return labels or [prompt]
+
+    @staticmethod
+    def _clean_output_label(raw_label, candidate_labels, fallback):
+        if isinstance(raw_label, (int, np.integer)):
+            idx = int(raw_label)
+            if 0 <= idx < len(candidate_labels):
+                return candidate_labels[idx]
+            return fallback
+        label = str(raw_label or "").strip()
+        label = re.sub(r"[\s|;,]+", " ", label).strip()
+        if not label:
+            return fallback
+
+        # GroundingDINO may concatenate overlapping text labels from the prompt,
+        # e.g. "office chair" + "chair" -> "office chair chair". Keep the most
+        # specific clean phrase instead of leaking duplicated labels to the VLM.
+        words = []
+        for word in label.split():
+            if not words or words[-1].lower() != word.lower():
+                words.append(word)
+        label = " ".join(words)
+
+        by_lower = {str(c).strip().lower(): str(c).strip()
+                    for c in candidate_labels if str(c).strip()}
+        return by_lower.get(label.lower(), label)
+
     def segment(self, image_bgr, prompt, depth_map):
         self.last_detection_score = None
         self.last_detection_label = None
@@ -195,7 +233,8 @@ class GroundingDINOMobileSAMSegmentor:
         self.last_bbox = None
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
         image_pil = PILImage.fromarray(image_rgb)
-        text_labels = [[prompt]]
+        candidate_labels = self._split_prompt_labels(prompt)
+        text_labels = [candidate_labels]
 
         start_time_DINO = time.time()
 
@@ -225,9 +264,11 @@ class GroundingDINOMobileSAMSegmentor:
 
         # Фильтрация по порогу
         box_threshold = 0.55
+        output_labels = result.get("text_labels", result.get("labels", []))
         filtered = [
-            (box.cpu().numpy(), score.item(), label)
-            for box, score, label in zip(result["boxes"], result["scores"], result["labels"])
+            (box.cpu().numpy(), score.item(),
+             self._clean_output_label(label, candidate_labels, prompt))
+            for box, score, label in zip(result["boxes"], result["scores"], output_labels)
             if score.item() >= box_threshold
         ]
 
@@ -346,7 +387,8 @@ class GroundingDINOMobileSAMSegmentor:
 
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
         image_pil = PILImage.fromarray(image_rgb)
-        text_labels = [[prompt]]
+        candidate_labels = self._split_prompt_labels(prompt)
+        text_labels = [candidate_labels]
 
         start_time_dino = time.time()
         inputs = self.dino_processor(
@@ -366,9 +408,11 @@ class GroundingDINOMobileSAMSegmentor:
         dino_time = time.time() - start_time_dino
 
         result = results[0]
+        output_labels = result.get("text_labels", result.get("labels", []))
         filtered = [
-            (box.detach().cpu().numpy(), float(score.item()), str(label))
-            for box, score, label in zip(result["boxes"], result["scores"], result["labels"])
+            (box.detach().cpu().numpy(), float(score.item()),
+             self._clean_output_label(label, candidate_labels, prompt))
+            for box, score, label in zip(result["boxes"], result["scores"], output_labels)
             if float(score.item()) >= box_threshold
         ]
         if not filtered:
@@ -413,7 +457,7 @@ class GroundingDINOMobileSAMSegmentor:
 
             dets.append(
                 Detection(
-                    label=prompt,
+                    label=label,
                     confidence=float(score),
                     cx=int(cx),
                     cy=int(cy),

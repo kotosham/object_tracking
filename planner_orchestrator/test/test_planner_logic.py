@@ -1,8 +1,9 @@
 """Unit tests for the VLM planner pure logic (Phase 4)."""
 from planner_orchestrator.planner_logic import (
-    Action, Candidate, CircuitBreaker, DegradationLatch, MockPlanner,
+    Action, Candidate, CircuitBreaker, ContextMark, DegradationLatch, MockPlanner,
     NotesBuffer, Observation, ReplanScheduler, build_vlm_options, parse_vlm_action,
-    validate_action, DRIVE_TO_VISIBLE, DETECT_ALL, TURN, DONE,
+    context_mark_promotable_to_target, validate_action, DRIVE_TO_VISIBLE,
+    DETECT_ALL, DRIVE_FORWARD, TURN, DONE,
 )
 
 
@@ -24,6 +25,21 @@ def test_mock_picks_best_matching_candidate():
     assert a.kind == DRIVE_TO_VISIBLE and a.mark_id == 3   # best score among matches
 
 
+def test_target_like_context_can_be_promoted_to_target_candidate():
+    mark = ContextMark(2, 'office chair', 0.41, distance_m=1.9,
+                       side='right', relevance='target_like')
+    assert context_mark_promotable_to_target('chair', mark, min_score=0.35)
+
+
+def test_weak_or_non_target_context_is_not_promoted():
+    weak = ContextMark(9, 'chair', 0.26, distance_m=1.7,
+                       side='center', relevance='target_like')
+    desk = ContextMark(3, 'desk', 0.50, distance_m=1.5,
+                       side='left', relevance='office_context')
+    assert not context_mark_promotable_to_target('chair', weak, min_score=0.35)
+    assert not context_mark_promotable_to_target('chair', desk, min_score=0.35)
+
+
 def test_mock_detects_all_then_scans_then_done():
     obs = Observation(target='bus')  # nothing visible
     mp = MockPlanner(scan_turn_limit=2, turn_step_rad=0.5)
@@ -31,6 +47,43 @@ def test_mock_detects_all_then_scans_then_done():
     assert mp.plan(obs).kind == TURN
     assert mp.plan(obs).kind == TURN
     assert mp.plan(obs).kind == DONE         # exhausted
+
+
+def test_mock_semantic_explore_turns_toward_context_side():
+    obs = Observation(
+        target='office chair',
+        context_marks=[ContextMark(4, 'desk', 0.8, distance_m=2.0,
+                                   side='left', center_x_norm=0.2,
+                                   relevance='office_context')])
+    a = MockPlanner(turn_step_rad=0.5).plan(obs)
+    assert a.kind == TURN and a.turn_yaw_rad == 0.5
+    assert 'semantic_explore' in a.rationale
+
+
+def test_mock_semantic_explore_drives_to_center_context():
+    obs = Observation(
+        target='office chair',
+        context_marks=[ContextMark(4, 'desk', 0.8, distance_m=2.0,
+                                   side='center', center_x_norm=0.5,
+                                   relevance='office_context')])
+    a = MockPlanner(semantic_forward_m=0.3).plan(obs)
+    assert a.kind == DRIVE_FORWARD and a.forward_dist_m == 0.3
+
+
+def test_mock_semantic_explore_turns_when_center_context_is_blocked():
+    obs = Observation(
+        target='office chair',
+        context_marks=[
+            ContextMark(1, 'desk table', 0.41, distance_m=0.31,
+                        side='center', center_x_norm=0.5,
+                        relevance='office_context'),
+            ContextMark(9, 'chair', 0.26, distance_m=1.69,
+                        side='center', center_x_norm=0.5,
+                        relevance='target_like'),
+        ])
+    a = MockPlanner(turn_step_rad=0.6).plan(obs)
+    assert a.kind == TURN and a.turn_yaw_rad == 0.3
+    assert 'forward probe blocked' in a.rationale
 
 
 def test_mock_done_when_target_close():
@@ -50,16 +103,36 @@ def test_mock_approaches_until_close():
 
 def test_mock_done_when_lost_after_approach():
     mp = MockPlanner()
-    seen = Observation(target='bus', candidates=[Candidate(2, 'bus', 0.9, distance_m=2.0)])
+    seen = Observation(target='bus', candidates=[Candidate(2, 'bus', 0.9, distance_m=1.5)])
     assert mp.plan(seen).kind == DRIVE_TO_VISIBLE     # drove toward it
     # at point-blank the bus overflows the frame and YOLOE drops it -> treated as arrived.
     assert mp.plan(Observation(target='bus')).kind == DONE
 
 
+def test_mock_does_not_done_when_target_lost_after_far_bounded_approach():
+    mp = MockPlanner()
+    far = Observation(target='bus', candidates=[Candidate(2, 'bus', 0.9, distance_m=5.3)])
+    assert mp.plan(far).kind == DRIVE_TO_VISIBLE
+    # A far target disappearing after a bounded step is not arrival; observe again.
+    assert mp.plan(Observation(target='bus')).kind == DETECT_ALL
+
+
 def test_mock_does_not_approach_unknown_depth_target_before_drive():
     mp = MockPlanner()
-    unknown = Observation(target='bus', candidates=[Candidate(2, 'bus', 0.9)])
-    assert mp.plan(unknown).kind == DETECT_ALL
+    unknown = Observation(target='bus',
+                          candidates=[Candidate(2, 'bus', 0.9, side='center')])
+    a = mp.plan(unknown)
+    assert a.kind == DRIVE_FORWARD
+    assert a.forward_dist_m == 0.6
+    assert 'depth unknown' in a.rationale
+
+
+def test_mock_turns_toward_unknown_depth_target_side():
+    mp = MockPlanner()
+    unknown = Observation(target='bus',
+                          candidates=[Candidate(2, 'bus', 0.9, side='right')])
+    a = mp.plan(unknown)
+    assert a.kind == TURN and a.turn_yaw_rad < 0.0
 
 
 def test_mock_approach_is_bounded():
@@ -89,6 +162,27 @@ def test_validate_rejects_unknown_depth_mark():
     assert not ok and 'unknown distance' in reason
 
 
+def test_parse_repairs_unknown_depth_target_to_probe():
+    obs = Observation(target='bus',
+                      candidates=[Candidate(2, 'bus', distance_m=0.0,
+                                            side='left', center_x_norm=0.2)])
+    a, reason = parse_vlm_action({'action': 'DRIVE_TO_VISIBLE', 'mark_id': 2}, obs)
+    assert reason == 'OK'
+    assert a.kind == TURN and a.turn_yaw_rad > 0.0
+    assert 'target_probe' in a.rationale
+
+
+def test_parse_accepts_target_probe_pseudo_action():
+    obs = Observation(target='office chair',
+                      candidates=[Candidate(1, 'office chair', distance_m=0.0,
+                                            side='center', center_x_norm=0.5)])
+    a, reason = parse_vlm_action({'action': 'TARGET_PROBE', 'mark_id': 1}, obs)
+    assert reason == 'OK'
+    assert a.kind == DRIVE_FORWARD
+    assert a.forward_dist_m == 0.6
+    assert 'target_probe' in a.rationale
+
+
 def test_validate_accepts_argless_actions():
     obs = Observation(target='bus')
     assert validate_action(Action(DETECT_ALL), obs)[0]
@@ -108,6 +202,24 @@ def test_build_options_lists_real_marks():
     assert 'DRIVE_TO_VISIBLE' in opt['actions'] and 'DETECT_ALL' in opt['actions']
     assert opt['map'] == 'occupancy map 40x40'
     assert 'frontiers' not in opt          # frontier options removed from the vocab
+
+
+def test_build_options_lists_context_marks():
+    obs = Observation(
+        target='office chair',
+        context_marks=[ContextMark(7, 'drawer cabinet', 0.66, distance_m=1.9,
+                                   side='right', center_x_norm=0.74,
+                                   relevance='office_context')])
+    mark = build_vlm_options(obs)['context_marks'][0]
+    assert mark == {
+        'mark_id': 7,
+        'label': 'drawer cabinet',
+        'score': 0.66,
+        'distance_m': 1.9,
+        'side': 'right',
+        'center_x_norm': 0.74,
+        'relevance': 'office_context',
+    }
 
 
 def test_build_options_serializes_unknown_distance_as_null():
@@ -131,6 +243,58 @@ def test_parse_valid_tool_call():
 def test_parse_rejects_hallucinated_mark():
     obs = Observation(target='bus', candidates=[Candidate(2, 'bus', distance_m=2.0)])
     act, reason = parse_vlm_action({'action': 'DRIVE_TO_VISIBLE', 'mark_id': 7}, obs)
+    assert act is None and 'not in candidates' in reason
+
+
+def test_parse_remaps_context_mark_drive_to_semantic_turn():
+    obs = Observation(
+        target='office chair',
+        context_marks=[ContextMark(5, 'office chair chair', 0.35, distance_m=4.8,
+                                   side='left', center_x_norm=0.2,
+                                   relevance='target_like')])
+    act, reason = parse_vlm_action(
+        {'action': 'DRIVE_TO_VISIBLE', 'mark_id': 5,
+         'rationale': 'inspect the partly visible chair'}, obs)
+    assert reason == 'OK'
+    assert act.kind == TURN and act.turn_yaw_rad > 0.0
+    assert 'semantic_explore' in act.rationale
+
+
+def test_parse_remaps_center_context_mark_drive_to_short_forward():
+    obs = Observation(
+        target='office chair',
+        context_marks=[ContextMark(2, 'drawer cabinet', 0.40, distance_m=2.7,
+                                   side='center', center_x_norm=0.5,
+                                   relevance='office_context')])
+    act, reason = parse_vlm_action({'action': 'DRIVE_TO_VISIBLE', 'mark_id': 2}, obs)
+    assert reason == 'OK'
+    assert act.kind == DRIVE_FORWARD and act.forward_dist_m == 0.4
+
+
+def test_parse_remaps_center_context_mark_drive_to_turn_when_blocked():
+    obs = Observation(
+        target='office chair',
+        context_marks=[
+            ContextMark(1, 'desk table', 0.41, distance_m=0.31,
+                        side='center', center_x_norm=0.5,
+                        relevance='office_context'),
+            ContextMark(9, 'chair', 0.26, distance_m=1.69,
+                        side='center', center_x_norm=0.5,
+                        relevance='target_like'),
+        ])
+    act, reason = parse_vlm_action({'action': 'DRIVE_TO_VISIBLE', 'mark_id': 9}, obs)
+    assert reason == 'OK'
+    assert act.kind == TURN and act.turn_yaw_rad > 0.0
+    assert 'forward probe blocked' in act.rationale
+
+
+def test_parse_still_rejects_low_relevance_context_mark_drive():
+    obs = Observation(
+        target='office chair',
+        context_marks=[ContextMark(8, 'floor', 0.80, distance_m=2.0,
+                                   side='center', center_x_norm=0.5,
+                                   relevance='low')])
+    act, reason = parse_vlm_action({'action': 'DRIVE_TO_VISIBLE', 'mark_id': 8}, obs)
     assert act is None and 'not in candidates' in reason
 
 

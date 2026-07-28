@@ -38,6 +38,13 @@ ACTION_NAMES = {
 }
 ACTION_KINDS = {v: k for k, v in ACTION_NAMES.items()}
 
+CONTEXT_EXPLORE_TURN_RAD = 0.6
+CONTEXT_EXPLORE_FORWARD_M = 0.4
+CONTEXT_EXPLORE_MIN_CLEARANCE_M = 0.8
+TARGET_PROBE_TURN_RAD = 0.45
+TARGET_PROBE_FORWARD_M = 0.6
+TARGET_CONTEXT_PROMOTE_MIN_SCORE = 0.35
+
 
 @dataclass(frozen=True)
 class Candidate:
@@ -48,6 +55,81 @@ class Candidate:
     label: str
     score: float = 0.0
     distance_m: float = 0.0
+    side: str = 'center'                 # left / center / right in the camera image
+    center_x_norm: float = 0.5
+
+
+@dataclass(frozen=True)
+class ContextMark:
+    """A non-target object visible in the scene. Context marks are for reasoning
+    only: they can suggest where to explore, but DRIVE_TO_VISIBLE may still target
+    only real target Candidates from visible_marks."""
+    mark_id: int
+    label: str
+    score: float = 0.0
+    distance_m: float = 0.0
+    side: str = 'center'                 # left / center / right in the camera image
+    center_x_norm: float = 0.5           # 0.0 = left edge, 1.0 = right edge
+    relevance: str = 'low'               # target_like / office_context / ambiguous / low
+
+
+OFFICE_CONTEXT_TERMS = (
+    'desk', 'table', 'drawer', 'drawer cabinet', 'file cabinet', 'bookcase',
+    'shelf', 'bookshelf', 'monitor', 'keyboard', 'laptop', 'computer', 'printer',
+    'office chair', 'chair', 'sofa', 'couch',
+)
+
+
+def image_side(center_x_norm: float) -> str:
+    try:
+        x = float(center_x_norm)
+    except (TypeError, ValueError):
+        return 'center'
+    if x < 0.4:
+        return 'left'
+    if x > 0.6:
+        return 'right'
+    return 'center'
+
+
+def context_relevance_for(target: str, label: str) -> str:
+    """Small, deterministic hint for the VLM: which visible non-target objects are
+    semantically useful search cues. The image is still the authority; this just
+    prevents the fallback policy from treating every random object as equally useful."""
+    t = (target or '').strip().lower()
+    l = (label or '').strip().lower()
+    if not l:
+        return 'low'
+    if _label_matches(t, l):
+        return 'target_like'
+    wants_office = any(w in t for w in ('chair', 'office', 'desk', 'table', 'cabinet'))
+    if wants_office and any(term in l for term in OFFICE_CONTEXT_TERMS):
+        return 'office_context'
+    if 'cabinet' in l or 'shelf' in l or 'box' in l:
+        return 'ambiguous'
+    return 'low'
+
+
+def context_mark_promotable_to_target(target: str, mark: ContextMark,
+                                      min_score: float = TARGET_CONTEXT_PROMOTE_MIN_SCORE
+                                      ) -> bool:
+    """Whether a context detection should be treated as a real target candidate.
+
+    A context pass can find the target under a broader query, e.g. target="chair"
+    while DINO office-context returns label="office chair". If the label really
+    matches the mission target and confidence is not just a tiny hint, promote it
+    so DRIVE_TO_VISIBLE may use its pixel/depth instead of only turning toward it.
+    """
+    if mark is None or int(mark.mark_id) <= 0:
+        return False
+    try:
+        score = float(mark.score)
+    except (TypeError, ValueError):
+        return False
+    if score < float(min_score):
+        return False
+    return (mark.relevance or '').lower() == 'target_like' and _label_matches(
+        target, mark.label)
 
 
 def distance_is_known(distance_m: float) -> bool:
@@ -66,6 +148,21 @@ def format_distance(distance_m: float) -> str:
     return 'unknown' if not distance_is_known(distance_m) else '%.2fm' % float(distance_m)
 
 
+def centered_forward_blocker(obs: Observation,
+                             min_clearance_m: float = CONTEXT_EXPLORE_MIN_CLEARANCE_M
+                             ) -> Optional[ContextMark]:
+    """Closest centered context mark that makes a blind/context forward probe unsafe."""
+    blockers = [
+        m for m in obs.context_marks
+        if m.side == 'center'
+        and distance_is_known(m.distance_m)
+        and float(m.distance_m) < float(min_clearance_m)
+    ]
+    if not blockers:
+        return None
+    return min(blockers, key=lambda m: float(m.distance_m))
+
+
 @dataclass(frozen=True)
 class Observation:
     """Everything the planner sees at a replan point. ROS-free. The camera frame and
@@ -73,6 +170,7 @@ class Observation:
     map_text describes that map so the model can read it."""
     target: str                          # mission instruction / object description
     candidates: List[Candidate] = field(default_factory=list)
+    context_marks: List[ContextMark] = field(default_factory=list)
     notes_facts: List[str] = field(default_factory=list)
     step_index: int = 0                  # atomic steps executed so far this mission
     map_text: str = ''                   # human description of the attached SLAM map
@@ -118,6 +216,97 @@ def validate_action(action: Action, obs: Observation) -> Tuple[bool, str]:
         if not distance_is_known(by_id[action.mark_id].distance_m):
             return False, 'mark_id %d has unknown distance' % action.mark_id
     return True, 'OK'
+
+
+def context_mark_to_semantic_explore(action: Action, obs: Observation) -> Optional[Action]:
+    """Repair a common VLM mistake: it may choose DRIVE_TO_VISIBLE for a
+    context_mark (for example a partly visible chair leg) instead of emitting a
+    semantic_explore motion. Context marks are not approach targets, but the
+    selected id still contains useful intent: inspect that side of the scene."""
+    if action.kind != DRIVE_TO_VISIBLE:
+        return None
+    by_target_id = {c.mark_id for c in obs.candidates}
+    if action.mark_id in by_target_id:
+        return None
+    by_context_id = {m.mark_id: m for m in obs.context_marks}
+    mark = by_context_id.get(action.mark_id)
+    if mark is None:
+        return None
+    relevance = (mark.relevance or '').lower()
+    if relevance not in ('target_like', 'office_context', 'ambiguous'):
+        return None
+
+    base = ('semantic_explore: VLM selected context mark %d "%s" (%s on %s), '
+            'so inspect that area instead of approaching it as a confirmed target'
+            % (mark.mark_id, mark.label, mark.relevance, mark.side))
+    if action.rationale:
+        base += '; original rationale: ' + action.rationale
+    if mark.side == 'left':
+        return Action(TURN, turn_yaw_rad=CONTEXT_EXPLORE_TURN_RAD,
+                      arg_label=mark.label, rationale=base)
+    if mark.side == 'right':
+        return Action(TURN, turn_yaw_rad=-CONTEXT_EXPLORE_TURN_RAD,
+                      arg_label=mark.label, rationale=base)
+    blocker = centered_forward_blocker(obs)
+    if blocker is not None:
+        return Action(TURN, turn_yaw_rad=CONTEXT_EXPLORE_TURN_RAD * 0.5,
+                      arg_label=mark.label,
+                      rationale=(base + '; forward probe blocked by centered "%s" at %.2fm'
+                                 % (blocker.label, float(blocker.distance_m))))
+    if distance_is_known(mark.distance_m) and mark.distance_m < CONTEXT_EXPLORE_MIN_CLEARANCE_M:
+        return Action(TURN, turn_yaw_rad=CONTEXT_EXPLORE_TURN_RAD * 0.5,
+                      arg_label=mark.label,
+                      rationale=base + '; context is too close for a forward probe')
+    return Action(DRIVE_FORWARD, forward_dist_m=CONTEXT_EXPLORE_FORWARD_M,
+                  arg_label=mark.label,
+                  rationale=base + '; context is centered, move forward cautiously')
+
+
+def unknown_depth_target_to_probe(action: Action, obs: Observation) -> Optional[Action]:
+    """Repair a common VLM mistake: the target is visible but too far/invalid for
+    RealSense depth, so DRIVE_TO_VISIBLE cannot compute a 3D Nav2 goal yet. Keep
+    pursuing the target by using its image side as a cautious probe motion."""
+    if action.kind != DRIVE_TO_VISIBLE:
+        return None
+    by_id = {c.mark_id: c for c in obs.candidates}
+    cand = by_id.get(action.mark_id)
+    if cand is None or distance_is_known(cand.distance_m):
+        return None
+
+    base = ('target_probe: target mark %d "%s" is visible on %s but depth is unknown; '
+            'move to bring it into RealSense range before ApproachDetection'
+            % (cand.mark_id, cand.label, cand.side))
+    if action.rationale:
+        base += '; original rationale: ' + action.rationale
+    if cand.side == 'left':
+        return Action(TURN, turn_yaw_rad=TARGET_PROBE_TURN_RAD,
+                      arg_label=cand.label, rationale=base)
+    if cand.side == 'right':
+        return Action(TURN, turn_yaw_rad=-TARGET_PROBE_TURN_RAD,
+                      arg_label=cand.label, rationale=base)
+    return Action(DRIVE_FORWARD, forward_dist_m=TARGET_PROBE_FORWARD_M,
+                  arg_label=cand.label, rationale=base)
+
+
+def target_probe_action(obs: Observation, mark_id: int = 0,
+                        rationale: str = '') -> Optional[Action]:
+    """Convert a pseudo TARGET_PROBE intent into a real atomic action.
+
+    The public action vocabulary intentionally stays small; target_probe is a
+    reasoning mode implemented as TURN/DRIVE_FORWARD.
+    """
+    matches = [c for c in obs.candidates
+               if _label_matches(obs.target, c.label)
+               and not distance_is_known(c.distance_m)]
+    if mark_id:
+        matches = [c for c in matches if int(c.mark_id) == int(mark_id)]
+    if not matches:
+        return None
+    best = max(matches, key=lambda c: float(c.score))
+    return unknown_depth_target_to_probe(
+        Action(DRIVE_TO_VISIBLE, mark_id=best.mark_id,
+               arg_label=best.label, rationale=rationale),
+        obs)
 
 
 class ReplanScheduler:
@@ -240,14 +429,47 @@ class MockPlanner:
     """
 
     def __init__(self, scan_turn_limit: int = 6, turn_step_rad: float = 0.6,
-                 reached_dist_m: float = 0.8, max_approaches: int = 8):
+                 reached_dist_m: float = 0.8, max_approaches: int = 8,
+                 semantic_forward_m: float = 0.4,
+                 lost_after_approach_done_dist_m: float = 1.8):
         self.scan_turn_limit = scan_turn_limit
         self.turn_step_rad = turn_step_rad
         self.reached_dist_m = reached_dist_m
         self.max_approaches = max_approaches
+        self.semantic_forward_m = semantic_forward_m
+        self.lost_after_approach_done_dist_m = lost_after_approach_done_dist_m
         self._scans = 0
         self._looked = False
         self._approaches = 0             # consecutive DRIVE_TO_VISIBLE toward this target
+        self._last_approach_start_dist = None
+
+    @staticmethod
+    def _useful_context_marks(obs: Observation) -> List[ContextMark]:
+        return [m for m in obs.context_marks
+                if (m.relevance or '').lower() in ('target_like', 'office_context', 'ambiguous')]
+
+    def _semantic_explore_action(self, obs: Observation) -> Optional[Action]:
+        useful = self._useful_context_marks(obs)
+        if not useful:
+            return None
+        best = max(useful, key=lambda m: (
+            2 if m.relevance == 'target_like' else 1 if m.relevance == 'office_context' else 0,
+            float(m.score),
+            -float(m.distance_m) if distance_is_known(m.distance_m) else -999.0,
+        ))
+        detail = 'semantic_explore: target "%s" not visible; context mark %d "%s" is %s on %s' % (
+            obs.target, best.mark_id, best.label, best.relevance, best.side)
+        if best.side == 'left':
+            return Action(TURN, turn_yaw_rad=self.turn_step_rad, rationale=detail)
+        if best.side == 'right':
+            return Action(TURN, turn_yaw_rad=-self.turn_step_rad, rationale=detail)
+        blocker = centered_forward_blocker(obs, CONTEXT_EXPLORE_MIN_CLEARANCE_M)
+        if blocker is not None:
+            return Action(TURN, turn_yaw_rad=self.turn_step_rad * 0.5,
+                          rationale=(detail + '; forward probe blocked by centered "%s" at %.2fm'
+                                     % (blocker.label, float(blocker.distance_m))))
+        return Action(DRIVE_FORWARD, forward_dist_m=self.semantic_forward_m,
+                      rationale=detail + '; move forward to inspect it')
 
     def plan(self, obs: Observation) -> Action:
         # 1) target visible.
@@ -256,50 +478,74 @@ class MockPlanner:
             best = max(matches, key=lambda c: c.score)
             self._scans = 0
             if not distance_is_known(best.distance_m):
-                if self._approaches > 0:
+                if (self._approaches > 0
+                        and self._last_approach_start_dist is not None
+                        and self._last_approach_start_dist
+                        <= self.lost_after_approach_done_dist_m):
                     self._approaches = 0
+                    self._last_approach_start_dist = None
                     return Action(DONE, rationale='target "%s" still visible after approach '
                                   'but depth is unknown -> stopping' % obs.target)
-                if not self._looked:
-                    self._looked = True
-                    return Action(DETECT_ALL, rationale='target "%s" visible but depth unknown; '
-                                  'refresh all detections' % obs.target)
-                return Action(TURN, turn_yaw_rad=self.turn_step_rad,
-                              rationale='target "%s" visible but depth unknown; change view'
-                              % obs.target)
+                self._looked = True
+                if best.side == 'left':
+                    return Action(TURN, turn_yaw_rad=TARGET_PROBE_TURN_RAD,
+                                  rationale='target "%s" visible on the left but depth unknown; '
+                                  'turn toward it' % obs.target)
+                if best.side == 'right':
+                    return Action(TURN, turn_yaw_rad=-TARGET_PROBE_TURN_RAD,
+                                  rationale='target "%s" visible on the right but depth unknown; '
+                                  'turn toward it' % obs.target)
+                return Action(DRIVE_FORWARD, forward_dist_m=TARGET_PROBE_FORWARD_M,
+                              rationale='target "%s" visible ahead but depth unknown; '
+                              'move forward cautiously to get depth' % obs.target)
             self._looked = False
             # arrived: within the RealSense reached range -> done.
             if best.distance_m <= self.reached_dist_m:
                 self._approaches = 0
+                self._last_approach_start_dist = None
                 return Action(DONE, rationale='target "%s" reached (%.2fm)'
                               % (obs.target, best.distance_m))
             # safety bound so a non-converging approach can't loop forever.
             if self._approaches >= self.max_approaches:
                 self._approaches = 0
+                self._last_approach_start_dist = None
                 return Action(DONE, rationale='target "%s" approached %dx without closing in '
                               '(%.2fm) -> stopping' % (obs.target, self.max_approaches,
                                                        best.distance_m))
             # otherwise keep driving up to it.
             self._approaches += 1
+            self._last_approach_start_dist = float(best.distance_m)
             return Action(DRIVE_TO_VISIBLE, mark_id=best.mark_id, arg_label=best.label,
                           rationale='target "%s" visible as mark %d (%.2fm)'
                           % (obs.target, best.mark_id, best.distance_m))
         # 2) not in view but we WERE just driving up to it -> at point-blank it overflows
-        #    the frame and YOLOE drops it: treat that as arrived.
+        #    the frame and YOLOE drops it: treat that as arrived only if the last
+        #    confirmed target range was already close. Far bounded approaches must
+        #    keep searching/re-observing.
         if self._approaches > 0:
+            last_dist = self._last_approach_start_dist
             self._approaches = 0
-            return Action(DONE, rationale='target reached (dropped out of frame at close range)')
-        # 3) nothing matching in view -> one broad look before scanning.
+            self._last_approach_start_dist = None
+            if (last_dist is not None
+                    and last_dist <= self.lost_after_approach_done_dist_m):
+                return Action(DONE, rationale='target reached (dropped out of frame at close range)')
+        # 3) target absent, but there are semantically useful scene cues.
+        semantic_action = self._semantic_explore_action(obs)
+        if semantic_action is not None:
+            self._looked = True
+            self._scans = 0
+            return semantic_action
+        # 4) nothing matching in view -> one broad look before blind scanning.
         if not self._looked:
             self._looked = True
             return Action(DETECT_ALL, rationale='no target in view; detect all objects')
-        # 4) rotate to bring new things into view.
+        # 5) rotate to bring new things into view.
         if self._scans < self.scan_turn_limit:
             self._scans += 1
             return Action(TURN, turn_yaw_rad=self.turn_step_rad,
-                          rationale='scan-rotate %d/%d (no target)'
+                          rationale='blind_scan: scan-rotate %d/%d (no target)'
                           % (self._scans, self.scan_turn_limit))
-        # 5) exhausted -> finish.
+        # 6) exhausted -> finish.
         return Action(DONE, rationale='no target after scanning')
 
 
@@ -312,8 +558,17 @@ def build_vlm_options(obs: Observation) -> dict:
         'actions': list(ACTION_NAMES.values()),
         'visible_marks': [{'mark_id': c.mark_id, 'label': c.label,
                            'score': round(c.score, 3),
-                           'distance_m': distance_for_options(c.distance_m)}
+                           'distance_m': distance_for_options(c.distance_m),
+                           'side': c.side,
+                           'center_x_norm': round(float(c.center_x_norm), 3)}
                           for c in obs.candidates],
+        'context_marks': [{'mark_id': c.mark_id, 'label': c.label,
+                           'score': round(c.score, 3),
+                           'distance_m': distance_for_options(c.distance_m),
+                           'side': c.side,
+                           'center_x_norm': round(float(c.center_x_norm), 3),
+                           'relevance': c.relevance}
+                          for c in obs.context_marks],
         'notes': obs.notes_facts,
         'step_index': obs.step_index,
     }
@@ -333,6 +588,13 @@ def parse_vlm_action(resp: dict, obs: Observation) -> Tuple[Optional[Action], st
     if not isinstance(resp, dict):
         return None, 'response is not an object'
     name = str(resp.get('action', '')).strip().upper()
+    if name == 'TARGET_PROBE':
+        mark_id = int(resp.get('mark_id', 0) or 0)
+        repaired = target_probe_action(obs, mark_id=mark_id,
+                                       rationale=str(resp.get('rationale', '') or ''))
+        if repaired is not None:
+            return repaired, 'OK'
+        return None, 'TARGET_PROBE requires a visible target mark with unknown distance'
     if name not in ACTION_KINDS:
         return None, 'unknown action %r' % name
     act = Action(
@@ -343,6 +605,12 @@ def parse_vlm_action(resp: dict, obs: Observation) -> Tuple[Optional[Action], st
         arg_label=str(resp.get('arg_label', '') or ''),
         rationale=str(resp.get('rationale', '') or ''),
     )
+    repaired = context_mark_to_semantic_explore(act, obs)
+    if repaired is not None:
+        return repaired, 'OK'
+    repaired = unknown_depth_target_to_probe(act, obs)
+    if repaired is not None:
+        return repaired, 'OK'
     ok, reason = validate_action(act, obs)
     if not ok:
         return None, reason

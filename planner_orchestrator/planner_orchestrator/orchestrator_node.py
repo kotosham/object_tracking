@@ -33,7 +33,7 @@ from concurrent.futures import ThreadPoolExecutor
 # A plan plus the candidate pixel map captured at planning time, so DRIVE_TO_VISIBLE
 # resolves mark_id->pixel against the SAME observation the VLM chose from -- even
 # while a concurrent replan is already overwriting the live candidate state.
-_PlanBundle = namedtuple('_PlanBundle', 'actions pixels')
+_PlanBundle = namedtuple('_PlanBundle', 'actions pixels obs')
 
 import rclpy
 from rclpy.action import ActionClient
@@ -60,9 +60,10 @@ from ar_project_msgs.msg import Heartbeat
 from fleet_comms.heartbeat import HeartbeatPublisher
 from planner_orchestrator import orchestration as orch
 from planner_orchestrator.planner_logic import (
-    Candidate, CircuitBreaker, DegradationLatch, NotesBuffer, Observation,
-    DETECT_ALL, DRIVE_FORWARD, DRIVE_TO_VISIBLE, TURN, distance_for_options,
-    distance_is_known, format_distance,
+    Candidate, CircuitBreaker, ContextMark, DegradationLatch, NotesBuffer, Observation,
+    DETECT_ALL, DRIVE_FORWARD, DRIVE_TO_VISIBLE, TURN, context_relevance_for,
+    context_mark_promotable_to_target, distance_for_options, distance_is_known,
+    format_distance, image_side,
 )
 from planner_orchestrator.vlm_client import make_client
 
@@ -105,6 +106,15 @@ class PlannerOrchestrator(Node):
         self.declare_parameter('turn_step_rad', 0.6)
         self.declare_parameter('forward_step_m', 0.5)
         self.declare_parameter('approach_offset', 0.58)
+        # Mirrors the Pi-side ApproachDetection default. If the visual target is
+        # farther than offset + this step, a successful DRIVE_TO_VISIBLE means an
+        # intermediate bounded approach, not final target arrival.
+        self.declare_parameter('approach_max_goal_step_m', 1.6)
+        # Once a final ApproachDetection reports SUCCEEDED, stop the VLM mission
+        # instead of replanning on a close-range frame where depth often becomes
+        # unknown and the target may overflow the camera. Long-range bounded
+        # approaches keep the mission alive.
+        self.declare_parameter('finish_on_approach_success', True)
         self.declare_parameter('max_steps', 60)
         self.declare_parameter('map_frame', 'map')
         self.declare_parameter('robot_frame', 'base_link')
@@ -136,7 +146,18 @@ class PlannerOrchestrator(Node):
         # the diploma tracker (DINO strict for target, YOLOE permissive for overview).
         self.declare_parameter('detect_conf', 0.0)
         self.declare_parameter('target_detect_conf', 0.50)
-        self.declare_parameter('detect_all_conf', 0.12)
+        self.declare_parameter('detect_all_conf', 0.08)
+        # When the target detector returns no candidates, run a broad-vocab context
+        # pass so the VLM can reason "office furniture is on the left" instead of
+        # falling straight into a blind scan.
+        self.declare_parameter('auto_context_when_target_absent', True)
+        self.declare_parameter('context_detect_conf', 0.25)
+        self.declare_parameter('context_target_promote_conf', 0.35)
+        self.declare_parameter(
+            'office_context_query',
+            'desk | table | drawer cabinet | cabinet | file cabinet | bookshelf | shelf | '
+            'office chair | chair | monitor | keyboard | laptop | printer')
+        self.declare_parameter('camera_image_width', 640)
         self.declare_parameter('camera_frame', 'camera_color_optical_frame')
         self.declare_parameter('subscribe_camera_image', True)
         self.declare_parameter('camera_image_topic', '/camera/camera/color/image_raw')
@@ -151,6 +172,9 @@ class PlannerOrchestrator(Node):
         self.turn_step = float(g('turn_step_rad'))
         self.fwd_step = float(g('forward_step_m'))
         self.approach_offset = float(g('approach_offset'))
+        self.approach_max_goal_step_m = float(g('approach_max_goal_step_m'))
+        self.finish_on_approach_success = bool(g('finish_on_approach_success'))
+        self._last_approach_result = None
         self.max_steps = int(g('max_steps'))
         self.map_frame = g('map_frame')
         self.robot_frame = g('robot_frame')
@@ -163,6 +187,11 @@ class PlannerOrchestrator(Node):
         self.detect_conf = float(g('detect_conf'))
         self.target_detect_conf = float(g('target_detect_conf'))
         self.detect_all_conf = float(g('detect_all_conf'))
+        self.auto_context_when_target_absent = bool(g('auto_context_when_target_absent'))
+        self.context_detect_conf = float(g('context_detect_conf'))
+        self.context_target_promote_conf = float(g('context_target_promote_conf'))
+        self.office_context_query = str(g('office_context_query'))
+        self.camera_image_width = max(1, int(g('camera_image_width')))
         if self.detect_conf > 0.0:
             self.target_detect_conf = self.detect_conf
             self.detect_all_conf = self.detect_conf
@@ -329,8 +358,17 @@ class PlannerOrchestrator(Node):
         CONSISTENT (candidate ids, camera image) pair even while the camera/replan
         threads run; the top-down SLAM map is rendered alongside (or None)."""
         cands, pixels, jpeg = self._refresh_candidates(target)
+        context_marks = []
+        if not cands and self.auto_context_when_target_absent:
+            context_marks, context_jpeg, promoted_cands, promoted_pixels = self._detect_context(target)
+            if promoted_cands:
+                cands = promoted_cands
+                pixels = promoted_pixels
+            if context_jpeg:
+                jpeg = context_jpeg
         map_jpeg, map_text = self._render_map()
         obs = Observation(target=target, candidates=cands,
+                          context_marks=context_marks,
                           notes_facts=self.notes.facts, step_index=step_index,
                           map_text=map_text)
         return obs, pixels, jpeg, map_jpeg
@@ -350,12 +388,8 @@ class PlannerOrchestrator(Node):
             g.conf_threshold = self.target_detect_conf
             res = self._call_action(self._detect, g, self.detect_timeout_s)
             if res is not None and getattr(res, 'candidates', None):
-                cands, pix = [], {}
-                for c in res.candidates:
-                    cands.append(Candidate(mark_id=int(c.mark_id), label=c.label,
-                                           score=float(c.confidence),
-                                           distance_m=float(c.pixel.z)))  # z = depth_m
-                    pix[int(c.mark_id)] = c.pixel    # Point: x=u, y=v, z=depth_m
+                cands, pix = self._candidates_and_pixels_from_detect_candidates(
+                    res.candidates)
                 jpeg = bytes(res.annotated.data) if res.annotated.data else self._camera_jpeg()
                 # Dashboard view: what the robot sees + the mark ids offered to the VLM.
                 self._publish_view(self._setofmark_pub, jpeg)
@@ -370,6 +404,29 @@ class PlannerOrchestrator(Node):
         # orchestrator also run against the continuous rgb_tracker instead of the service).
         return self._fallback_candidates(target)
 
+    def _candidates_and_pixels_from_detect_candidates(self, candidates):
+        cands, pix = [], {}
+        for c in candidates or []:
+            bbox = getattr(c, 'bbox', None)
+            if bbox is not None and int(getattr(bbox, 'width', 0) or 0) > 0:
+                center_x = float(bbox.x_offset) + float(bbox.width) / 2.0
+            else:
+                center_x = float(getattr(getattr(c, 'pixel', None), 'x',
+                                         self.camera_image_width / 2.0))
+            center_x_norm = max(0.0, min(1.0, center_x / float(self.camera_image_width)))
+            pixel = getattr(c, 'pixel', None)
+            distance_m = float(getattr(pixel, 'z', 0.0) or 0.0)
+            mark_id = int(getattr(c, 'mark_id', 0) or 0)
+            cands.append(Candidate(mark_id=mark_id,
+                                   label=str(getattr(c, 'label', '') or ''),
+                                   score=float(getattr(c, 'confidence', 0.0) or 0.0),
+                                   distance_m=distance_m,
+                                   side=image_side(center_x_norm),
+                                   center_x_norm=center_x_norm))
+            if pixel is not None:
+                pix[mark_id] = pixel    # Point: x=u, y=v, z=depth_m
+        return cands, pix
+
     def _fallback_candidates(self, target):
         with self._lock:
             px = self._pixel
@@ -378,6 +435,105 @@ class PlannerOrchestrator(Node):
             return ([Candidate(mark_id=1, label=target, score=1.0,
                                distance_m=float(px.point.z))], {1: px.point}, jpeg)
         return [], {}, jpeg
+
+    def _context_marks_from_candidates(self, target, candidates):
+        """Convert broad-vocab detector results into scene-context marks for the
+        VLM. These marks are not valid DRIVE_TO_VISIBLE targets; they only explain
+        what kind of area is visible and on which side of the camera frame."""
+        out = []
+        for c in candidates or []:
+            bbox = getattr(c, 'bbox', None)
+            if bbox is not None and int(getattr(bbox, 'width', 0) or 0) > 0:
+                center_x = float(bbox.x_offset) + float(bbox.width) / 2.0
+            else:
+                center_x = float(getattr(getattr(c, 'pixel', None), 'x', self.camera_image_width / 2.0))
+            center_x_norm = max(0.0, min(1.0, center_x / float(self.camera_image_width)))
+            distance_m = float(getattr(getattr(c, 'pixel', None), 'z', 0.0) or 0.0)
+            label = str(getattr(c, 'label', '') or '')
+            out.append(ContextMark(
+                mark_id=int(getattr(c, 'mark_id', 0) or 0),
+                label=label,
+                score=float(getattr(c, 'confidence', 0.0) or 0.0),
+                distance_m=distance_m,
+                side=image_side(center_x_norm),
+                center_x_norm=center_x_norm,
+                relevance=context_relevance_for(target, label),
+            ))
+        return out
+
+    def _context_brief(self, mark):
+        return '%d:%s(%.2f@%s,%s,%s)' % (
+            mark.mark_id, mark.label, mark.score,
+            format_distance(mark.distance_m), mark.side, mark.relevance)
+
+    @staticmethod
+    def _use_office_context(target):
+        t = (target or '').strip().lower()
+        return any(term in t for term in (
+            'office', 'chair', 'desk', 'table', 'cabinet', 'drawer', 'shelf',
+            'bookcase', 'monitor', 'keyboard', 'laptop', 'printer'))
+
+    def _context_query_for_target(self, target):
+        if self._use_office_context(target):
+            return (self.office_context_query or '').strip()
+        return ''
+
+    def _detect_context(self, target):
+        """Automatic context pass used only when the final target is absent. It
+        gives the VLM semantic search cues such as 'desk on the left' without
+        pretending those context objects are final approach targets."""
+        if not self._detect.wait_for_server(timeout_sec=1.0):
+            return [], None, [], {}
+        g = DetectTarget.Goal()
+        g.request_id = self._goal_id()
+        g.mission_epoch = self._epoch
+        g.query = self._context_query_for_target(target)
+        g.render_setofmark = True
+        g.conf_threshold = self.context_detect_conf if g.query else self.detect_all_conf
+        res = self._call_action(self._detect, g, self.detect_timeout_s)
+        cands = getattr(res, 'candidates', None) if res is not None else None
+        jpeg = None
+        if getattr(res, 'annotated', None) is not None and res.annotated.data:
+            jpeg = bytes(res.annotated.data)
+            self._publish_view(self._setofmark_pub, jpeg)
+        marks = self._context_marks_from_candidates(target, cands)
+        det_cands, det_pixels = self._candidates_and_pixels_from_detect_candidates(cands)
+        promotable_ids = {
+            int(m.mark_id) for m in marks
+            if context_mark_promotable_to_target(
+                target, m, self.context_target_promote_conf)
+        }
+        promoted = [c for c in det_cands if int(c.mark_id) in promotable_ids]
+        promoted_pixels = {
+            int(mark_id): point for mark_id, point in det_pixels.items()
+            if int(mark_id) in promotable_ids
+        }
+        if marks:
+            backend = 'dino_office' if g.query else 'yoloe_all'
+            self.get_logger().info('context_detect[%s]: %d object(s): %s' % (
+                backend, len(marks), ', '.join(self._context_brief(m) for m in marks)))
+        if promoted:
+            self.get_logger().info(
+                'context_promote: %d target-like context object(s) promoted to candidates: %s'
+                % (len(promoted), ', '.join(
+                    '%d:%s(%.2f@%s,%s)' % (
+                        c.mark_id, c.label, c.score,
+                        format_distance(c.distance_m), c.side)
+                    for c in promoted)))
+        self._activity(
+            'context_detect',
+            backend='dino_office' if g.query else 'yoloe_all',
+            objects=[{'mark_id': m.mark_id, 'label': m.label,
+                      'score': round(float(m.score), 2),
+                      'distance_m': distance_for_options(m.distance_m),
+                      'side': m.side, 'relevance': m.relevance}
+                     for m in marks],
+            promoted=[{'mark_id': c.mark_id, 'label': c.label,
+                       'score': round(float(c.score), 2),
+                       'distance_m': distance_for_options(c.distance_m),
+                       'side': c.side}
+                      for c in promoted])
+        return marks, jpeg, promoted, promoted_pixels
 
     def _lookup_robot_pose(self, target_frame, timeout_s=0.0):
         try:
@@ -483,11 +639,15 @@ class PlannerOrchestrator(Node):
             self._activity('degraded', step=step,
                            detail='VLM circuit-breaker OPEN -> continuing in FLAT fallback')
         best = max(obs.candidates, key=lambda c: c.score, default=None)
+        best_context = max(obs.context_marks, key=lambda c: c.score, default=None)
         det = ('' if best is None else " best='%s' conf=%.2f @%s"
                % (best.label, best.score, format_distance(best.distance_m)))
+        ctx = ('' if best_context is None else " context=%d best_context='%s' %s %.2f @%s"
+               % (len(obs.context_marks), best_context.label, best_context.side,
+                  best_context.score, format_distance(best_context.distance_m)))
         self.get_logger().info(
-            'observe@step %d: %d detection(s)%s, notes=%d, map=%s -> asking %s'
-            % (step, len(obs.candidates), det, len(obs.notes_facts),
+            'observe@step %d: %d target detection(s)%s%s, notes=%d, map=%s -> asking %s'
+            % (step, len(obs.candidates), det, ctx, len(obs.notes_facts),
                'yes' if map_jpeg else 'no', type(client).__name__))
         self._activity(
             'observe', step=step, n_detections=len(obs.candidates),
@@ -495,6 +655,11 @@ class PlannerOrchestrator(Node):
                          'score': round(float(c.score), 3),
                          'distance_m': distance_for_options(c.distance_m)}
                         for c in obs.candidates],
+            context_marks=[{'mark_id': c.mark_id, 'label': c.label,
+                            'score': round(float(c.score), 3),
+                            'distance_m': distance_for_options(c.distance_m),
+                            'side': c.side, 'relevance': c.relevance}
+                           for c in obs.context_marks],
             notes=len(obs.notes_facts), map='yes' if map_jpeg else 'no',
             client=type(client).__name__)
         vlm_t0 = time.monotonic()
@@ -508,6 +673,7 @@ class PlannerOrchestrator(Node):
                 'plan', step=step,
                 latency_ms=round((time.monotonic() - vlm_t0) * 1e3, 1),
                 actions=[{'action': self._action_brief(a),
+                          'role': self._action_role(a, obs),
                           'rationale': a.rationale or ''} for a in actions])
         except Exception as e:
             self.cb.record_failure()
@@ -521,7 +687,7 @@ class PlannerOrchestrator(Node):
         self.heartbeat.set_status(
             Heartbeat.DEGRADED if (self.cb.is_open or self._degrade.degraded)
             else Heartbeat.OK)
-        return _PlanBundle(actions, pixels)
+        return _PlanBundle(actions, pixels, obs)
 
     def _next_bundle(self, pending, target, step):
         """Adopt the concurrently-computed plan at the commit-point (no idle if it
@@ -530,7 +696,7 @@ class PlannerOrchestrator(Node):
             try:
                 return pending.result()
             except Exception:
-                return _PlanBundle([], {})
+                return _PlanBundle([], {}, None)
         return self._compute_plan(target, step)
 
     def _run_mission(self, target):
@@ -560,10 +726,12 @@ class PlannerOrchestrator(Node):
                     continue
                 terminate = False
                 for i, action in enumerate(bundle.actions):
-                    self.get_logger().info('step %d: %s -- %s'
-                                           % (step, self._action_brief(action),
+                    role = self._action_role(action, bundle.obs)
+                    self.get_logger().info('step %d [%s]: %s -- %s'
+                                           % (step, role, self._action_brief(action),
                                               action.rationale or ''))
                     self._activity('step_start', step=step,
+                                   role=role,
                                    action=self._action_brief(action),
                                    rationale=action.rationale or '')
                     if orch.is_terminal(action.kind):       # DONE
@@ -578,7 +746,7 @@ class PlannerOrchestrator(Node):
                                                       self.async_replan, pending is not None):
                         pending = self._planner_pool.submit(self._compute_plan, target, step + 1)
                     t0 = time.monotonic()
-                    ok = self._dispatch(action, bundle.pixels)
+                    ok = self._dispatch(action, bundle.pixels, target)
                     self.notes.add_fact('%s%s -> %s' % (
                         action.name,
                         (' ' + action.rationale) if action.rationale else '',
@@ -589,6 +757,16 @@ class PlannerOrchestrator(Node):
                                    duration_s=round(time.monotonic() - t0, 2))
                     self._publish_notes(target)
                     step += 1
+                    if ok and action.kind == DRIVE_TO_VISIBLE and self._approach_can_auto_finish(
+                            action, bundle.obs):
+                        self.get_logger().info(
+                            'target approach succeeded -> finishing mission at last confirmed '
+                            'approach pose')
+                        self._activity(
+                            'auto_done', step=step, target=target,
+                            reason='DRIVE_TO_VISIBLE succeeded; final approach pose reached')
+                        terminate = True
+                        break
                     dt = time.monotonic() - t0
                     if dt < self.min_step_s:      # don't hammer on instant-reached skills
                         time.sleep(self.min_step_s - dt)
@@ -628,7 +806,72 @@ class PlannerOrchestrator(Node):
             return 'DRIVE_TO_VISIBLE mark=%d' % a.mark_id
         return a.name
 
-    def _dispatch(self, action, cand_pixels):
+    @staticmethod
+    def _action_role(action, obs):
+        """Human-readable intent class for logs/dashboard."""
+        if action.kind == DRIVE_TO_VISIBLE:
+            return 'target_approach'
+        if action.kind in (TURN, DRIVE_FORWARD):
+            rationale = (action.rationale or '').lower()
+            useful_context = bool(
+                obs and any((m.relevance or '').lower() in
+                            ('target_like', 'office_context', 'ambiguous')
+                            for m in obs.context_marks))
+            if 'semantic_explore' in rationale or useful_context:
+                return 'semantic_explore'
+            return 'blind_scan'
+        if action.kind == DETECT_ALL:
+            return 'blind_scan'
+        if orch.is_terminal(action.kind):
+            return 'done'
+        return 'other'
+
+    def _approach_can_auto_finish(self, action, obs):
+        """Only final, not bounded, ApproachDetection success should end a mission.
+
+        The Pi clamps far visual targets to short Nav2 segments so online SLAM and
+        costmaps can grow. Reaching that segment is progress, not arrival.
+        """
+        if not self.finish_on_approach_success:
+            return False
+        res = self._last_approach_result
+        final_distance = getattr(res, 'final_distance_m', float('nan'))
+        if distance_is_known(final_distance):
+            final_threshold = self.approach_offset + 0.35
+            if float(final_distance) <= final_threshold:
+                return True
+            self.get_logger().info(
+                'intermediate target approach succeeded with %.2fm still expected '
+                'to target (final threshold %.2fm) -> continuing mission'
+                % (float(final_distance), final_threshold))
+            self._activity(
+                'step_progress', action=self._action_brief(action),
+                result='intermediate_approach',
+                final_distance_m=round(float(final_distance), 2),
+                final_threshold_m=round(final_threshold, 2))
+            return False
+        if obs is None:
+            return True
+        cand = next((c for c in obs.candidates
+                     if int(c.mark_id) == int(action.mark_id)), None)
+        if cand is None or not distance_is_known(cand.distance_m):
+            return True
+        auto_finish_threshold = (
+            self.approach_offset + max(0.0, self.approach_max_goal_step_m) + 0.05)
+        if float(cand.distance_m) <= auto_finish_threshold:
+            return True
+        self.get_logger().info(
+            'intermediate target approach succeeded at start distance %.2fm '
+            '(auto-finish threshold %.2fm) -> continuing mission'
+            % (float(cand.distance_m), auto_finish_threshold))
+        self._activity(
+            'step_progress', action=self._action_brief(action),
+            result='intermediate_approach',
+            start_distance_m=round(float(cand.distance_m), 2),
+            auto_finish_threshold_m=round(auto_finish_threshold, 2))
+        return False
+
+    def _dispatch(self, action, cand_pixels, target=''):
         if action.kind in (TURN, DRIVE_FORWARD):
             pose = self._motion_pose()
             if pose is None:
@@ -642,7 +885,7 @@ class PlannerOrchestrator(Node):
         if action.kind == DRIVE_TO_VISIBLE:
             return self._send_approach_mark(action.mark_id, action.arg_label, cand_pixels)
         if action.kind == DETECT_ALL:
-            return self._do_detect_all()
+            return self._do_detect_all(target)
         return False
 
     def _goal_id(self):
@@ -671,7 +914,8 @@ class PlannerOrchestrator(Node):
         g.target_label = label or ''
         g.approach_offset = self.approach_offset
         g.max_pixel_age_s = 1.5
-        return self._send_and_wait(orch.SKILL_APPROACH, g)
+        self._last_approach_result = self._send_and_wait_result(orch.SKILL_APPROACH, g)
+        return getattr(self._last_approach_result, 'outcome', None) == 0
 
     def _send_approach_mark(self, mark_id, label, cand_pixels):
         """DRIVE_TO_VISIBLE(mark_id): inject the chosen candidate's pixel onto
@@ -726,7 +970,7 @@ class PlannerOrchestrator(Node):
             return None
         return getattr(res_box.get('res'), 'result', None)
 
-    def _do_detect_all(self):
+    def _do_detect_all(self, target=''):
         """DETECT_ALL: run the detector over a broad object vocabulary (empty query =>
         detect-all on the server) and record what is in view -- objects + their
         classes -- into the notes the VLM reads next replan. Perception only; the
@@ -748,13 +992,17 @@ class PlannerOrchestrator(Node):
             return False
         if getattr(res, 'annotated', None) is not None and res.annotated.data:
             self._publish_view(self._setofmark_pub, bytes(res.annotated.data))
-        seen = ', '.join('%s(%.2f)' % (c.label, c.confidence) for c in cands)
+        marks = self._context_marks_from_candidates(target, cands)
+        seen = ', '.join('%s(%.2f,%s,%s)' % (
+            m.label, m.score, m.side, m.relevance) for m in marks)
         self.notes.add_fact('objects in view: ' + seen)
         self.get_logger().info('DETECT_ALL: %d object(s): %s' % (len(cands), seen))
         self._activity('detect_all',
-                       objects=[{'label': c.label,
-                                 'score': round(float(c.confidence), 2)}
-                                for c in cands])
+                       objects=[{'mark_id': m.mark_id, 'label': m.label,
+                                 'score': round(float(m.score), 2),
+                                 'distance_m': distance_for_options(m.distance_m),
+                                 'side': m.side, 'relevance': m.relevance}
+                                for m in marks])
         return True
 
     def _dispatch_stop(self):
@@ -767,10 +1015,16 @@ class PlannerOrchestrator(Node):
     def _send_and_wait(self, skill, goal):
         """Send a skill goal and block (in the worker thread) for the result,
         using events set by the executor-thread done-callbacks (loopback-safe)."""
+        res = self._send_and_wait_result(skill, goal)
+        outcome = getattr(res, 'outcome', None)
+        return outcome == 0   # 0 == SUCCEEDED across the skill results
+
+    def _send_and_wait_result(self, skill, goal):
+        """Like _send_and_wait(), but returns the action result object."""
         ac = self._ac[skill]
         if not ac.wait_for_server(timeout_sec=self.skill_wait_s):
             self.get_logger().warn('skill %s server unavailable' % skill)
-            return False
+            return None
         gh_box = {}
         gh_evt = threading.Event()
 
@@ -780,7 +1034,7 @@ class PlannerOrchestrator(Node):
         ac.send_goal_async(goal).add_done_callback(_gh_cb)
         if not gh_evt.wait(self.skill_wait_s) or gh_box.get('gh') is None or not gh_box['gh'].accepted:
             self.get_logger().warn('skill %s goal not accepted' % skill)
-            return False
+            return None
         res_box = {}
         res_evt = threading.Event()
 
@@ -790,10 +1044,9 @@ class PlannerOrchestrator(Node):
         gh_box['gh'].get_result_async().add_done_callback(_res_cb)
         if not res_evt.wait(self.result_timeout_s):
             self.get_logger().warn('skill %s result timeout' % skill)
-            return False
+            return None
         res = res_box.get('res')
-        outcome = getattr(getattr(res, 'result', None), 'outcome', None)
-        return outcome == 0   # 0 == SUCCEEDED across the skill results
+        return getattr(res, 'result', None)
 
     def _publish_notes(self, target):
         m = Notes()

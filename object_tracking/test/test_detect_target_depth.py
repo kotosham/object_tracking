@@ -100,11 +100,24 @@ def test_yoloe_mode_uses_one_backend_for_target_and_detect_all(monkeypatch):
     assert vocab is sentinel
 
 
-def test_detector_uses_split_diploma_confidence_defaults():
+def test_detector_uses_split_target_and_context_confidence_defaults():
     srv = DetectTargetServer.__new__(DetectTargetServer)
     srv.target_conf_default = 0.50
-    srv.vocab_conf_default = 0.12
+    srv.vocab_conf_default = 0.08
 
     assert srv._conf_for_query("drawer cabinet", 0.0) == pytest.approx(0.50)
-    assert srv._conf_for_query("", 0.0) == pytest.approx(0.12)
+    assert srv._conf_for_query("", 0.0) == pytest.approx(0.08)
     assert srv._conf_for_query("drawer cabinet", 0.35) == pytest.approx(0.35)
+
+
+def test_dino_output_label_deduplicates_overlapping_prompt_terms():
+    dino_mod = pytest.importorskip("object_tracking.dino_mobilesam_image_segmentation")
+    segmentor = dino_mod.GroundingDINOMobileSAMSegmentor
+
+    label = segmentor._clean_output_label(
+        "office chair chair",
+        ["desk", "office chair", "chair"],
+        "office chair",
+    )
+
+    assert label == "office chair"

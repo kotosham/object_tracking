@@ -54,7 +54,7 @@ class DetectTargetServer(Node):
         self.declare_parameter('model_mode', 'yoloe')
         self.declare_parameter('conf_default', -1.0)  # legacy override for both paths
         self.declare_parameter('target_conf_default', 0.50)
-        self.declare_parameter('vocab_conf_default', 0.12)
+        self.declare_parameter('vocab_conf_default', 0.08)
         self.declare_parameter('min_mask_area', 200)
         self.declare_parameter('max_marks', 9)           # Set-of-Mark legibility cap
         self.declare_parameter('jpeg_quality', 80)
