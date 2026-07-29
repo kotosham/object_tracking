@@ -57,6 +57,7 @@ class Candidate:
     distance_m: float = 0.0
     side: str = 'center'                 # left / center / right in the camera image
     center_x_norm: float = 0.5
+    source: str = 'target'               # target / context_promoted / fallback
 
 
 @dataclass(frozen=True)
@@ -161,6 +162,35 @@ def centered_forward_blocker(obs: Observation,
     if not blockers:
         return None
     return min(blockers, key=lambda m: float(m.distance_m))
+
+
+def useful_context_marks(obs: Observation) -> List['ContextMark']:
+    return [
+        m for m in obs.context_marks
+        if (m.relevance or '').lower() in ('target_like', 'office_context', 'ambiguous')
+    ]
+
+
+def best_context_mark(obs: Observation) -> Optional['ContextMark']:
+    useful = useful_context_marks(obs)
+    if not useful:
+        return None
+    return max(useful, key=lambda m: (
+        2 if m.relevance == 'target_like' else 1 if m.relevance == 'office_context' else 0,
+        float(m.score),
+        -float(m.distance_m) if distance_is_known(m.distance_m) else -999.0,
+    ))
+
+
+def best_directional_context_mark(obs: Observation) -> Optional['ContextMark']:
+    directional = [m for m in useful_context_marks(obs) if m.side in ('left', 'right')]
+    if not directional:
+        return None
+    return max(directional, key=lambda m: (
+        2 if m.relevance == 'target_like' else 1 if m.relevance == 'office_context' else 0,
+        float(m.score),
+        -float(m.distance_m) if distance_is_known(m.distance_m) else -999.0,
+    ))
 
 
 @dataclass(frozen=True)
@@ -309,6 +339,107 @@ def target_probe_action(obs: Observation, mark_id: int = 0,
         obs)
 
 
+def context_forward_to_directional_explore(action: Action, obs: Observation) -> Optional[Action]:
+    """If the target is absent but semantic context exists, do not let the VLM
+    default to a vague forward probe. First turn toward the strongest contextual
+    side so the run is explainable: "office furniture is there -> inspect there".
+    """
+    if action.kind != DRIVE_FORWARD:
+        return None
+    if obs.candidates:
+        return None
+    best = best_context_mark(obs)
+    if best is None:
+        return None
+    base = ('semantic_explore: target "%s" not visible; replacing forward probe '
+            'with inspection of context mark %d "%s" (%s on %s)'
+            % (obs.target, best.mark_id, best.label, best.relevance, best.side))
+    if action.rationale:
+        base += '; original rationale: ' + action.rationale
+    if best.side == 'left':
+        return Action(TURN, turn_yaw_rad=CONTEXT_EXPLORE_TURN_RAD,
+                      arg_label=best.label, rationale=base)
+    if best.side == 'right':
+        return Action(TURN, turn_yaw_rad=-CONTEXT_EXPLORE_TURN_RAD,
+                      arg_label=best.label, rationale=base)
+
+    blocker = centered_forward_blocker(obs)
+    if blocker is not None:
+        return Action(TURN, turn_yaw_rad=CONTEXT_EXPLORE_TURN_RAD * 0.5,
+                      arg_label=best.label,
+                      rationale=(base + '; forward probe blocked by centered "%s" at %.2fm'
+                                 % (blocker.label, float(blocker.distance_m))))
+    return None
+
+
+def context_turn_to_directional_explore(action: Action, obs: Observation) -> Optional[Action]:
+    """Normalize weak or wrong-way VLM turns when semantic context already says
+    which side is worth inspecting. This prevents many tiny 10-degree "nudges"
+    that look like the robot is doing nothing.
+    """
+    if action.kind != TURN:
+        return None
+    if obs.candidates:
+        return None
+    best = best_directional_context_mark(obs)
+    if best is None:
+        return None
+    desired = (CONTEXT_EXPLORE_TURN_RAD if best.side == 'left'
+               else -CONTEXT_EXPLORE_TURN_RAD)
+    same_direction = float(action.turn_yaw_rad) * desired > 0.0
+    if same_direction and abs(float(action.turn_yaw_rad)) >= CONTEXT_EXPLORE_TURN_RAD * 0.75:
+        return None
+    base = ('semantic_explore: target "%s" not visible; normalizing turn toward '
+            'context mark %d "%s" (%s on %s)'
+            % (obs.target, best.mark_id, best.label, best.relevance, best.side))
+    if action.rationale:
+        base += '; original rationale: ' + action.rationale
+    return Action(TURN, turn_yaw_rad=desired, arg_label=best.label, rationale=base)
+
+
+def premature_done_to_continue(action: Action, obs: Observation) -> Optional[Action]:
+    """DONE is allowed only when a strict target candidate is currently close.
+
+    A VLM often says DONE after a failed/probing context approach because "no more
+    useful information" is visible. That is unsafe for the real robot: absence of
+    a strict target means keep searching, not finish.
+    """
+    if action.kind != DONE:
+        return None
+    strict = [
+        c for c in obs.candidates
+        if (c.source or '') == 'target'
+        and _label_matches(obs.target, c.label)
+        and distance_is_known(c.distance_m)
+    ]
+    if strict:
+        closest = min(strict, key=lambda c: float(c.distance_m))
+        if float(closest.distance_m) <= 0.8:
+            return None
+
+    best = best_context_mark(obs)
+    base = ('done_guard: target "%s" is not confirmed by a close strict detection; '
+            'continuing search instead of DONE' % obs.target)
+    if action.rationale:
+        base += '; original rationale: ' + action.rationale
+    if best is None:
+        return Action(DETECT_ALL, rationale=base + '; refresh detections')
+    if best.side == 'left':
+        return Action(TURN, turn_yaw_rad=CONTEXT_EXPLORE_TURN_RAD,
+                      arg_label=best.label, rationale=base)
+    if best.side == 'right':
+        return Action(TURN, turn_yaw_rad=-CONTEXT_EXPLORE_TURN_RAD,
+                      arg_label=best.label, rationale=base)
+    blocker = centered_forward_blocker(obs)
+    if blocker is not None:
+        return Action(TURN, turn_yaw_rad=CONTEXT_EXPLORE_TURN_RAD * 0.5,
+                      arg_label=best.label,
+                      rationale=(base + '; forward probe blocked by centered "%s" at %.2fm'
+                                 % (blocker.label, float(blocker.distance_m))))
+    return Action(DRIVE_FORWARD, forward_dist_m=CONTEXT_EXPLORE_FORWARD_M,
+                  arg_label=best.label, rationale=base + '; centered context, probe forward')
+
+
 class ReplanScheduler:
     """Replan every N executed atomic steps (Phase 4, user spec: N=2..3 default 3)."""
 
@@ -443,20 +574,10 @@ class MockPlanner:
         self._approaches = 0             # consecutive DRIVE_TO_VISIBLE toward this target
         self._last_approach_start_dist = None
 
-    @staticmethod
-    def _useful_context_marks(obs: Observation) -> List[ContextMark]:
-        return [m for m in obs.context_marks
-                if (m.relevance or '').lower() in ('target_like', 'office_context', 'ambiguous')]
-
     def _semantic_explore_action(self, obs: Observation) -> Optional[Action]:
-        useful = self._useful_context_marks(obs)
-        if not useful:
+        best = best_context_mark(obs)
+        if best is None:
             return None
-        best = max(useful, key=lambda m: (
-            2 if m.relevance == 'target_like' else 1 if m.relevance == 'office_context' else 0,
-            float(m.score),
-            -float(m.distance_m) if distance_is_known(m.distance_m) else -999.0,
-        ))
         detail = 'semantic_explore: target "%s" not visible; context mark %d "%s" is %s on %s' % (
             obs.target, best.mark_id, best.label, best.relevance, best.side)
         if best.side == 'left':
@@ -560,7 +681,8 @@ def build_vlm_options(obs: Observation) -> dict:
                            'score': round(c.score, 3),
                            'distance_m': distance_for_options(c.distance_m),
                            'side': c.side,
-                           'center_x_norm': round(float(c.center_x_norm), 3)}
+                           'center_x_norm': round(float(c.center_x_norm), 3),
+                           'source': c.source}
                           for c in obs.candidates],
         'context_marks': [{'mark_id': c.mark_id, 'label': c.label,
                            'score': round(c.score, 3),
@@ -609,6 +731,15 @@ def parse_vlm_action(resp: dict, obs: Observation) -> Tuple[Optional[Action], st
     if repaired is not None:
         return repaired, 'OK'
     repaired = unknown_depth_target_to_probe(act, obs)
+    if repaired is not None:
+        return repaired, 'OK'
+    repaired = context_forward_to_directional_explore(act, obs)
+    if repaired is not None:
+        return repaired, 'OK'
+    repaired = context_turn_to_directional_explore(act, obs)
+    if repaired is not None:
+        return repaired, 'OK'
+    repaired = premature_done_to_continue(act, obs)
     if repaired is not None:
         return repaired, 'OK'
     ok, reason = validate_action(act, obs)

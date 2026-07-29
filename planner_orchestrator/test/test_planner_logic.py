@@ -183,11 +183,73 @@ def test_parse_accepts_target_probe_pseudo_action():
     assert 'target_probe' in a.rationale
 
 
+def test_parse_repairs_context_forward_to_directional_turn():
+    obs = Observation(
+        target='office chair',
+        context_marks=[
+            ContextMark(1, 'drawer cabinet', 0.40, distance_m=2.2,
+                        side='center', center_x_norm=0.5,
+                        relevance='office_context'),
+            ContextMark(8, 'office chair', 0.30, distance_m=3.3,
+                        side='right', center_x_norm=0.8,
+                        relevance='target_like'),
+        ])
+    a, reason = parse_vlm_action(
+        {'action': 'DRIVE_FORWARD', 'forward_dist_m': 0.5,
+         'rationale': 'probe forward'},
+        obs)
+    assert reason == 'OK'
+    assert a.kind == TURN and a.turn_yaw_rad < 0.0
+    assert 'replacing forward probe' in a.rationale
+
+
+def test_parse_normalizes_tiny_context_turn_to_directional_turn():
+    obs = Observation(
+        target='chair',
+        context_marks=[
+            ContextMark(1, 'drawer cabinet', 0.38, distance_m=2.4,
+                        side='center', center_x_norm=0.5,
+                        relevance='office_context'),
+            ContextMark(6, 'desk', 0.27, distance_m=2.0,
+                        side='right', center_x_norm=0.8,
+                        relevance='office_context'),
+        ])
+    a, reason = parse_vlm_action(
+        {'action': 'TURN', 'turn_yaw_rad': 0.17,
+         'rationale': 'turn slightly right toward office context'},
+        obs)
+    assert reason == 'OK'
+    assert a.kind == TURN and a.turn_yaw_rad == -0.6
+    assert 'normalizing turn toward context mark' in a.rationale
+
+
 def test_validate_accepts_argless_actions():
     obs = Observation(target='bus')
     assert validate_action(Action(DETECT_ALL), obs)[0]
     assert validate_action(Action(TURN, turn_yaw_rad=0.5), obs)[0]
     assert validate_action(Action(DONE), obs)[0]
+
+
+def test_parse_repairs_premature_done_without_strict_target():
+    obs = Observation(
+        target='office chair',
+        context_marks=[ContextMark(1, 'desk', 0.43, distance_m=0.19,
+                                   side='center', center_x_norm=0.5,
+                                   relevance='office_context')])
+    a, reason = parse_vlm_action({'action': 'DONE', 'rationale': 'cannot see target'}, obs)
+    assert reason == 'OK'
+    assert a.kind == TURN
+    assert 'done_guard' in a.rationale
+
+
+def test_parse_allows_done_with_close_strict_target():
+    obs = Observation(
+        target='office chair',
+        candidates=[Candidate(1, 'office chair', 0.55, distance_m=0.5,
+                              source='target')])
+    a, reason = parse_vlm_action({'action': 'DONE', 'rationale': 'target reached'}, obs)
+    assert reason == 'OK'
+    assert a.kind == DONE
 
 
 # ---- VLM tool-call build / parse -------------------------------------------
@@ -199,6 +261,7 @@ def test_build_options_lists_real_marks():
     opt = build_vlm_options(obs)
     mark = opt['visible_marks'][0]
     assert mark['mark_id'] == 2 and mark['distance_m'] == 3.25   # realsense range
+    assert mark['source'] == 'target'
     assert 'DRIVE_TO_VISIBLE' in opt['actions'] and 'DETECT_ALL' in opt['actions']
     assert opt['map'] == 'occupancy map 40x40'
     assert 'frontiers' not in opt          # frontier options removed from the vocab

@@ -60,9 +60,10 @@ from ar_project_msgs.msg import Heartbeat
 from fleet_comms.heartbeat import HeartbeatPublisher
 from planner_orchestrator import orchestration as orch
 from planner_orchestrator.planner_logic import (
-    Candidate, CircuitBreaker, ContextMark, DegradationLatch, NotesBuffer, Observation,
-    DETECT_ALL, DRIVE_FORWARD, DRIVE_TO_VISIBLE, TURN, context_relevance_for,
-    context_mark_promotable_to_target, distance_for_options, distance_is_known,
+    Action, Candidate, CircuitBreaker, ContextMark, DegradationLatch,
+    NotesBuffer, Observation, DETECT_ALL, DRIVE_FORWARD, DRIVE_TO_VISIBLE,
+    TURN, centered_forward_blocker, context_mark_promotable_to_target,
+    context_relevance_for, distance_for_options, distance_is_known,
     format_distance, image_side,
 )
 from planner_orchestrator.vlm_client import make_client
@@ -102,20 +103,23 @@ class PlannerOrchestrator(Node):
         self.declare_parameter('vlm_base_url', '')
         self.declare_parameter('vlm_api_key', '')
         self.declare_parameter('vlm_model', '')
-        self.declare_parameter('vlm_timeout_s', 8.0)
+        self.declare_parameter('vlm_timeout_s', 30.0)
         self.declare_parameter('turn_step_rad', 0.6)
         self.declare_parameter('forward_step_m', 0.5)
         self.declare_parameter('approach_offset', 0.58)
         # Mirrors the Pi-side ApproachDetection default. If the visual target is
         # farther than offset + this step, a successful DRIVE_TO_VISIBLE means an
         # intermediate bounded approach, not final target arrival.
-        self.declare_parameter('approach_max_goal_step_m', 1.6)
+        self.declare_parameter('approach_max_goal_step_m', 1.2)
         # Once a final ApproachDetection reports SUCCEEDED, stop the VLM mission
         # instead of replanning on a close-range frame where depth often becomes
         # unknown and the target may overflow the camera. Long-range bounded
         # approaches keep the mission alive.
         self.declare_parameter('finish_on_approach_success', True)
-        self.declare_parameter('max_steps', 60)
+        # A strict target seen farther than this is not point-blank enough to close
+        # the mission solely on Nav2 success; re-observe once to confirm proximity.
+        self.declare_parameter('approach_final_observe_start_dist_m', 0.9)
+        self.declare_parameter('max_steps', 40)
         self.declare_parameter('map_frame', 'map')
         self.declare_parameter('robot_frame', 'base_link')
         # Relative VLM actions (TURN / DRIVE_FORWARD) only need a local metric
@@ -136,7 +140,7 @@ class PlannerOrchestrator(Node):
         # Phase 4.6 anytime/async replan: compute the NEXT plan concurrently while
         # the executive still runs the current action, adopt only at a commit-point
         # (the batch boundary) -> no idle / "wasted actions" between replans.
-        self.declare_parameter('async_replan', True)
+        self.declare_parameter('async_replan', False)
         # Phase 3 binding: pull real Set-of-Mark candidates from the edge detector
         # and feed the chosen mark's pixel to ApproachDetection on DRIVE_TO_VISIBLE.
         self.declare_parameter('detect_action_name', 'detect_target')
@@ -147,20 +151,31 @@ class PlannerOrchestrator(Node):
         self.declare_parameter('detect_conf', 0.0)
         self.declare_parameter('target_detect_conf', 0.50)
         self.declare_parameter('detect_all_conf', 0.08)
+        # DINO occasionally emits one-frame semantic spikes ("chair" on a handle,
+        # ball, table edge). Require the target-like object to be seen twice on
+        # consecutive detector calls before the VLM may drive to it.
+        self.declare_parameter('target_confirm_observations', 2)
+        self.declare_parameter('context_target_confirm_observations', 2)
+        self.declare_parameter('target_confirm_interval_s', 0.20)
+        self.declare_parameter('target_confirm_pixel_tolerance_px', 90.0)
+        self.declare_parameter('target_confirm_depth_tolerance_m', 0.80)
         # When the target detector returns no candidates, run a broad-vocab context
         # pass so the VLM can reason "office furniture is on the left" instead of
         # falling straight into a blind scan.
         self.declare_parameter('auto_context_when_target_absent', True)
-        self.declare_parameter('context_detect_conf', 0.25)
+        self.declare_parameter('context_detect_conf', 0.35)
         self.declare_parameter('context_target_promote_conf', 0.35)
+        self.declare_parameter('semantic_turn_antioscillation', True)
+        self.declare_parameter('semantic_turn_max_streak', 2)
+        self.declare_parameter('semantic_probe_forward_m', 0.45)
         self.declare_parameter(
             'office_context_query',
             'desk | table | drawer cabinet | cabinet | file cabinet | bookshelf | shelf | '
-            'office chair | chair | monitor | keyboard | laptop | printer')
+            'monitor | keyboard | laptop | printer')
         self.declare_parameter('camera_image_width', 640)
         self.declare_parameter('camera_frame', 'camera_color_optical_frame')
         self.declare_parameter('subscribe_camera_image', True)
-        self.declare_parameter('camera_image_topic', '/camera/camera/color/image_raw')
+        self.declare_parameter('camera_image_topic', '/camera_edge/color/image_raw')
         self.declare_parameter('camera_use_compressed_input', False)
         # Attach the top-down SLAM occupancy map as a 2nd image to the VLM. map_max_px
         # bounds the rendered map's longest side (kept small to limit tokens/latency).
@@ -173,6 +188,8 @@ class PlannerOrchestrator(Node):
         self.fwd_step = float(g('forward_step_m'))
         self.approach_offset = float(g('approach_offset'))
         self.approach_max_goal_step_m = float(g('approach_max_goal_step_m'))
+        self.approach_final_observe_start_dist_m = float(
+            g('approach_final_observe_start_dist_m'))
         self.finish_on_approach_success = bool(g('finish_on_approach_success'))
         self._last_approach_result = None
         self.max_steps = int(g('max_steps'))
@@ -187,9 +204,22 @@ class PlannerOrchestrator(Node):
         self.detect_conf = float(g('detect_conf'))
         self.target_detect_conf = float(g('target_detect_conf'))
         self.detect_all_conf = float(g('detect_all_conf'))
+        self.target_confirm_observations = max(1, int(g('target_confirm_observations')))
+        self.context_target_confirm_observations = max(
+            1, int(g('context_target_confirm_observations')))
+        self.target_confirm_interval_s = max(0.0, float(g('target_confirm_interval_s')))
+        self.target_confirm_pixel_tolerance_px = max(
+            0.0, float(g('target_confirm_pixel_tolerance_px')))
+        self.target_confirm_depth_tolerance_m = max(
+            0.0, float(g('target_confirm_depth_tolerance_m')))
         self.auto_context_when_target_absent = bool(g('auto_context_when_target_absent'))
         self.context_detect_conf = float(g('context_detect_conf'))
         self.context_target_promote_conf = float(g('context_target_promote_conf'))
+        self.semantic_turn_antioscillation = bool(g('semantic_turn_antioscillation'))
+        self.semantic_turn_max_streak = max(1, int(g('semantic_turn_max_streak')))
+        self.semantic_probe_forward_m = float(g('semantic_probe_forward_m'))
+        self._semantic_turn_side = ''
+        self._semantic_turn_streak = 0
         self.office_context_query = str(g('office_context_query'))
         self.camera_image_width = max(1, int(g('camera_image_width')))
         if self.detect_conf > 0.0:
@@ -380,17 +410,21 @@ class PlannerOrchestrator(Node):
         ids (and the camera callback can't clobber the annotated frame mid-plan).
         Falls back to a single /target_pixel candidate when the detector is absent."""
         if self._detect.wait_for_server(timeout_sec=1.0):
-            g = DetectTarget.Goal()
-            g.request_id = self._goal_id()
-            g.mission_epoch = self._epoch
-            g.query = target
-            g.render_setofmark = True
-            g.conf_threshold = self.target_detect_conf
-            res = self._call_action(self._detect, g, self.detect_timeout_s)
+            res = self._call_detect_target(target, self.target_detect_conf, True)
             if res is not None and getattr(res, 'candidates', None):
                 cands, pix = self._candidates_and_pixels_from_detect_candidates(
                     res.candidates)
+                cands, pix = self._confirm_target_candidates(
+                    target, cands, pix, self.target_detect_conf,
+                    self.target_confirm_observations, source='target')
                 jpeg = bytes(res.annotated.data) if res.annotated.data else self._camera_jpeg()
+                if not cands:
+                    self.get_logger().info(
+                        'target_confirm: raw target detection(s) rejected as unconfirmed')
+                    self._activity('target_confirm',
+                                   target=target, raw=len(getattr(res, 'candidates', []) or []),
+                                   confirmed=0)
+                    return [], {}, self._camera_jpeg()
                 # Dashboard view: what the robot sees + the mark ids offered to the VLM.
                 self._publish_view(self._setofmark_pub, jpeg)
                 return cands, pix, jpeg
@@ -403,6 +437,15 @@ class PlannerOrchestrator(Node):
         # Detector server absent -> last-resort single /target_pixel candidate (lets the
         # orchestrator also run against the continuous rgb_tracker instead of the service).
         return self._fallback_candidates(target)
+
+    def _call_detect_target(self, query, conf_threshold, render_setofmark):
+        g = DetectTarget.Goal()
+        g.request_id = self._goal_id()
+        g.mission_epoch = self._epoch
+        g.query = query
+        g.render_setofmark = bool(render_setofmark)
+        g.conf_threshold = float(conf_threshold)
+        return self._call_action(self._detect, g, self.detect_timeout_s)
 
     def _candidates_and_pixels_from_detect_candidates(self, candidates):
         cands, pix = [], {}
@@ -427,13 +470,86 @@ class PlannerOrchestrator(Node):
                 pix[mark_id] = pixel    # Point: x=u, y=v, z=depth_m
         return cands, pix
 
+    @staticmethod
+    def _label_compatible(target, a, b):
+        """Loose label check for two detector outputs describing the same target."""
+        t = (target or '').strip().lower()
+        la = (a or '').strip().lower()
+        lb = (b or '').strip().lower()
+        if not la or not lb:
+            return False
+        if la in lb or lb in la:
+            return True
+        if t and ((t in la and t in lb)
+                  or (set(t.split()) & set(la.split()) & set(lb.split()))):
+            return True
+        return bool(set(la.split()) & set(lb.split()))
+
+    def _candidate_confirmed_by(self, target, cand, pixel, other_cands, other_pixels):
+        """Match a candidate against a second detector pass by label + image/depth."""
+        for other in other_cands or []:
+            if not self._label_compatible(target, cand.label, other.label):
+                continue
+            other_pixel = (other_pixels or {}).get(int(other.mark_id))
+            if pixel is not None and other_pixel is not None:
+                dx = abs(float(pixel.x) - float(other_pixel.x))
+                dy = abs(float(pixel.y) - float(other_pixel.y))
+                if dx > self.target_confirm_pixel_tolerance_px:
+                    continue
+                if dy > self.target_confirm_pixel_tolerance_px:
+                    continue
+            else:
+                tol_norm = self.target_confirm_pixel_tolerance_px / float(
+                    max(1, self.camera_image_width))
+                if abs(float(cand.center_x_norm) - float(other.center_x_norm)) > tol_norm:
+                    continue
+            if (distance_is_known(cand.distance_m)
+                    and distance_is_known(other.distance_m)):
+                dd = abs(float(cand.distance_m) - float(other.distance_m))
+                allowed = max(self.target_confirm_depth_tolerance_m,
+                              0.35 * min(float(cand.distance_m),
+                                         float(other.distance_m)))
+                if dd > allowed:
+                    continue
+            return True
+        return False
+
+    def _confirm_target_candidates(self, target, cands, pix, conf_threshold,
+                                   required_observations, source, query=None):
+        if required_observations <= 1 or not cands:
+            return cands, pix
+        if self.target_confirm_interval_s > 0.0:
+            time.sleep(self.target_confirm_interval_s)
+        res2 = self._call_detect_target(query or target, conf_threshold, False)
+        if res2 is None or not getattr(res2, 'candidates', None):
+            self.get_logger().info(
+                'target_confirm[%s]: %d raw -> 0 confirmed (second pass empty)'
+                % (source, len(cands)))
+            return [], {}
+        cands2, pix2 = self._candidates_and_pixels_from_detect_candidates(res2.candidates)
+        confirmed, confirmed_pix = [], {}
+        for cand in cands:
+            pixel = (pix or {}).get(int(cand.mark_id))
+            if self._candidate_confirmed_by(target, cand, pixel, cands2, pix2):
+                confirmed.append(cand)
+                if pixel is not None:
+                    confirmed_pix[int(cand.mark_id)] = pixel
+        self.get_logger().info(
+            'target_confirm[%s]: %d raw -> %d confirmed over %d observation(s)'
+            % (source, len(cands), len(confirmed), required_observations))
+        self._activity('target_confirm', target=target, source=source,
+                       raw=len(cands), confirmed=len(confirmed),
+                       required_observations=required_observations)
+        return confirmed, confirmed_pix
+
     def _fallback_candidates(self, target):
         with self._lock:
             px = self._pixel
             jpeg = self._jpeg
         if px is not None:
             return ([Candidate(mark_id=1, label=target, score=1.0,
-                               distance_m=float(px.point.z))], {1: px.point}, jpeg)
+                               distance_m=float(px.point.z),
+                               source='fallback')], {1: px.point}, jpeg)
         return [], {}, jpeg
 
     def _context_marks_from_candidates(self, target, candidates):
@@ -484,13 +600,9 @@ class PlannerOrchestrator(Node):
         pretending those context objects are final approach targets."""
         if not self._detect.wait_for_server(timeout_sec=1.0):
             return [], None, [], {}
-        g = DetectTarget.Goal()
-        g.request_id = self._goal_id()
-        g.mission_epoch = self._epoch
-        g.query = self._context_query_for_target(target)
-        g.render_setofmark = True
-        g.conf_threshold = self.context_detect_conf if g.query else self.detect_all_conf
-        res = self._call_action(self._detect, g, self.detect_timeout_s)
+        query = self._context_query_for_target(target)
+        conf_threshold = self.context_detect_conf if query else self.detect_all_conf
+        res = self._call_detect_target(query, conf_threshold, True)
         cands = getattr(res, 'candidates', None) if res is not None else None
         jpeg = None
         if getattr(res, 'annotated', None) is not None and res.annotated.data:
@@ -498,18 +610,49 @@ class PlannerOrchestrator(Node):
             self._publish_view(self._setofmark_pub, jpeg)
         marks = self._context_marks_from_candidates(target, cands)
         det_cands, det_pixels = self._candidates_and_pixels_from_detect_candidates(cands)
+        target_like_ids = {
+            int(m.mark_id) for m in marks
+            if (m.relevance or '').lower() == 'target_like'
+        }
+        confirmed_target_like_ids = set(target_like_ids)
+        if target_like_ids and self.context_target_confirm_observations > 1:
+            target_like_cands = [
+                c for c in det_cands if int(c.mark_id) in target_like_ids
+            ]
+            confirmed_like, _ = self._confirm_target_candidates(
+                target, target_like_cands, det_pixels, conf_threshold,
+                self.context_target_confirm_observations,
+                source='context_target_like', query=query)
+            confirmed_target_like_ids = {int(c.mark_id) for c in confirmed_like}
+            hidden = len(target_like_ids - confirmed_target_like_ids)
+            if hidden:
+                self.get_logger().info(
+                    'context_confirm: hiding %d unconfirmed target-like mark(s)'
+                    % hidden)
+        if confirmed_target_like_ids != target_like_ids:
+            marks = [
+                m for m in marks
+                if ((m.relevance or '').lower() != 'target_like'
+                    or int(m.mark_id) in confirmed_target_like_ids)
+            ]
         promotable_ids = {
             int(m.mark_id) for m in marks
             if context_mark_promotable_to_target(
                 target, m, self.context_target_promote_conf)
         }
-        promoted = [c for c in det_cands if int(c.mark_id) in promotable_ids]
+        promoted = [
+            Candidate(mark_id=c.mark_id, label=c.label, score=c.score,
+                      distance_m=c.distance_m, side=c.side,
+                      center_x_norm=c.center_x_norm,
+                      source='context_promoted')
+            for c in det_cands if int(c.mark_id) in promotable_ids
+        ]
         promoted_pixels = {
             int(mark_id): point for mark_id, point in det_pixels.items()
             if int(mark_id) in promotable_ids
         }
         if marks:
-            backend = 'dino_office' if g.query else 'yoloe_all'
+            backend = 'dino_office' if query else 'yoloe_all'
             self.get_logger().info('context_detect[%s]: %d object(s): %s' % (
                 backend, len(marks), ', '.join(self._context_brief(m) for m in marks)))
         if promoted:
@@ -522,7 +665,7 @@ class PlannerOrchestrator(Node):
                     for c in promoted)))
         self._activity(
             'context_detect',
-            backend='dino_office' if g.query else 'yoloe_all',
+            backend='dino_office' if query else 'yoloe_all',
             objects=[{'mark_id': m.mark_id, 'label': m.label,
                       'score': round(float(m.score), 2),
                       'distance_m': distance_for_options(m.distance_m),
@@ -707,6 +850,8 @@ class PlannerOrchestrator(Node):
         self.notes = NotesBuffer()
         self.cb = CircuitBreaker()
         self._degrade = DegradationLatch()   # fresh mission retries the VLM
+        self._semantic_turn_side = ''
+        self._semantic_turn_streak = 0
         step = 0
         pending = None
         try:
@@ -726,6 +871,9 @@ class PlannerOrchestrator(Node):
                     continue
                 terminate = False
                 for i, action in enumerate(bundle.actions):
+                    role = self._action_role(action, bundle.obs)
+                    action = self._semantic_explore_antioscillation(
+                        action, bundle.obs, role)
                     role = self._action_role(action, bundle.obs)
                     self.get_logger().info('step %d [%s]: %s -- %s'
                                            % (step, role, self._action_brief(action),
@@ -755,6 +903,7 @@ class PlannerOrchestrator(Node):
                                    action=self._action_brief(action),
                                    result='ok' if ok else 'failed',
                                    duration_s=round(time.monotonic() - t0, 2))
+                    self._remember_semantic_motion(action, bundle.obs, role, ok)
                     self._publish_notes(target)
                     step += 1
                     if ok and action.kind == DRIVE_TO_VISIBLE and self._approach_can_auto_finish(
@@ -826,6 +975,77 @@ class PlannerOrchestrator(Node):
             return 'done'
         return 'other'
 
+    @staticmethod
+    def _turn_side(action):
+        if action.kind != TURN or abs(float(action.turn_yaw_rad)) < 0.2:
+            return ''
+        return 'left' if float(action.turn_yaw_rad) > 0.0 else 'right'
+
+    def _semantic_explore_antioscillation(self, action, obs, role):
+        if not self.semantic_turn_antioscillation:
+            return action
+        if role != 'semantic_explore' or obs is None:
+            return action
+        if obs.candidates:
+            return action
+        if action.kind != TURN:
+            return action
+        side = self._turn_side(action)
+        if not side:
+            return action
+
+        blocker = centered_forward_blocker(obs)
+        last_side = self._semantic_turn_side
+        reverse_turn = bool(last_side and side != last_side)
+        too_many_turns = (
+            last_side == side and self._semantic_turn_streak >= self.semantic_turn_max_streak)
+        if not reverse_turn and not too_many_turns:
+            return action
+
+        reason = []
+        if reverse_turn:
+            reason.append('blocked reverse semantic turn %s->%s' % (last_side, side))
+        if too_many_turns:
+            reason.append('semantic turn streak %d on %s' % (
+                self._semantic_turn_streak, side))
+        base = ('semantic_explore: anti_oscillation: %s'
+                % '; '.join(reason))
+        if action.rationale:
+            base += '; original rationale: ' + action.rationale
+
+        if blocker is None:
+            return Action(DRIVE_FORWARD,
+                          forward_dist_m=max(0.05, self.semantic_probe_forward_m),
+                          arg_label=action.arg_label,
+                          rationale=base + '; probe forward after inspecting context')
+
+        keep_side = last_side or side
+        yaw = self.turn_step * (1.0 if keep_side == 'left' else -1.0) * 0.5
+        return Action(TURN, turn_yaw_rad=yaw, arg_label=action.arg_label,
+                      rationale=(base + '; forward probe blocked by centered "%s" at %.2fm, '
+                                 'keep inspecting %s instead of oscillating'
+                                 % (blocker.label, float(blocker.distance_m), keep_side)))
+
+    def _remember_semantic_motion(self, action, obs, role, ok):
+        if role != 'semantic_explore' or not ok:
+            if action.kind == DRIVE_TO_VISIBLE:
+                self._semantic_turn_side = ''
+                self._semantic_turn_streak = 0
+            return
+        if action.kind == TURN:
+            side = self._turn_side(action)
+            if not side:
+                return
+            if side == self._semantic_turn_side:
+                self._semantic_turn_streak += 1
+            else:
+                self._semantic_turn_side = side
+                self._semantic_turn_streak = 1
+            return
+        if action.kind == DRIVE_FORWARD:
+            self._semantic_turn_side = ''
+            self._semantic_turn_streak = 0
+
     def _approach_can_auto_finish(self, action, obs):
         """Only final, not bounded, ApproachDetection success should end a mission.
 
@@ -835,7 +1055,45 @@ class PlannerOrchestrator(Node):
         if not self.finish_on_approach_success:
             return False
         res = self._last_approach_result
+        bounded_step = bool(getattr(res, 'bounded_step', False))
         final_distance = getattr(res, 'final_distance_m', float('nan'))
+        cand = None
+        if obs is not None:
+            cand = next((c for c in obs.candidates
+                         if int(c.mark_id) == int(action.mark_id)), None)
+        if cand is not None and (cand.source or '') == 'context_promoted':
+            self.get_logger().info(
+                'context-promoted target approach succeeded -> continuing mission '
+                'until strict target detector confirms the goal')
+            self._activity(
+                'step_progress', action=self._action_brief(action),
+                result='context_promoted_probe',
+                candidate_label=cand.label,
+                candidate_score=round(float(cand.score), 2),
+                final_distance_m=(round(float(final_distance), 2)
+                                  if distance_is_known(final_distance) else None))
+            return False
+        if bounded_step:
+            final_threshold = self.approach_offset + 0.35
+            if distance_is_known(final_distance):
+                self.get_logger().info(
+                    'bounded target approach succeeded with %.2fm still expected '
+                    'to target (final threshold %.2fm) -> continuing mission'
+                    % (float(final_distance), final_threshold))
+                self._activity(
+                    'step_progress', action=self._action_brief(action),
+                    result='bounded_approach',
+                    final_distance_m=round(float(final_distance), 2),
+                    final_threshold_m=round(final_threshold, 2))
+            else:
+                self.get_logger().info(
+                    'bounded target approach succeeded (remaining distance unknown) '
+                    '-> continuing mission')
+                self._activity(
+                    'step_progress', action=self._action_brief(action),
+                    result='bounded_approach',
+                    final_distance_m=None)
+            return False
         if distance_is_known(final_distance):
             final_threshold = self.approach_offset + 0.35
             if float(final_distance) <= final_threshold:
@@ -852,10 +1110,20 @@ class PlannerOrchestrator(Node):
             return False
         if obs is None:
             return True
-        cand = next((c for c in obs.candidates
-                     if int(c.mark_id) == int(action.mark_id)), None)
         if cand is None or not distance_is_known(cand.distance_m):
             return True
+        confirm_threshold = max(0.0, self.approach_final_observe_start_dist_m)
+        if confirm_threshold > 0.0 and float(cand.distance_m) > confirm_threshold:
+            self.get_logger().info(
+                'strict target approach succeeded from %.2fm start distance; '
+                're-observing before DONE (confirm threshold %.2fm)'
+                % (float(cand.distance_m), confirm_threshold))
+            self._activity(
+                'step_progress', action=self._action_brief(action),
+                result='strict_reobserve_before_done',
+                start_distance_m=round(float(cand.distance_m), 2),
+                confirm_threshold_m=round(confirm_threshold, 2))
+            return False
         auto_finish_threshold = (
             self.approach_offset + max(0.0, self.approach_max_goal_step_m) + 0.05)
         if float(cand.distance_m) <= auto_finish_threshold:
