@@ -166,8 +166,11 @@ class PlannerOrchestrator(Node):
         # лишний кандидат безобиден. На картинке же всё, что около порога, живёт
         # ровно один кадр — метки появляются и исчезают между прогонами, номера
         # переприсваиваются, и оператор смотрит на мельтешение вместо обстановки.
-        # Показываем только то, в чём детектор уверен.
-        self.declare_parameter('idle_detect_conf', 0.35)
+        # Показываем только то, в чём детектор уверен. 0.25, а не выше: цели в
+        # симуляции — плоские билборды, и YOLOE даёт по ним 0.26..0.40, так что
+        # порог 0.35 срезал в flat_detect ВСЁ, включая сам билборд (замерено).
+        # 0.25 отсекает дрожащий хвост 0.13..0.22 и оставляет устойчивые метки.
+        self.declare_parameter('idle_detect_conf', 0.25)
         self.declare_parameter('camera_frame', 'camera_color_optical_frame')
         self.declare_parameter('subscribe_camera_image', True)
         self.declare_parameter('camera_image_topic', '/camera/camera/color/image_raw')
