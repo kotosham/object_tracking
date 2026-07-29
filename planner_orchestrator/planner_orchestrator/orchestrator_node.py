@@ -195,6 +195,16 @@ class PlannerOrchestrator(Node):
         self.declare_parameter('scan_topic', '/scan')
         self.declare_parameter('forward_standoff_m', 0.40)
         self.declare_parameter('forward_corridor_half_width_m', 0.25)
+        # Ниже этого Nav2 не поедет ВООБЩЕ: цель попадает внутрь допуска
+        # (nav2_params.yaml: xy_goal_tolerance 0.20), controller_server сразу
+        # рапортует «Reached the goal», и робот не трогается с места. Прежний
+        # порог отказа был 0.05 м, из-за чего в зазоре 0.05..0.20 команда
+        # считалась выполненной, VLM получал «ok» и повторял её.
+        # Наблюдалось у оператора ровно так: сорок шагов DRIVE_FORWARD +0.18m
+        # подряд, «Reached the goal!» на каждом, робот стоит, кадр и карта не
+        # меняются, миссия упирается в max_steps. 0.25 = допуск 0.20 плюс запас
+        # на дискретность одометрии.
+        self.declare_parameter('min_drive_m', 0.25)
         g = lambda n: self.get_parameter(n).value
         self.replan_n = max(1, int(g('replan_every_n')))
         self.turn_step = float(g('turn_step_rad'))
@@ -227,6 +237,7 @@ class PlannerOrchestrator(Node):
         self.map_max_px = int(g('map_max_px'))
         self.scan_topic = str(g('scan_topic'))
         self.forward_standoff_m = float(g('forward_standoff_m'))
+        self.min_drive_m = float(g('min_drive_m'))
         self.forward_corridor_half_width_m = float(g('forward_corridor_half_width_m'))
         self.async_replan = bool(g('async_replan'))
         self._planner_pool = ThreadPoolExecutor(max_workers=1,
@@ -926,11 +937,21 @@ class PlannerOrchestrator(Node):
         else:
             # standoff already contains the camera->footprint-front offset margin
             drive = min(asked, max(0.0, clearance - self.forward_standoff_m))
-        if drive <= 0.05:
-            self._exec_note = ('blocked: obstacle ~%.1fm ahead, no safe forward motion'
-                               % clearance)
-            self.get_logger().warn('DRIVE_FORWARD %.2fm refused: clearance %.2fm'
-                                   % (asked, clearance))
+        # Отказываем ЧЕСТНО, когда ехать некуда: иначе Nav2 принимает цель внутри
+        # своего допуска, мгновенно объявляет её достигнутой, и модель получает
+        # «ok» на движение, которого не было. Она повторяет ту же команду, пока
+        # не кончатся шаги. Лучше сказать «заблокировано» — тогда у неё есть
+        # повод развернуться.
+        if drive < self.min_drive_m:
+            self._exec_note = (
+                'blocked: obstacle ~%.1fm ahead, свободного хода %.2fm — меньше '
+                'минимального шага %.2fm, ехать некуда; поверните'
+                % (clearance if clearance is not None else -1.0, drive, self.min_drive_m))
+            self.get_logger().warn(
+                'DRIVE_FORWARD %.2fm refused: свободно %.2fm < min_drive %.2fm '
+                '(clearance %s)'
+                % (asked, drive, self.min_drive_m,
+                   ('%.2fm' % clearance) if clearance is not None else 'н/д'))
             return False
         x, y, yaw, frame = pose
         ok = self._send_goto(x + drive * math.cos(yaw), y + drive * math.sin(yaw),
