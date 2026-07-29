@@ -70,7 +70,7 @@ def test_build_messages_includes_image_and_options():
     obs = Observation(target='bus', candidates=[Candidate(2, 'bus', 0.9, distance_m=2.0)])
     msgs = c.build_messages(obs, image_jpeg=b'\xff\xd8jpegbytes')
     assert msgs[0]['role'] == 'system'
-    user = msgs[1]['content']
+    user = msgs[-1]['content']
     kinds = [p['type'] for p in user]
     assert 'text' in kinds and 'image_url' in kinds
     img = [p for p in user if p['type'] == 'image_url'][0]
@@ -81,7 +81,7 @@ def test_build_messages_includes_image_and_options():
 def test_build_messages_text_only_when_no_image():
     c = OpenAICompatibleClient('http://x/v1', 'k', 'qwen')
     msgs = c.build_messages(Observation(target='bus'), image_jpeg=None)
-    assert all(p['type'] == 'text' for p in msgs[1]['content'])
+    assert all(p['type'] == 'text' for p in msgs[-1]['content'])
 
 
 def test_build_messages_attaches_map_as_second_image():
@@ -89,9 +89,9 @@ def test_build_messages_attaches_map_as_second_image():
     obs = Observation(target='bus', candidates=[Candidate(2, 'bus', 0.9, distance_m=2.0)],
                       map_text='occupancy map')
     msgs = c.build_messages(obs, image_jpeg=b'\xff\xd8camera', map_jpeg=b'\xff\xd8map')
-    images = [p for p in msgs[1]['content'] if p['type'] == 'image_url']
+    images = [p for p in msgs[-1]['content'] if p['type'] == 'image_url']
     assert len(images) == 2                      # camera + map
-    assert 'occupancy map' in msgs[1]['content'][0]['text']   # map described in opts
+    assert 'occupancy map' in msgs[-1]['content'][0]['text']   # map described in opts
 
 
 def test_parse_response_valid_tool_call():
@@ -139,6 +139,16 @@ def _seq_resp(payload):
     return json.dumps({'choices': [{'message': {'content': json.dumps(payload)}}]})
 
 
+def _system_count(messages):
+    """Сколько системных сообщений в диалоге.
+
+    Проверять размер списка целиком больше нельзя: между системным промптом и
+    реальным запросом лежат few-shot пары, и их число — деталь промпта, а не
+    контракт. Значимо ровно одно: добавился ли SEQUENCE_PROMPT.
+    """
+    return sum(1 for m in messages if m.get('role') == 'system')
+
+
 def test_build_messages_n1_has_no_sequence_override():
     c = OpenAICompatibleClient('http://x/v1', 'k', 'qwen')
     obs = Observation(target='bus')
@@ -148,8 +158,10 @@ def test_build_messages_n1_has_no_sequence_override():
 def test_build_messages_n_gt_1_adds_sequence_override():
     c = OpenAICompatibleClient('http://x/v1', 'k', 'qwen')
     msgs = c.build_messages(Observation(target='bus'), None, None, n=3)
-    assert len(msgs) == 3 and msgs[1]['role'] == 'system'
-    assert 'actions' in msgs[1]['content']
+    assert _system_count(msgs) == 2                # базовый + SEQUENCE_PROMPT
+    assert msgs[-1]['role'] == 'user'
+    systems = [m['content'] for m in msgs if m['role'] == 'system']
+    assert any('"actions"' in s for s in systems)  # переопределение формата пришло
 
 
 def test_parse_sequence_returns_actions_in_order():
@@ -224,7 +236,8 @@ def test_plan_sequence_n1_uses_single_action_path(monkeypatch):
     monkeypatch.setattr(c, '_post', fake_post)
     acts = c.plan_sequence(Observation(target='bus'), None, None, n=1)
     assert [a.kind for a in acts] == [TURN]
-    assert seen['max_tokens'] == 256 and len(seen['messages']) == 2
+    assert seen['max_tokens'] == 256
+    assert _system_count(seen['messages']) == 1   # без SEQUENCE_PROMPT
 
 
 def test_plan_sequence_scales_token_budget(monkeypatch):
@@ -237,7 +250,8 @@ def test_plan_sequence_scales_token_budget(monkeypatch):
 
     monkeypatch.setattr(c, '_post', fake_post)
     c.plan_sequence(Observation(target='bus'), None, None, n=4)
-    assert seen['max_tokens'] == 256 * 4 and len(seen['messages']) == 3
+    assert seen['max_tokens'] == 256 * 4
+    assert _system_count(seen['messages']) == 2   # + SEQUENCE_PROMPT
 
 
 def test_mock_client_ignores_n(monkeypatch):

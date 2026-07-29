@@ -83,6 +83,46 @@ except Exception:                       # mock mode needs no image pipeline
 # и рендер карты на изображения, которые никто не успеет увидеть.
 IDLE_VIEW_PERIOD_S = 1.0
 
+# После скольких ОДИНАКОВЫХ действий подряд писать в заметки предупреждение о
+# зацикливании. Три, а не два: два одинаковых шага — нормальный приём (довернуть
+# на 180 двумя поворотами, проехать длинный коридор двумя рывками).
+REPEAT_WARN_AFTER = 3
+
+# Потолок одного заднего хода. Робот едет назад ВСЛЕПУЮ — камера и лидар
+# смотрят вперёд, — поэтому шаг заведомо короткий: освободить место для
+# разворота хватает, а вкатиться во что-то позади за 0.5 м трудно.
+REVERSE_MAX_M = 0.5
+
+
+def _parse_rooms(raw, logger=None):
+    """'имя|x0,x1,y0,y1;имя|...' -> {name: (x_min, x_max, y_min, y_max)}.
+
+    Не JSON намеренно: строка приходит через `-p name:=value`, то есть через
+    YAML-разбор ROS-аргументов, и фигурные скобки с кавычками валят его целиком
+    (проверено: оркестратор падал с «Failed to parse global arguments»). Здесь
+    нет ни одного символа, особенного для YAML.
+
+    Кривой кусок пропускаем молча, а не роняем узел: подписи на карте — удобство,
+    и падать из-за них было бы обменом большого на малое.
+    """
+    text = (raw or '').strip()
+    if not text:
+        return {}
+    out = {}
+    for chunk in text.split(';'):
+        chunk = chunk.strip()
+        if not chunk or '|' not in chunk:
+            continue
+        name, _, box = chunk.partition('|')
+        try:
+            x0, x1, y0, y1 = (float(v) for v in box.split(','))
+        except (TypeError, ValueError):
+            continue
+        out[name.strip()] = (min(x0, x1), max(x0, x1), min(y0, y1), max(y0, y1))
+    if not out and logger is not None:
+        logger.warn('rooms_spec не разобран — карта пойдёт без подписей комнат')
+    return out
+
 
 def _yaw_to_quat(yaw):
     return (0.0, 0.0, math.sin(yaw / 2.0), math.cos(yaw / 2.0))
@@ -205,6 +245,11 @@ class PlannerOrchestrator(Node):
         # меняются, миссия упирается в max_steps. 0.25 = допуск 0.20 плюс запас
         # на дискретность одометрии.
         self.declare_parameter('min_drive_m', 0.25)
+        # Комнаты мира: 'имя|x0,x1,y0,y1;имя|...' в метрах. Подписываются на
+        # карте, которую видит модель. АПРИОРНОЕ знание — робот его не выводит,
+        # его передаёт консоль из worlds.yaml. Пусто = карта остаётся чистой
+        # SLAM-сеткой, как раньше.
+        self.declare_parameter('rooms_spec', '')
         g = lambda n: self.get_parameter(n).value
         self.replan_n = max(1, int(g('replan_every_n')))
         self.turn_step = float(g('turn_step_rad'))
@@ -238,6 +283,7 @@ class PlannerOrchestrator(Node):
         self.scan_topic = str(g('scan_topic'))
         self.forward_standoff_m = float(g('forward_standoff_m'))
         self.min_drive_m = float(g('min_drive_m'))
+        self.rooms = _parse_rooms(str(g('rooms_spec') or ''), self.get_logger())
         self.forward_corridor_half_width_m = float(g('forward_corridor_half_width_m'))
         self.async_replan = bool(g('async_replan'))
         self._planner_pool = ThreadPoolExecutor(max_workers=1,
@@ -314,6 +360,8 @@ class PlannerOrchestrator(Node):
                                  callback_group=sub)
         self._scan = None                # latest LaserScan (forward-clearance clamp)
         self._exec_note = None           # honest per-step execution detail for notes
+        self._last_action_name = ''      # для счётчика повторов подряд
+        self._same_action_run = 0
         if self.scan_topic:
             self.create_subscription(LaserScan, self.scan_topic, self._on_scan,
                                      media_besteffort(), callback_group=sub)
@@ -679,6 +727,29 @@ class PlannerOrchestrator(Node):
         n_unknown = int(np.count_nonzero(data < 0))
         n_occ = int(np.count_nonzero(data >= 50))
         n_free = w * h - n_unknown - n_occ
+        # Холст расширяется до габаритов ЗДАНИЯ, если комнаты известны. Без
+        # этого видна только уже исследованная часть: SLAM-сетка растёт по мере
+        # разведки, и подписи комнат, куда робот ещё не заходил, просто не
+        # попадали в кадр — а именно они и нужны, чтобы решить, куда ехать.
+        # Дорисованная область остаётся серой (=unknown): это честно, там
+        # действительно ничего не измерено.
+        if self.rooms:
+            pad = 1.0
+            rx0 = min(min(v[0] for v in self.rooms.values()) - pad, ox)
+            rx1 = max(max(v[1] for v in self.rooms.values()) + pad, ox + w * res)
+            ry0 = min(min(v[2] for v in self.rooms.values()) - pad, oy)
+            ry1 = max(max(v[3] for v in self.rooms.values()) + pad, oy + h * res)
+            nw = max(w, int(math.ceil((rx1 - rx0) / res)))
+            nh = max(h, int(math.ceil((ry1 - ry0) / res)))
+            if (nw, nh) != (w, h) and nw * nh <= 4000 * 4000:
+                canvas = np.full((nh, nw), 127, dtype=np.uint8)
+                cx0 = int(round((ox - rx0) / res))
+                cy0 = int(round((oy - ry0) / res))
+                cx0 = max(0, min(cx0, nw - w))
+                cy0 = max(0, min(cy0, nh - h))
+                canvas[cy0:cy0 + h, cx0:cx0 + w] = img
+                img, w, h = canvas, nw, nh
+                ox, oy = rx0, ry0
         # OccupancyGrid origin is bottom-left; image row 0 is top -> flip to north-up.
         img = cv2.cvtColor(cv2.flip(img, 0), cv2.COLOR_GRAY2BGR)
         pose = self._robot_pose()
@@ -698,11 +769,53 @@ class PlannerOrchestrator(Node):
         if scale < 1.0:                                    # cap size; keep cells crisp
             img = cv2.resize(img, (max(1, int(w * scale)), max(1, int(h * scale))),
                              interpolation=cv2.INTER_NEAREST)
+        else:
+            scale = 1.0
+        # Подписи комнат — ПОСЛЕ масштабирования: иначе текст ужимается вместе с
+        # картинкой и на выходе нечитаем.
+        rooms_line = self._draw_rooms(img, ox, oy, res, h, scale)
         ok, buf = cv2.imencode('.jpg', img)
         if not ok:
             return None, ''
-        return buf.tobytes(), orch.describe_occupancy_grid(
+        text = orch.describe_occupancy_grid(
             w, h, res, robot_xy, n_free, n_occ, n_unknown)
+        if rooms_line:
+            text = text + ' ' + rooms_line
+        return buf.tobytes(), text
+
+    def _draw_rooms(self, img, ox, oy, res, grid_h, scale):
+        """Подписать комнаты на карте и вернуть их же строкой для промпта.
+
+        Две формы одного и того же намеренно: надпись на картинке даёт модели
+        пространственную привязку («туалет — вон та комната сверху»), а строка
+        текстом переживает любое качество JPEG и читается вернее, чем мелкие
+        буквы. Что-то одно регулярно теряется.
+        """
+        if not self.rooms:
+            return ''
+        def to_px(wx, wy):
+            cx = (wx - ox) / res
+            cy = (wy - oy) / res
+            return int(cx * scale), int((grid_h - 1 - cy) * scale)
+
+        parts = []
+        for name in sorted(self.rooms):
+            x0, x1, y0, y1 = self.rooms[name]
+            p0, p1 = to_px(x0, y1), to_px(x1, y0)     # верхний-левый, нижний-правый
+            cv2.rectangle(img, p0, p1, (0, 140, 0), 1)
+            label = str(name)
+            # Подпись в центре комнаты, с тёмной подложкой: белые стены и серое
+            # «неизвестно» съедают тонкий текст без неё.
+            tx, ty = to_px((x0 + x1) / 2.0, (y0 + y1) / 2.0)
+            fs = max(0.35, 0.45 * scale) if scale < 1.0 else 0.45
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, fs, 1)
+            org = (max(0, tx - tw // 2), max(th, ty + th // 2))
+            cv2.rectangle(img, (org[0] - 2, org[1] - th - 2),
+                          (org[0] + tw + 2, org[1] + 3), (255, 255, 255), -1)
+            cv2.putText(img, label, org, cv2.FONT_HERSHEY_SIMPLEX, fs,
+                        (0, 120, 0), 1, cv2.LINE_AA)
+            parts.append('%s at x %.1f..%.1f, y %.1f..%.1f' % (name, x0, x1, y0, y1))
+        return 'Rooms (from the building plan): ' + '; '.join(parts) + '.'
 
     # ---- anytime/async mission loop (Phase 4.6): replan overlaps execution ----
     def _compute_plan(self, target, step):
@@ -835,6 +948,21 @@ class PlannerOrchestrator(Node):
                         (' ' + action.rationale) if action.rationale else '',
                         'ok' if ok else 'failed',
                         (' | ' + detail) if detail else ''))
+                    # Зацикливание модель по своим заметкам не опознаёт: каждый
+                    # отдельный шаг отчитывается «ok», и серия из семнадцати
+                    # поворотов подряд выглядит как семнадцать успехов. Считаем
+                    # повторы сами и говорим прямым текстом — это наблюдение,
+                    # на которое планировщику есть чем ответить.
+                    if action.name == self._last_action_name:
+                        self._same_action_run += 1
+                    else:
+                        self._last_action_name, self._same_action_run = action.name, 1
+                    if self._same_action_run >= REPEAT_WARN_AFTER:
+                        self.notes.add_fact(
+                            'WARNING: %s repeated %d times in a row and the view is '
+                            'not changing -- you are stuck in a loop, choose a '
+                            'DIFFERENT action'
+                            % (action.name, self._same_action_run))
                     self._activity('step_result', step=step,
                                    action=self._action_brief(action),
                                    result='ok' if ok else 'failed',
@@ -931,6 +1059,28 @@ class PlannerOrchestrator(Node):
         Clearances are rounded to 0.1 m so a repeated ram produces the SAME fact
         and the notes buffer dedups it instead of flooding."""
         asked = float(action.forward_dist_m)
+        # ЗАДНИЙ ХОД — отдельная ветка, и без неё он не работал ВООБЩЕ. Клэмп
+        # ниже считает свободное место передним лидаром и обрезает им запрос;
+        # для отрицательного запроса min() всегда возвращал сам запрос, а затем
+        # проверка порога («меньше минимального шага») отбрасывала его как
+        # заведомо слишком короткий. В журнале это выглядело как
+        # «DRIVE_FORWARD -0.40m -> failed | blocked», и робот, упёршийся носом,
+        # не мог отъехать — ни одна из двух ветвей движения ему не оставалась.
+        # Назад едем вслепую: заднего датчика на роботе нет, поэтому шаг жёстко
+        # ограничен REVERSE_MAX_M — этого хватает, чтобы освободить место для
+        # разворота, и мало, чтобы въехать во что-то позади.
+        if asked < 0.0:
+            drive = max(asked, -REVERSE_MAX_M)
+            if abs(drive) < self.min_drive_m:
+                self._exec_note = ('blocked: задний ход %.2fm короче минимального '
+                                   'шага %.2fm' % (abs(drive), self.min_drive_m))
+                return False
+            x, y, yaw, frame = pose
+            ok = self._send_goto(x + drive * math.cos(yaw), y + drive * math.sin(yaw),
+                                 yaw, frame_id=frame)
+            self._exec_note = ('отъехал назад вслепую %.2fm (заднего датчика нет)'
+                               % abs(drive))
+            return ok
         clearance = self._forward_clearance_m()   # scan-frame (camera, robot front)
         if clearance is None:                     # no scan info -> old behaviour
             drive = asked

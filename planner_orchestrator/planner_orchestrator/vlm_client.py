@@ -29,33 +29,79 @@ from planner_orchestrator.planner_logic import (
     DONE, Action, MockPlanner, Observation, build_vlm_options, parse_vlm_action,
 )
 
+# Промпт намеренно короткий и построен как ReAct: сначала "think", потом
+# действие. Порядок ключей в JSON — часть замысла, а не оформление: модель
+# генерирует слева направо, поэтому "think" ПЕРЕД "action" заставляет её сначала
+# рассудить и лишь затем выбрать, а обратный порядок превращает объяснение в
+# оправдание уже сделанного выбора.
+#
+# Прежняя версия была вдвое длиннее и при этом умалчивала ровно о том, что робот
+# делал неправильно: не объясняла, когда поворачивать, зачем задний ход и какой
+# шаг вперёд имеет смысл. Отсюда наблюдавшееся поведение — десятки DRIVE_FORWARD
+# подряд в упор в стену, без единого TURN.
 SYSTEM_PROMPT = (
-    "You are the planner for a mobile robot searching for a target object. Each turn "
-    "you receive: the target; the live camera image (1st image, with numbered marks "
-    "on detected objects); a top-down SLAM occupancy map (2nd image, if available); "
-    "the currently visible detections (each with a mark_id, its detector class label, "
-    "a confidence score, and distance_m -- the RealSense range to it in meters, or "
-    "null when depth is unknown); and your running notes. Use known distance_m values "
-    "to size DRIVE_FORWARD and the map to avoid obstacles and unexplored dead-ends. "
-    "Choose exactly ONE action and reply with a "
-    "single JSON object, no prose. Actions: "
-    "TURN -- rotate in place; set turn_yaw_rad (radians, + = left). "
-    "DRIVE_FORWARD -- drive straight; set forward_dist_m (meters, negative = backward). "
-    "DRIVE_TO_VISIBLE -- drive to a detected object using the navigation stack; set "
-    "mark_id, which MUST be one of the listed visible marks and must have a non-null "
-    "positive distance_m. "
-    "DETECT_ALL -- run the detector over the whole view and add every object and its "
-    "class to your notes (recognises common everyday classes: people, vehicles, "
-    "furniture, animals, household items). "
-    "DONE -- the target is reached or the mission is complete. Choose DONE once the "
-    "target's known distance_m shows you are close (roughly within ~0.6 m, the robot's "
-    "approach standoff), or right after a successful DRIVE_TO_VISIBLE has brought you "
-    "up to it and it now fills the camera / drops out of the detections at point-blank "
-    "range. Never choose DONE just because distance_m is null/unknown. "
-    "Never invent a mark_id that is not listed, and never output map coordinates. "
-    "JSON schema: "
-    '{"action": str, "turn_yaw_rad": float, "forward_dist_m": float, "mark_id": int, '
-    '"arg_label": str, "rationale": str}.'
+    "You drive a small wheeled robot through rooms to find one target object.\n"
+    "Each turn you get: the target, the camera view (numbered marks on detections), "
+    "a top-down map, the list of visible marks, and your notes.\n"
+    "\n"
+    "ACTIONS\n"
+    "TURN turn_yaw_rad      rotate in place. + = left, - = right. 1.57 = 90 deg.\n"
+    "DRIVE_FORWARD forward_dist_m   drive straight. Use 0.3..1.5 m.\n"
+    "DRIVE_TO_VISIBLE mark_id       let the nav stack drive to a listed mark.\n"
+    "DETECT_ALL             name every object in view and store it in notes.\n"
+    "DONE                   target reached.\n"
+    "\n"
+    "RULES\n"
+    "- Wall or obstacle ahead: do NOT drive forward. TURN (1.57 or -1.57) and look.\n"
+    "- Target not visible: explore. TURN to scan, DRIVE_FORWARD into open space, "
+    "DETECT_ALL to record what is around. Note where each room and object is; that map "
+    "of the place is how you find the target later.\n"
+    "- Forward steps below 0.25 m do nothing at all -- the robot will not move. Never "
+    "ask for them. If only a few centimetres are free ahead, you are AT a wall: turn.\n"
+    "- Wedged with a wall in front and no room to turn? Back off first: negative "
+    "forward_dist_m, -0.3 to -0.5, then turn. That is what reverse is for. Never "
+    "reverse to explore -- there is no rear sensor, you are blind backwards, and the "
+    "step is capped at 0.5 m.\n"
+    "- Turning does not move you. After AT MOST two turns in a row you MUST drive: "
+    "pick the most open direction you have just seen and DRIVE_FORWARD. Spinning in "
+    "place forever fails the mission exactly as surely as ramming a wall.\n"
+    "- Read your notes: they list what you already did. Repeating the same action that "
+    "changed nothing is the main way this mission fails. Alternate look and move -- "
+    "turn to see, then drive to get there.\n"
+    "- DRIVE_TO_VISIBLE needs a mark_id from the list with a non-null distance_m. Never "
+    "invent one. Never output map coordinates.\n"
+    "- DONE only when the target's distance_m is about 0.6 m or less, or right after "
+    "DRIVE_TO_VISIBLE brought you up to it. Never DONE on unknown distance.\n"
+    "\n"
+    "REPLY\n"
+    'One JSON object, no prose, "think" first (one short sentence: what you see, what '
+    "you will do):\n"
+    '{"think": str, "action": str, "turn_yaw_rad": float, "forward_dist_m": float, '
+    '"mark_id": int, "arg_label": str}'
+)
+
+# Few-shot. Три примера покрывают три состояния, в которых модель ошибалась:
+# упёрлась в стену, ничего не видит, цель видна и близко. Пары «пользователь ->
+# ответ» кладутся в диалог как обычные сообщения — так модель видит не описание
+# формата, а его употребление.
+FEWSHOT = (
+    ('Target: chair\nVisible marks: none\nNotes: wall ahead at 0.4 m',
+     '{"think": "Wall right in front, nothing visible, so driving forward is '
+     'pointless -- turn left and scan.", "action": "TURN", "turn_yaw_rad": 1.57, '
+     '"forward_dist_m": 0.0, "mark_id": 0, "arg_label": ""}'),
+    ('Target: chair\nVisible marks: none\nNotes: corridor open ahead, rooms unexplored',
+     '{"think": "Open corridor and no detections here; move up it and look for new '
+     'objects.", "action": "DRIVE_FORWARD", "turn_yaw_rad": 0.0, '
+     '"forward_dist_m": 1.0, "mark_id": 0, "arg_label": ""}'),
+    ('Target: chair\nVisible marks: none\nNotes: TURN -> ok; TURN -> ok',
+     '{"think": "Two turns already and still nothing -- turning again just spins me. '
+     'Drive into the open space I saw.", "action": "DRIVE_FORWARD", '
+     '"turn_yaw_rad": 0.0, "forward_dist_m": 1.0, "mark_id": 0, "arg_label": ""}'),
+    ('Target: chair\nVisible marks: [{"mark_id": 2, "label": "chair", '
+     '"distance_m": 2.4}]\nNotes: -',
+     '{"think": "The chair is mark 2 at 2.4 m -- let the nav stack take me to it.", '
+     '"action": "DRIVE_TO_VISIBLE", "turn_yaw_rad": 0.0, "forward_dist_m": 0.0, '
+     '"mark_id": 2, "arg_label": "chair"}'),
 )
 
 # Добавка к системному промпту при replan_every_n > 1. Идёт ОТДЕЛЬНЫМ сообщением
@@ -69,7 +115,7 @@ SYSTEM_PROMPT = (
 # «доехать до метки 2, затем повернуть к метке 3», хотя метки к тому моменту уже
 # пересчитаны и mark_id значит совсем другое.
 SEQUENCE_PROMPT = (
-    "REPLY FORMAT OVERRIDE (replaces the 'exactly ONE action' rule above): reply "
+    "REPLY FORMAT OVERRIDE (replaces the single-object reply rule above): reply "
     'with a single JSON object {"actions": [...]} whose "actions" is a list of 1 to '
     '%d actions, in execution order, each object using exactly the schema above. '
     'Only the FIRST action is chosen with fresh perception: the rest are executed '
@@ -140,6 +186,11 @@ class OpenAICompatibleClient(VlmClient):
             content.append({'type': 'text', 'text': 'Top-down SLAM map:'})
             content.append(self._image_part(map_jpeg))
         messages = [{'role': 'system', 'content': SYSTEM_PROMPT}]
+        # Примеры идут ПОСЛЕ системного сообщения и ДО реального запроса, как
+        # обычный диалог: так модель видит формат в употреблении, а не в описании.
+        for shot_user, shot_reply in FEWSHOT:
+            messages.append({'role': 'user', 'content': shot_user})
+            messages.append({'role': 'assistant', 'content': shot_reply})
         if n > 1:
             messages.append({'role': 'system',
                              'content': SEQUENCE_PROMPT % (n, n)})

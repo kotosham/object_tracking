@@ -341,7 +341,9 @@ def parse_vlm_action(resp: dict, obs: Observation) -> Tuple[Optional[Action], st
         forward_dist_m=float(resp.get('forward_dist_m', 0.0) or 0.0),
         mark_id=int(resp.get('mark_id', 0) or 0),
         arg_label=str(resp.get('arg_label', '') or ''),
-        rationale=str(resp.get('rationale', '') or ''),
+        # 'think' — поле ReAct-схемы нового промпта, 'rationale' — прежнее имя.
+        # Принимаем оба: старые прогоны и записанные ответы должны читаться так же.
+        rationale=str(resp.get('think', resp.get('rationale', '')) or ''),
     )
     ok, reason = validate_action(act, obs)
     if not ok:
