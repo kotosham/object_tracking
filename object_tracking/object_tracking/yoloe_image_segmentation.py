@@ -8,6 +8,10 @@ from ament_index_python.packages import PackageNotFoundError, get_package_share_
 
 
 class YOLOESegmentor:
+    # Сколько наборов классов держать закодированными одновременно. В работе их
+    # ровно два (цель и словарь), запас — на смену цели внутри миссии.
+    PE_CACHE_MAX = 8
+
     # Broad object vocabulary for DETECT_ALL (segment_vocab). YOLOE here is the
     # text-prompted variant (yoloe-11s-seg.pt) -- it only finds classes it is told
     # to look for -- so "all objects" means "all objects from this list". True
@@ -56,6 +60,15 @@ class YOLOESegmentor:
         self.model = YOLOE(self.model_path)
         self.imgsz = imgsz
         self.current_prompt = None
+        # Эмбеддинги текстовых промптов по набору классов. Одного «последнего
+        # набора» было мало: оркестратор ЧЕРЕДУЕТ запросы — поиск цели ставит
+        # один класс, холостой показ обстановки ставит 80 классов словаря, — и
+        # на каждом переключении кэш промахивался, то есть get_text_pe гонял
+        # текстовый энкодер заново. Он тяжёлый и держит GIL: именно этим узел
+        # переставал слать heartbeat, а потребители объявляли его мёртвым.
+        # Держим несколько наборов: эмбеддинги мелкие (число классов x размер
+        # вектора), а промах стоит секунды.
+        self._pe_cache = {}
         self.last_detection_score = None
         self.last_mask = None
 
@@ -113,13 +126,23 @@ class YOLOESegmentor:
         )
 
     def _set_classes(self, classes):
-        """Set (and cache) the YOLOE text-prompt class list. Re-embeds only when the
-        class set actually changes -- get_text_pe runs the text encoder, so this
-        avoids re-encoding on every frame when the prompt is stable."""
+        """Set (and cache) the YOLOE text-prompt class list.
+
+        get_text_pe runs the text encoder, so the embedding is cached PER CLASS
+        SET, not just for the most recent one: the caller alternates between a
+        single-class target query and the 80-class vocabulary, and a
+        last-one-only cache missed on every switch.
+        """
         key = tuple(classes)
         if key == self.current_prompt:
             return
-        self.model.set_classes(list(classes), self.model.get_text_pe(list(classes)))
+        pe = self._pe_cache.get(key)
+        if pe is None:
+            pe = self.model.get_text_pe(list(classes))
+            if len(self._pe_cache) >= self.PE_CACHE_MAX:
+                self._pe_cache.pop(next(iter(self._pe_cache)))
+            self._pe_cache[key] = pe
+        self.model.set_classes(list(classes), pe)
         self.current_prompt = key
 
     def _set_prompt(self, prompt):

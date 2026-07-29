@@ -106,7 +106,18 @@ class DetectTargetServer(Node):
         self._frame = None               # latest BGR frame
         self._frame_header = None
         self._depth_frames = deque(maxlen=self.depth_buffer_size)
-        self._lock = threading.Lock()    # single-in-flight detection
+        self._lock = threading.Lock()    # снимок кадра/глубины
+        # Инференс сериализуется ОТДЕЛЬНО. _lock держится только на снимке кадра
+        # и отпускается до счёта, а _execute стоит в ReentrantCallbackGroup и
+        # goal_callback принимает цели безусловно — то есть вызовы реально шли
+        # внахлёст. Оркестратор дёргает detect_target из трёх мест (пул простоя,
+        # пул планировщика и поток миссии), и его собственные проверки занятости
+        # это не предотвращают.
+        # Дело не только в тройной нагрузке на CPU: модель ОДНА, а set_classes
+        # меняет её состояние глобально, так что параллельные запросы с разными
+        # наборами классов перебивали друг другу промпт — запрос на цель мог
+        # считаться словарём и наоборот.
+        self._infer_lock = threading.Lock()
 
         # Name of a backend to load lazily on first use (set by _load_segmentors
         # for the DETECT_ALL/vocab path in hybrid mode). None once loaded or when
@@ -545,20 +556,24 @@ class DetectTargetServer(Node):
         fb = DetectTarget.Feedback()
         seg_t0 = time.monotonic()
         try:
-            if query:
-                if self.target_segmentor is None:
-                    raise RuntimeError('target detector backend is not available')
-                segmentor = self.target_segmentor
-                conf = self._conf_for_query(query, float(req.conf_threshold))
-                dets = segmentor.segment_all(frame, query, conf=conf,
-                                             min_mask_area=self.min_mask_area)
-            else:
-                segmentor = self._get_vocab_segmentor()   # loads YOLOE on first use
-                if segmentor is None:
-                    raise RuntimeError('DETECT_ALL backend is not available')
-                conf = self._conf_for_query(query, float(req.conf_threshold))
-                dets = segmentor.segment_vocab(frame, conf=conf,
-                                               min_mask_area=self.min_mask_area)
+            # Замок охватывает и выбор классов, и сам счёт: они неразделимы —
+            # set_classes переключает единственную модель, и отпустить замок
+            # между ними значит позволить соседнему вызову подменить промпт.
+            with self._infer_lock:
+                if query:
+                    if self.target_segmentor is None:
+                        raise RuntimeError('target detector backend is not available')
+                    segmentor = self.target_segmentor
+                    conf = self._conf_for_query(query, float(req.conf_threshold))
+                    dets = segmentor.segment_all(frame, query, conf=conf,
+                                                 min_mask_area=self.min_mask_area)
+                else:
+                    segmentor = self._get_vocab_segmentor()  # loads YOLOE on first use
+                    if segmentor is None:
+                        raise RuntimeError('DETECT_ALL backend is not available')
+                    conf = self._conf_for_query(query, float(req.conf_threshold))
+                    dets = segmentor.segment_vocab(frame, conf=conf,
+                                                   min_mask_area=self.min_mask_area)
         except Exception as exc:
             self.get_logger().error('segment failed: %r' % (exc,))
             goal_handle.abort()
