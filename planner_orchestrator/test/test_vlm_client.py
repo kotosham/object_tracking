@@ -8,7 +8,8 @@ from planner_orchestrator.planner_logic import (
 )
 from planner_orchestrator.vlm_client import (
     ENV_API_KEY, ENV_BASE_URL, ENV_MODEL,
-    MockVlmClient, OpenAICompatibleClient, make_client, resolve_credentials,
+    MockVlmClient, OpenAICompatibleClient, SYSTEM_PROMPT, make_client,
+    resolve_credentials,
 )
 
 
@@ -76,6 +77,17 @@ def test_build_messages_includes_image_and_options():
     img = [p for p in user if p['type'] == 'image_url'][0]
     assert img['image_url']['url'].startswith('data:image/jpeg;base64,')
     assert 'bus' in user[0]['text']        # target + options serialized in
+
+
+def test_system_prompt_prioritizes_corridor_exploration():
+    assert 'white connected corridors/free regions' in SYSTEM_PROMPT
+    assert 'after at most one meaningful TURN' in SYSTEM_PROMPT
+    assert 'Do not spend many steps rotating' in SYSTEM_PROMPT
+    assert 'Context objects are ONLY cues' in SYSTEM_PROMPT
+    assert 'not destinations and not objects to approach' in SYSTEM_PROMPT
+    assert 'initial_scan turns are already done' in SYSTEM_PROMPT
+    assert 'corridor_scan entries' in SYSTEM_PROMPT
+    assert 'prefer a real free/unknown corridor' in SYSTEM_PROMPT
 
 
 def test_build_messages_text_only_when_no_image():

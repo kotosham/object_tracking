@@ -62,9 +62,9 @@ from planner_orchestrator import orchestration as orch
 from planner_orchestrator.planner_logic import (
     Action, Candidate, CircuitBreaker, ContextMark, DegradationLatch,
     NotesBuffer, Observation, DETECT_ALL, DRIVE_FORWARD, DRIVE_TO_VISIBLE,
-    TURN, centered_forward_blocker, context_mark_promotable_to_target,
+    TURN, context_mark_promotable_to_target,
     context_relevance_for, distance_for_options, distance_is_known,
-    format_distance, image_side,
+    format_distance, image_side, lost_target_lock_recovery_action,
 )
 from planner_orchestrator.vlm_client import make_client
 
@@ -105,6 +105,10 @@ class PlannerOrchestrator(Node):
         self.declare_parameter('vlm_model', '')
         self.declare_parameter('vlm_timeout_s', 30.0)
         self.declare_parameter('turn_step_rad', 0.6)
+        self.declare_parameter('min_effective_turn_rad', 0.6)
+        self.declare_parameter('initial_scan_when_target_absent', True)
+        self.declare_parameter('initial_scan_left_rad', 3.14)
+        self.declare_parameter('initial_scan_right_rad', 1.57)
         self.declare_parameter('forward_step_m', 0.5)
         self.declare_parameter('approach_offset', 0.58)
         # Mirrors the Pi-side ApproachDetection default. If the visual target is
@@ -137,6 +141,9 @@ class PlannerOrchestrator(Node):
         # Floor on per-step wall time so an instant-reached skill can't make the
         # loop hammer the executive (and gives observations time to refresh).
         self.declare_parameter('min_step_s', 0.5)
+        # After a TURN action, wait before the next detector/VLM observation so
+        # the RealSense image is not captured while the robot is still settling.
+        self.declare_parameter('turn_settle_s', 2.0)
         # Phase 4.6 anytime/async replan: compute the NEXT plan concurrently while
         # the executive still runs the current action, adopt only at a commit-point
         # (the batch boundary) -> no idle / "wasted actions" between replans.
@@ -163,11 +170,22 @@ class PlannerOrchestrator(Node):
         # pass so the VLM can reason "office furniture is on the left" instead of
         # falling straight into a blind scan.
         self.declare_parameter('auto_context_when_target_absent', True)
-        self.declare_parameter('context_detect_conf', 0.35)
+        self.declare_parameter('context_detect_conf', 0.30)
         self.declare_parameter('context_target_promote_conf', 0.35)
         self.declare_parameter('semantic_turn_antioscillation', True)
-        self.declare_parameter('semantic_turn_max_streak', 2)
+        self.declare_parameter('semantic_turn_max_streak', 1)
         self.declare_parameter('semantic_probe_forward_m', 0.45)
+        # Keep a short-lived memory of a strict target after bounded approaches.
+        # If it drops out for a frame, recover toward the last confirmed side
+        # before falling back to generic context search.
+        self.declare_parameter('target_lock_recovery_steps', 3)
+        self.declare_parameter('target_lock_recovery_turn_rad', 0.6)
+        self.declare_parameter('target_lock_recovery_forward_m', 0.45)
+        # After a strict target was confidently approached once, keep a navigation
+        # lock on its map point. The detector may lose the object at close range
+        # because it overflows the camera; that should not drop us back to context
+        # search while a saved target coordinate is still actionable.
+        self.declare_parameter('locked_target_approach_max_attempts', 8)
         self.declare_parameter(
             'office_context_query',
             'desk | table | drawer cabinet | cabinet | file cabinet | bookshelf | shelf | '
@@ -185,6 +203,10 @@ class PlannerOrchestrator(Node):
         g = lambda n: self.get_parameter(n).value
         self.replan_n = max(1, int(g('replan_every_n')))
         self.turn_step = float(g('turn_step_rad'))
+        self.min_effective_turn_rad = max(0.0, float(g('min_effective_turn_rad')))
+        self.initial_scan_when_target_absent = bool(g('initial_scan_when_target_absent'))
+        self.initial_scan_left_rad = abs(float(g('initial_scan_left_rad')))
+        self.initial_scan_right_rad = abs(float(g('initial_scan_right_rad')))
         self.fwd_step = float(g('forward_step_m'))
         self.approach_offset = float(g('approach_offset'))
         self.approach_max_goal_step_m = float(g('approach_max_goal_step_m'))
@@ -200,6 +222,7 @@ class PlannerOrchestrator(Node):
         self.skill_wait_s = float(g('skill_wait_s'))
         self.result_timeout_s = float(g('result_timeout_s'))
         self.min_step_s = float(g('min_step_s'))
+        self.turn_settle_s = max(0.0, float(g('turn_settle_s')))
         self.detect_timeout_s = float(g('detect_timeout_s'))
         self.detect_conf = float(g('detect_conf'))
         self.target_detect_conf = float(g('target_detect_conf'))
@@ -220,6 +243,14 @@ class PlannerOrchestrator(Node):
         self.semantic_probe_forward_m = float(g('semantic_probe_forward_m'))
         self._semantic_turn_side = ''
         self._semantic_turn_streak = 0
+        self.target_lock_recovery_steps = max(0, int(g('target_lock_recovery_steps')))
+        self.target_lock_recovery_turn_rad = float(g('target_lock_recovery_turn_rad'))
+        self.target_lock_recovery_forward_m = float(g('target_lock_recovery_forward_m'))
+        self._target_lock = None
+        self.locked_target_approach_max_attempts = max(
+            0, int(g('locked_target_approach_max_attempts')))
+        self._target_nav_lock = None
+        self._corridor_scan = {}
         self.office_context_query = str(g('office_context_query'))
         self.camera_image_width = max(1, int(g('camera_image_width')))
         if self.detect_conf > 0.0:
@@ -388,8 +419,11 @@ class PlannerOrchestrator(Node):
         CONSISTENT (candidate ids, camera image) pair even while the camera/replan
         threads run; the top-down SLAM map is rendered alongside (or None)."""
         cands, pixels, jpeg = self._refresh_candidates(target)
+        if cands:
+            self._remember_target_lock(target, cands, step_index)
         context_marks = []
-        if not cands and self.auto_context_when_target_absent:
+        skip_context_for_nav_lock = self._active_target_nav_lock(target) is not None
+        if not cands and self.auto_context_when_target_absent and not skip_context_for_nav_lock:
             context_marks, context_jpeg, promoted_cands, promoted_pixels = self._detect_context(target)
             if promoted_cands:
                 cands = promoted_cands
@@ -397,11 +431,327 @@ class PlannerOrchestrator(Node):
             if context_jpeg:
                 jpeg = context_jpeg
         map_jpeg, map_text = self._render_map()
+        self._record_corridor_scan(target, step_index, cands, context_marks)
+        notes = self.notes.facts
+        lock_note = self._target_lock_note(target, step_index, have_target=bool(cands))
+        if lock_note:
+            notes = notes + [lock_note]
         obs = Observation(target=target, candidates=cands,
                           context_marks=context_marks,
-                          notes_facts=self.notes.facts, step_index=step_index,
-                          map_text=map_text)
+                          notes_facts=notes, step_index=step_index,
+                          map_text=map_text,
+                          corridor_scan=self._corridor_scan_options())
         return obs, pixels, jpeg, map_jpeg
+
+    def _corridor_scan_view(self, step_index):
+        """Which initial-scan viewpoint this observation represents.
+
+        step 0 is the starting forward view. After the first initial-scan TURN,
+        step 1 observes the right-side corridor. The step-1 plan contains two
+        signed left turns, so the next observation is step 3: the left-side view.
+        """
+        if not self.initial_scan_when_target_absent:
+            return ''
+        step = int(step_index)
+        if step == 0:
+            return 'forward'
+        if step == 1:
+            return 'right'
+        if step >= 3 and 'left' not in self._corridor_scan:
+            return 'left'
+        return ''
+
+    @staticmethod
+    def _corridor_object_dict(mark):
+        return {
+            'label': mark.label,
+            'score': round(float(mark.score), 2),
+            'distance_m': distance_for_options(mark.distance_m),
+            'side': mark.side,
+            'relevance': mark.relevance,
+        }
+
+    def _record_corridor_scan(self, target, step_index, cands, context_marks):
+        view = self._corridor_scan_view(step_index)
+        if not view:
+            return
+        strict_target = any((c.source or '') == 'target' for c in cands or [])
+        if strict_target:
+            return
+        useful = [
+            m for m in context_marks or []
+            if (m.relevance or '').lower() in ('target_like', 'office_context', 'ambiguous')
+        ]
+        useful = sorted(
+            useful,
+            key=lambda m: (
+                2 if (m.relevance or '').lower() == 'target_like'
+                else 1 if (m.relevance or '').lower() == 'office_context'
+                else 0,
+                float(m.score),
+            ),
+            reverse=True)[:6]
+        objects = [self._corridor_object_dict(m) for m in useful]
+        if objects:
+            object_text = ', '.join(
+                '%s(%.2f@%s,%s,%s)' % (
+                    o['label'], o['score'],
+                    'unknown' if o['distance_m'] is None else '%.2fm' % o['distance_m'],
+                    o['side'], o['relevance'])
+                for o in objects)
+        else:
+            object_text = 'no useful context objects'
+        entry = {
+            'view': view,
+            'step': int(step_index),
+            'objects': objects,
+            'summary': (
+                '%s corridor/view: %s. Use these objects only as semantic cues '
+                'for choosing a free corridor on the SLAM map; do not approach '
+                'the context objects themselves.' % (view, object_text)
+            ),
+        }
+        self._corridor_scan[view] = entry
+        fact = 'CORRIDOR_SCAN[%s]: %s' % (view, object_text)
+        self.notes.add_fact(fact)
+        self.get_logger().info(fact)
+        self._activity('corridor_scan', step=step_index, view=view,
+                       objects=objects, target=target)
+
+    def _corridor_scan_options(self):
+        return [
+            self._corridor_scan[v]
+            for v in ('forward', 'right', 'left')
+            if v in self._corridor_scan
+        ]
+
+    def _initial_scan_actions(self, obs, step_index):
+        """Start a search mission with a short panoramic scan when no strict
+        target is visible yet. The forward view has already been checked by the
+        current observation. If it is empty, look right first, then sweep left in
+        two signed 90-degree turns. Splitting the 180-degree sweep avoids the Nav2
+        ambiguity where the controller can choose either physical direction for a
+        pi-radian yaw change. Context/promoted hints do not cancel the scan: they
+        are useful for later corridor choice, but too noisy to skip the initial
+        map-building sweep.
+        """
+        if not self.initial_scan_when_target_absent or obs is None:
+            return []
+        strict_target = any((c.source or '') == 'target' for c in obs.candidates)
+        if strict_target:
+            return []
+        step = int(step_index)
+        if step == 0:
+            return [Action(
+                TURN, turn_yaw_rad=-self.initial_scan_right_rad,
+                rationale=('initial_scan: strict target is not visible in the forward '
+                           'view; rotate right ~90deg to check the right-side corridor '
+                           'before choosing an exploration direction'))]
+        if step == 1:
+            left_step = max(0.0, self.initial_scan_left_rad / 2.0)
+            if left_step <= 0.0:
+                return []
+            return [
+                Action(
+                    TURN, turn_yaw_rad=left_step,
+                    rationale=('initial_scan: strict target is still not visible after '
+                               'checking right; rotate left ~90deg back through the '
+                               'starting heading')),
+                Action(
+                    TURN, turn_yaw_rad=left_step,
+                    rationale=('initial_scan: continue left another ~90deg to inspect '
+                               'the left-side corridor before active corridor '
+                               'exploration')),
+            ]
+        return []
+
+    def _initial_scan_action(self, obs, step_index):
+        """Compatibility helper for tests/older callers that expect one action."""
+        actions = self._initial_scan_actions(obs, step_index)
+        return actions[0] if actions else None
+
+    def _remember_target_lock(self, target, cands, step_index):
+        strict = [
+            c for c in cands or []
+            if (c.source or '') == 'target' and distance_is_known(c.distance_m)
+        ]
+        if not strict:
+            return
+        best = max(strict, key=lambda c: (float(c.score), -float(c.distance_m)))
+        self._target_lock = {
+            'target': target,
+            'label': best.label,
+            'score': float(best.score),
+            'distance_m': float(best.distance_m),
+            'side': best.side,
+            'step': int(step_index),
+            'recoveries': 0,
+        }
+        self.get_logger().info(
+            'target_lock: remembered "%s" conf=%.2f @%s on %s at step %d'
+            % (best.label, best.score, format_distance(best.distance_m),
+               best.side, step_index))
+
+    def _active_target_lock(self, target, step_index):
+        lock = self._target_lock
+        if not lock or lock.get('target') != target:
+            return None
+        age_steps = max(0, int(step_index) - int(lock.get('step', 0)))
+        recoveries = int(lock.get('recoveries', 0))
+        if age_steps <= 0:
+            return None
+        if self.target_lock_recovery_steps <= 0:
+            return None
+        if age_steps > self.target_lock_recovery_steps:
+            return None
+        if recoveries >= self.target_lock_recovery_steps:
+            return None
+        return lock
+
+    def _target_lock_note(self, target, step_index, have_target=False):
+        if have_target:
+            return ''
+        lock = self._active_target_lock(target, step_index)
+        if lock is None:
+            return ''
+        age_steps = max(0, int(step_index) - int(lock.get('step', 0)))
+        return ('TARGET_LOCK: strict target "%s" was last confirmed %.2fm on %s '
+                '%d step(s) ago; try to reacquire it before generic context search'
+                % (lock.get('label', target), float(lock.get('distance_m', 0.0)),
+                   lock.get('side', 'center'), age_steps))
+
+    def _apply_target_lock_recovery(self, actions, obs, target, step_index):
+        if obs is None or obs.candidates:
+            return actions
+        lock = self._active_target_lock(target, step_index)
+        if lock is None:
+            return actions
+        age_steps = max(0, int(step_index) - int(lock.get('step', 0)))
+        action = lost_target_lock_recovery_action(
+            obs,
+            label=str(lock.get('label', target) or target),
+            distance_m=float(lock.get('distance_m', 0.0) or 0.0),
+            side=str(lock.get('side', 'center') or 'center'),
+            age_steps=age_steps,
+            turn_step_rad=self.target_lock_recovery_turn_rad,
+            forward_dist_m=self.target_lock_recovery_forward_m)
+        if action is None:
+            return actions
+        proposed = ', '.join(self._action_brief(a) for a in actions) or '-'
+        lock['recoveries'] = int(lock.get('recoveries', 0)) + 1
+        self.get_logger().info(
+            'target_lock: recovering last confirmed target; overriding plan %s -> %s '
+            '(recovery %d/%d)'
+            % (proposed, self._action_brief(action), lock['recoveries'],
+               self.target_lock_recovery_steps))
+        self._activity(
+            'target_lock_recovery', step=step_index,
+            action=self._action_brief(action),
+            label=lock.get('label', target),
+            distance_m=round(float(lock.get('distance_m', 0.0) or 0.0), 2),
+            side=lock.get('side', 'center'),
+            recovery=lock['recoveries'],
+            max_recovery=self.target_lock_recovery_steps)
+        return [action]
+
+    @staticmethod
+    def _pose_is_valid(ps):
+        if ps is None:
+            return False
+        try:
+            return bool(ps.header.frame_id) and math.isfinite(ps.pose.position.x) \
+                and math.isfinite(ps.pose.position.y)
+        except AttributeError:
+            return False
+
+    @staticmethod
+    def _point_is_valid(pt):
+        if pt is None:
+            return False
+        try:
+            return bool(pt.header.frame_id) and math.isfinite(pt.point.x) \
+                and math.isfinite(pt.point.y)
+        except AttributeError:
+            return False
+
+    def _remember_target_nav_lock(self, target, label, result, step_index):
+        """Latch the map target from a successful strict visual approach.
+
+        This is the missing contract between perception and navigation: after one
+        confident object detection, losing the object from the camera should not
+        erase the saved map coordinate. Later steps may update this lock from a
+        fresh strict detection, or continue toward the locked point directly.
+        """
+        if result is None or getattr(result, 'outcome', None) != 0:
+            return
+        target_point = getattr(result, 'target_point', None)
+        final_goal_pose = getattr(result, 'final_goal_pose', None)
+        if not self._point_is_valid(target_point) or not self._pose_is_valid(final_goal_pose):
+            return
+        previous = self._target_nav_lock or {}
+        self._target_nav_lock = {
+            'target': target,
+            'label': label or target,
+            'target_point': target_point,
+            'final_goal_pose': final_goal_pose,
+            'final_distance_m': float(getattr(result, 'final_distance_m', 0.0) or 0.0),
+            'bounded_step': bool(getattr(result, 'bounded_step', False)),
+            'step': int(step_index),
+            'attempts': int(previous.get('attempts', 0)),
+        }
+        self.get_logger().info(
+            'target_nav_lock: remembered "%s" target=(%.2f,%.2f) final_goal=(%.2f,%.2f) '
+            'bounded=%s final_distance=%.2fm'
+            % (self._target_nav_lock['label'],
+               target_point.point.x, target_point.point.y,
+               final_goal_pose.pose.position.x, final_goal_pose.pose.position.y,
+               self._target_nav_lock['bounded_step'],
+               self._target_nav_lock['final_distance_m']))
+        self._activity(
+            'target_nav_lock',
+            step=step_index,
+            label=self._target_nav_lock['label'],
+            target_x=round(float(target_point.point.x), 2),
+            target_y=round(float(target_point.point.y), 2),
+            final_goal_x=round(float(final_goal_pose.pose.position.x), 2),
+            final_goal_y=round(float(final_goal_pose.pose.position.y), 2),
+            bounded=bool(self._target_nav_lock['bounded_step']),
+            final_distance_m=round(float(self._target_nav_lock['final_distance_m']), 2))
+
+    def _active_target_nav_lock(self, target):
+        lock = self._target_nav_lock
+        if not lock or lock.get('target') != target:
+            return None
+        if self.locked_target_approach_max_attempts <= 0:
+            return None
+        if int(lock.get('attempts', 0)) >= self.locked_target_approach_max_attempts:
+            return None
+        if not self._point_is_valid(lock.get('target_point')):
+            return None
+        return lock
+
+    def _locked_target_action(self, obs, target, step_index):
+        lock = self._active_target_nav_lock(target)
+        if lock is None:
+            return None
+        strict = [
+            c for c in (obs.candidates if obs is not None else [])
+            if (c.source or '') == 'target' and distance_is_known(c.distance_m)
+        ]
+        if strict:
+            best = max(strict, key=lambda c: (float(c.score), -float(c.distance_m)))
+            return Action(
+                DRIVE_TO_VISIBLE, mark_id=best.mark_id, arg_label=best.label,
+                rationale=('target_nav_lock: strict target is visible again; update the '
+                           'locked map point from mark %d instead of asking VLM to rethink '
+                           'the scene' % best.mark_id))
+        return Action(
+            DRIVE_TO_VISIBLE, mark_id=0, arg_label='__locked_target__',
+            rationale=('target_nav_lock: target was already confidently localized at '
+                       '(%.2f, %.2f) in %s; continue toward that saved point even though '
+                       'the object is not currently visible in the frame')
+            % (lock['target_point'].point.x, lock['target_point'].point.y,
+               lock['target_point'].header.frame_id))
 
     def _refresh_candidates(self, target):
         """Query the edge DetectTarget service. Returns (candidates, pixels, jpeg)
@@ -459,13 +809,24 @@ class PlannerOrchestrator(Node):
             center_x_norm = max(0.0, min(1.0, center_x / float(self.camera_image_width)))
             pixel = getattr(c, 'pixel', None)
             distance_m = float(getattr(pixel, 'z', 0.0) or 0.0)
+            if pixel is not None:
+                pixel_x_norm = max(0.0, min(
+                    1.0, float(getattr(pixel, 'x', center_x)) / float(self.camera_image_width)))
+                # We currently only use x for edge guards; y is recorded for
+                # future diagnostics without adding another camera-height param.
+                pixel_y_norm = 0.5
+            else:
+                pixel_x_norm = center_x_norm
+                pixel_y_norm = 0.5
             mark_id = int(getattr(c, 'mark_id', 0) or 0)
             cands.append(Candidate(mark_id=mark_id,
                                    label=str(getattr(c, 'label', '') or ''),
                                    score=float(getattr(c, 'confidence', 0.0) or 0.0),
                                    distance_m=distance_m,
                                    side=image_side(center_x_norm),
-                                   center_x_norm=center_x_norm))
+                                   center_x_norm=center_x_norm,
+                                   pixel_x_norm=pixel_x_norm,
+                                   pixel_y_norm=pixel_y_norm))
             if pixel is not None:
                 pix[mark_id] = pixel    # Point: x=u, y=v, z=depth_m
         return cands, pix
@@ -644,6 +1005,8 @@ class PlannerOrchestrator(Node):
             Candidate(mark_id=c.mark_id, label=c.label, score=c.score,
                       distance_m=c.distance_m, side=c.side,
                       center_x_norm=c.center_x_norm,
+                      pixel_x_norm=c.pixel_x_norm,
+                      pixel_y_norm=c.pixel_y_norm,
                       source='context_promoted')
             for c in det_cands if int(c.mark_id) in promotable_ids
         ]
@@ -788,10 +1151,18 @@ class PlannerOrchestrator(Node):
         ctx = ('' if best_context is None else " context=%d best_context='%s' %s %.2f @%s"
                % (len(obs.context_marks), best_context.label, best_context.side,
                   best_context.score, format_distance(best_context.distance_m)))
+        locked_action = self._locked_target_action(obs, target, step)
+        initial_scan_actions = [] if locked_action is not None else self._initial_scan_actions(obs, step)
+        if locked_action is not None:
+            planner_name = 'target_nav_lock'
+        elif initial_scan_actions:
+            planner_name = 'initial_scan'
+        else:
+            planner_name = type(client).__name__
         self.get_logger().info(
-            'observe@step %d: %d target detection(s)%s%s, notes=%d, map=%s -> asking %s'
+            'observe@step %d: %d target detection(s)%s%s, notes=%d, map=%s -> planner=%s'
             % (step, len(obs.candidates), det, ctx, len(obs.notes_facts),
-               'yes' if map_jpeg else 'no', type(client).__name__))
+               'yes' if map_jpeg else 'no', planner_name))
         self._activity(
             'observe', step=step, n_detections=len(obs.candidates),
             detections=[{'mark_id': c.mark_id, 'label': c.label,
@@ -806,9 +1177,39 @@ class PlannerOrchestrator(Node):
             notes=len(obs.notes_facts), map='yes' if map_jpeg else 'no',
             client=type(client).__name__)
         vlm_t0 = time.monotonic()
+        if initial_scan_actions:
+            actions = list(initial_scan_actions)
+            self.get_logger().info('plan@step %d: initial scan action(s): %s'
+                                   % (step, ', '.join(self._action_brief(a)
+                                                      for a in actions)))
+            self._activity(
+                'plan', step=step, latency_ms=0.0, source='initial_scan',
+                actions=[{'action': self._action_brief(a),
+                          'role': self._action_role(a, obs),
+                          'rationale': a.rationale or ''} for a in actions])
+            self.heartbeat.set_latency_ms(0.0)
+            self.heartbeat.set_status(
+                Heartbeat.DEGRADED if (self.cb.is_open or self._degrade.degraded)
+                else Heartbeat.OK)
+            return _PlanBundle(actions, pixels, obs)
+        if locked_action is not None:
+            actions = [locked_action]
+            self.get_logger().info('plan@step %d: target nav-lock action: %s'
+                                   % (step, self._action_brief(locked_action)))
+            self._activity(
+                'plan', step=step, latency_ms=0.0, source='target_nav_lock',
+                actions=[{'action': self._action_brief(locked_action),
+                          'role': self._action_role(locked_action, obs),
+                          'rationale': locked_action.rationale or ''}])
+            self.heartbeat.set_latency_ms(0.0)
+            self.heartbeat.set_status(
+                Heartbeat.DEGRADED if (self.cb.is_open or self._degrade.degraded)
+                else Heartbeat.OK)
+            return _PlanBundle(actions, pixels, obs)
         try:
             actions = list(client.plan_sequence(obs, jpeg, map_jpeg, n=self.replan_n))
             self.cb.record_success() if actions else self.cb.record_failure()
+            actions = self._apply_target_lock_recovery(actions, obs, target, step)
             self.get_logger().info('plan@step %d: VLM returned %d action(s): %s'
                                    % (step, len(actions),
                                       ', '.join(self._action_brief(a) for a in actions) or '-'))
@@ -824,6 +1225,7 @@ class PlannerOrchestrator(Node):
             self._activity('plan_failed', step=step, error=str(e),
                            cb_open=bool(self.cb.is_open))
             actions = []
+            actions = self._apply_target_lock_recovery(actions, obs, target, step)
         # Real per-component health (was: heartbeat always OK). Latency feeds the
         # p99 budget; DEGRADED reflects the breaker/latch and resets once healthy.
         self.heartbeat.set_latency_ms((time.monotonic() - vlm_t0) * 1e3)
@@ -842,6 +1244,32 @@ class PlannerOrchestrator(Node):
                 return _PlanBundle([], {}, None)
         return self._compute_plan(target, step)
 
+    def _should_launch_lead_replan(self, action, action_index, batch_len, already_pending):
+        """Do not observe/replan while a turn is physically in progress.
+
+        TURN actions are where motion blur hurt us most: Nav2 may report success
+        before the camera image has visually settled. Keep async replan for other
+        motions, but force a fresh post-settle observation after every TURN.
+        """
+        if action.kind == TURN and self.turn_settle_s > 0.0:
+            return False
+        return orch.should_launch_lead_replan(
+            action_index, batch_len, self.async_replan, already_pending)
+
+    def _settle_after_turn(self, action, ok):
+        if not ok or action.kind != TURN or self.turn_settle_s <= 0.0:
+            return
+        delay = float(self.turn_settle_s)
+        self.get_logger().info(
+            'turn settle: waiting %.2fs before next observation to avoid motion-blurred detections'
+            % delay)
+        self._activity(
+            'perception_settle',
+            action=self._action_brief(action),
+            duration_s=round(delay, 2),
+            reason='post_turn_image_stabilization')
+        time.sleep(delay)
+
     def _run_mission(self, target):
         self.get_logger().info('VLM mission start: target="%s"' % target)
         self._activity('mission_start', target=target,
@@ -852,6 +1280,9 @@ class PlannerOrchestrator(Node):
         self._degrade = DegradationLatch()   # fresh mission retries the VLM
         self._semantic_turn_side = ''
         self._semantic_turn_streak = 0
+        self._target_lock = None
+        self._target_nav_lock = None
+        self._corridor_scan = {}
         step = 0
         pending = None
         try:
@@ -872,8 +1303,14 @@ class PlannerOrchestrator(Node):
                 terminate = False
                 for i, action in enumerate(bundle.actions):
                     role = self._action_role(action, bundle.obs)
+                    action = self._normalize_turn_action(action, role)
+                    role = self._action_role(action, bundle.obs)
                     action = self._semantic_explore_antioscillation(
                         action, bundle.obs, role)
+                    # Repairs above may synthesize a new TURN. Clamp once more at
+                    # the final execution boundary so VLM-level turns are never
+                    # swallowed by Nav2 yaw tolerance as no-ops.
+                    action = self._normalize_turn_action(action, role)
                     role = self._action_role(action, bundle.obs)
                     self.get_logger().info('step %d [%s]: %s -- %s'
                                            % (step, role, self._action_brief(action),
@@ -890,11 +1327,11 @@ class PlannerOrchestrator(Node):
                         break
                     # anytime: launch the NEXT replan while this (last-of-batch) action
                     # executes, so it is ready at the commit-point -> no wasted idle.
-                    if orch.should_launch_lead_replan(i, len(bundle.actions),
-                                                      self.async_replan, pending is not None):
+                    if self._should_launch_lead_replan(
+                            action, i, len(bundle.actions), pending is not None):
                         pending = self._planner_pool.submit(self._compute_plan, target, step + 1)
                     t0 = time.monotonic()
-                    ok = self._dispatch(action, bundle.pixels, target)
+                    ok = self._dispatch(action, bundle.pixels, target, step)
                     self.notes.add_fact('%s%s -> %s' % (
                         action.name,
                         (' ' + action.rationale) if action.rationale else '',
@@ -905,6 +1342,7 @@ class PlannerOrchestrator(Node):
                                    duration_s=round(time.monotonic() - t0, 2))
                     self._remember_semantic_motion(action, bundle.obs, role, ok)
                     self._publish_notes(target)
+                    self._settle_after_turn(action, ok)
                     step += 1
                     if ok and action.kind == DRIVE_TO_VISIBLE and self._approach_can_auto_finish(
                             action, bundle.obs):
@@ -952,6 +1390,8 @@ class PlannerOrchestrator(Node):
         if a.kind == DRIVE_FORWARD:
             return 'DRIVE_FORWARD %+.2fm' % a.forward_dist_m
         if a.kind == DRIVE_TO_VISIBLE:
+            if a.mark_id == 0 and a.arg_label == '__locked_target__':
+                return 'DRIVE_TO_LOCKED_TARGET'
             return 'DRIVE_TO_VISIBLE mark=%d' % a.mark_id
         return a.name
 
@@ -962,6 +1402,8 @@ class PlannerOrchestrator(Node):
             return 'target_approach'
         if action.kind in (TURN, DRIVE_FORWARD):
             rationale = (action.rationale or '').lower()
+            if 'initial_scan:' in rationale:
+                return 'initial_scan'
             useful_context = bool(
                 obs and any((m.relevance or '').lower() in
                             ('target_like', 'office_context', 'ambiguous')
@@ -981,6 +1423,26 @@ class PlannerOrchestrator(Node):
             return ''
         return 'left' if float(action.turn_yaw_rad) > 0.0 else 'right'
 
+    def _normalize_turn_action(self, action, role):
+        """Avoid no-op TURN actions that are smaller than Nav2's yaw tolerance."""
+        if action.kind != TURN:
+            return action
+        yaw = float(action.turn_yaw_rad)
+        if not math.isfinite(yaw):
+            yaw = 0.0
+        min_yaw = float(self.min_effective_turn_rad)
+        if min_yaw <= 0.0 or abs(yaw) >= min_yaw:
+            return action
+        sign = 1.0 if yaw >= 0.0 else -1.0
+        normalized = sign * min_yaw
+        base = ('turn_guard: requested %.2frad is below the effective turn %.2frad; '
+                'normalizing to %.2frad so Nav2 cannot treat it as already reached'
+                % (yaw, min_yaw, normalized))
+        if action.rationale:
+            base += '; original rationale: ' + action.rationale
+        return Action(TURN, turn_yaw_rad=normalized,
+                      arg_label=action.arg_label, rationale=base)
+
     def _semantic_explore_antioscillation(self, action, obs, role):
         if not self.semantic_turn_antioscillation:
             return action
@@ -994,7 +1456,6 @@ class PlannerOrchestrator(Node):
         if not side:
             return action
 
-        blocker = centered_forward_blocker(obs)
         last_side = self._semantic_turn_side
         reverse_turn = bool(last_side and side != last_side)
         too_many_turns = (
@@ -1013,18 +1474,11 @@ class PlannerOrchestrator(Node):
         if action.rationale:
             base += '; original rationale: ' + action.rationale
 
-        if blocker is None:
-            return Action(DRIVE_FORWARD,
-                          forward_dist_m=max(0.05, self.semantic_probe_forward_m),
-                          arg_label=action.arg_label,
-                          rationale=base + '; probe forward after inspecting context')
-
-        keep_side = last_side or side
-        yaw = self.turn_step * (1.0 if keep_side == 'left' else -1.0) * 0.5
-        return Action(TURN, turn_yaw_rad=yaw, arg_label=action.arg_label,
-                      rationale=(base + '; forward probe blocked by centered "%s" at %.2fm, '
-                                 'keep inspecting %s instead of oscillating'
-                                 % (blocker.label, float(blocker.distance_m), keep_side)))
+        return Action(DRIVE_FORWARD,
+                      forward_dist_m=max(0.05, self.semantic_probe_forward_m),
+                      arg_label=action.arg_label,
+                      rationale=(base + '; probe forward after inspecting context; '
+                                 'navigation costmaps decide whether the short motion is safe'))
 
     def _remember_semantic_motion(self, action, obs, role, ok):
         if role != 'semantic_explore' or not ok:
@@ -1139,7 +1593,7 @@ class PlannerOrchestrator(Node):
             auto_finish_threshold_m=round(auto_finish_threshold, 2))
         return False
 
-    def _dispatch(self, action, cand_pixels, target=''):
+    def _dispatch(self, action, cand_pixels, target='', step_index=0):
         if action.kind in (TURN, DRIVE_FORWARD):
             pose = self._motion_pose()
             if pose is None:
@@ -1151,7 +1605,10 @@ class PlannerOrchestrator(Node):
             gx, gy, gyaw = orch.relative_goal(pose[0], pose[1], pose[2], action)
             return self._send_goto(gx, gy, gyaw, frame_id=pose[3])
         if action.kind == DRIVE_TO_VISIBLE:
-            return self._send_approach_mark(action.mark_id, action.arg_label, cand_pixels)
+            if action.mark_id == 0 and action.arg_label == '__locked_target__':
+                return self._send_locked_target_approach(target, step_index)
+            return self._send_approach_mark(
+                action.mark_id, action.arg_label, cand_pixels, target, step_index)
         if action.kind == DETECT_ALL:
             return self._do_detect_all(target)
         return False
@@ -1175,17 +1632,22 @@ class PlannerOrchestrator(Node):
         g.yaw_tolerance = 0.5
         return self._send_and_wait(orch.SKILL_GO_TO_POSE, g)
 
-    def _send_approach(self, label):
+    def _send_approach(self, label, target='', step_index=0, locked_target_point=None):
         g = ApproachDetection.Goal()
         g.request_id = self._goal_id()
         g.mission_epoch = self._epoch
         g.target_label = label or ''
         g.approach_offset = self.approach_offset
         g.max_pixel_age_s = 1.5
+        if locked_target_point is not None:
+            g.use_locked_target = True
+            g.locked_target_point = locked_target_point
         self._last_approach_result = self._send_and_wait_result(orch.SKILL_APPROACH, g)
+        self._remember_target_nav_lock(
+            target, label, self._last_approach_result, step_index)
         return getattr(self._last_approach_result, 'outcome', None) == 0
 
-    def _send_approach_mark(self, mark_id, label, cand_pixels):
+    def _send_approach_mark(self, mark_id, label, cand_pixels, target='', step_index=0):
         """DRIVE_TO_VISIBLE(mark_id): inject the chosen candidate's pixel onto
         /target_pixel (kept fresh by a background republisher so ApproachDetection's
         freshness gate stays satisfied through the whole drive), then approach.
@@ -1213,9 +1675,25 @@ class PlannerOrchestrator(Node):
         pub_thread = threading.Thread(target=_republish, daemon=True)
         pub_thread.start()
         try:
-            return self._send_approach(label)
+            return self._send_approach(label, target, step_index)
         finally:
             stop.set()
+
+    def _send_locked_target_approach(self, target='', step_index=0):
+        lock = self._active_target_nav_lock(target)
+        if lock is None:
+            self.get_logger().warn('DRIVE_TO_LOCKED_TARGET: no active target nav-lock')
+            return False
+        lock['attempts'] = int(lock.get('attempts', 0)) + 1
+        self.get_logger().info(
+            'target_nav_lock: continuing saved target "%s" attempt %d/%d'
+            % (lock.get('label', target), lock['attempts'],
+               self.locked_target_approach_max_attempts))
+        return self._send_approach(
+            str(lock.get('label', target) or target),
+            target=target,
+            step_index=step_index,
+            locked_target_point=lock.get('target_point'))
 
     def _call_action(self, ac, goal, timeout_s):
         """Send a goal and block (worker thread) for its result message; None on

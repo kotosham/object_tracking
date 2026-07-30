@@ -2,8 +2,8 @@
 from planner_orchestrator.planner_logic import (
     Action, Candidate, CircuitBreaker, ContextMark, DegradationLatch, MockPlanner,
     NotesBuffer, Observation, ReplanScheduler, build_vlm_options, parse_vlm_action,
-    context_mark_promotable_to_target, validate_action, DRIVE_TO_VISIBLE,
-    DETECT_ALL, DRIVE_FORWARD, TURN, DONE,
+    context_mark_promotable_to_target, lost_target_lock_recovery_action,
+    validate_action, DRIVE_TO_VISIBLE, DETECT_ALL, DRIVE_FORWARD, TURN, DONE,
 )
 
 
@@ -70,7 +70,7 @@ def test_mock_semantic_explore_drives_to_center_context():
     assert a.kind == DRIVE_FORWARD and a.forward_dist_m == 0.3
 
 
-def test_mock_semantic_explore_turns_when_center_context_is_blocked():
+def test_mock_semantic_explore_probes_center_context_even_if_dino_is_close():
     obs = Observation(
         target='office chair',
         context_marks=[
@@ -82,8 +82,8 @@ def test_mock_semantic_explore_turns_when_center_context_is_blocked():
                         relevance='target_like'),
         ])
     a = MockPlanner(turn_step_rad=0.6).plan(obs)
-    assert a.kind == TURN and a.turn_yaw_rad == 0.3
-    assert 'forward probe blocked' in a.rationale
+    assert a.kind == DRIVE_FORWARD
+    assert 'navigation costmaps decide' in a.rationale
 
 
 def test_mock_done_when_target_close():
@@ -183,7 +183,31 @@ def test_parse_accepts_target_probe_pseudo_action():
     assert 'target_probe' in a.rationale
 
 
-def test_parse_repairs_context_forward_to_directional_turn():
+def test_parse_recenters_edge_target_before_approach():
+    obs = Observation(
+        target='office chair',
+        candidates=[Candidate(1, 'office chair', 0.71, distance_m=2.15,
+                              side='right', center_x_norm=0.9,
+                              source='target', pixel_x_norm=0.99)])
+    a, reason = parse_vlm_action({'action': 'DRIVE_TO_VISIBLE', 'mark_id': 1}, obs)
+    assert reason == 'OK'
+    assert a.kind == TURN and a.turn_yaw_rad < 0.0
+    assert 'edge_target_guard' in a.rationale
+
+
+def test_visible_target_guard_recenters_edge_target_instead_of_done():
+    obs = Observation(
+        target='office chair',
+        candidates=[Candidate(1, 'office chair', 0.71, distance_m=2.15,
+                              side='left', center_x_norm=0.1,
+                              source='target', pixel_x_norm=0.01)])
+    a, reason = parse_vlm_action({'action': 'DONE', 'rationale': 'already found'}, obs)
+    assert reason == 'OK'
+    assert a.kind == TURN and a.turn_yaw_rad > 0.0
+    assert 'edge_target_guard' in a.rationale
+
+
+def test_parse_preserves_context_forward_corridor_probe():
     obs = Observation(
         target='office chair',
         context_marks=[
@@ -199,8 +223,29 @@ def test_parse_repairs_context_forward_to_directional_turn():
          'rationale': 'probe forward'},
         obs)
     assert reason == 'OK'
+    assert a.kind == DRIVE_FORWARD and a.forward_dist_m == 0.5
+    assert a.rationale == 'probe forward'
+
+
+def test_parse_blocks_context_forward_when_center_obstacle_is_close():
+    obs = Observation(
+        target='office chair',
+        context_marks=[
+            ContextMark(1, 'desk', 0.52, distance_m=0.34,
+                        side='center', center_x_norm=0.5,
+                        relevance='office_context'),
+            ContextMark(2, 'drawer cabinet', 0.40, distance_m=2.2,
+                        side='right', center_x_norm=0.8,
+                        relevance='office_context'),
+        ])
+    a, reason = parse_vlm_action(
+        {'action': 'DRIVE_FORWARD', 'forward_dist_m': 0.55,
+         'rationale': 'corridor ahead'},
+        obs)
+    assert reason == 'OK'
     assert a.kind == TURN and a.turn_yaw_rad < 0.0
-    assert 'replacing forward probe' in a.rationale
+    assert 'requested corridor probe is blocked' in a.rationale
+    assert 'not to approach the context object' in a.rationale
 
 
 def test_parse_normalizes_tiny_context_turn_to_directional_turn():
@@ -238,8 +283,9 @@ def test_parse_repairs_premature_done_without_strict_target():
                                    relevance='office_context')])
     a, reason = parse_vlm_action({'action': 'DONE', 'rationale': 'cannot see target'}, obs)
     assert reason == 'OK'
-    assert a.kind == TURN
+    assert a.kind == DRIVE_FORWARD
     assert 'done_guard' in a.rationale
+    assert 'navigation costmaps decide' in a.rationale
 
 
 def test_parse_allows_done_with_close_strict_target():
@@ -250,6 +296,65 @@ def test_parse_allows_done_with_close_strict_target():
     a, reason = parse_vlm_action({'action': 'DONE', 'rationale': 'target reached'}, obs)
     assert reason == 'OK'
     assert a.kind == DONE
+
+
+def test_parse_repairs_done_with_visible_target_that_is_not_close_enough():
+    obs = Observation(
+        target='office chair',
+        candidates=[Candidate(1, 'office chair', 0.89, distance_m=1.35,
+                              source='target')])
+    a, reason = parse_vlm_action({'action': 'DONE', 'rationale': 'target visible'}, obs)
+    assert reason == 'OK'
+    assert a.kind == DRIVE_TO_VISIBLE and a.mark_id == 1
+    assert 'target_guard' in a.rationale
+
+
+def test_parse_prefers_visible_target_over_refresh_when_not_close_enough():
+    obs = Observation(
+        target='office chair',
+        candidates=[Candidate(1, 'office chair', 0.86, distance_m=0.83,
+                              source='target')])
+    a, reason = parse_vlm_action({'action': 'DETECT_ALL', 'rationale': 'refresh'}, obs)
+    assert reason == 'OK'
+    assert a.kind == DRIVE_TO_VISIBLE and a.mark_id == 1
+    assert 'instead of DETECT_ALL' in a.rationale
+
+
+def test_target_lock_recovery_turns_toward_last_seen_side():
+    obs = Observation(target='office chair')
+    a = lost_target_lock_recovery_action(
+        obs, label='office chair', distance_m=2.7, side='left', age_steps=1)
+    assert a is not None
+    assert a.kind == TURN and a.turn_yaw_rad > 0.0
+    assert 'target_lock' in a.rationale
+
+
+def test_target_lock_recovery_moves_forward_for_center_target():
+    obs = Observation(target='office chair')
+    a = lost_target_lock_recovery_action(
+        obs, label='office chair', distance_m=2.7, side='center', age_steps=1,
+        forward_dist_m=0.45)
+    assert a is not None
+    assert a.kind == DRIVE_FORWARD and a.forward_dist_m == 0.45
+
+
+def test_target_lock_recovery_probes_forward_even_with_close_dino_context():
+    obs = Observation(
+        target='office chair',
+        context_marks=[ContextMark(2, 'desk table', 0.4, distance_m=0.3,
+                                   side='center', relevance='office_context')])
+    a = lost_target_lock_recovery_action(
+        obs, label='office chair', distance_m=2.7, side='center', age_steps=1)
+    assert a is not None
+    assert a.kind == DRIVE_FORWARD
+    assert 'navigation costmaps decide' in a.rationale
+
+
+def test_target_lock_recovery_ignores_other_target_label():
+    obs = Observation(target='office chair')
+    assert lost_target_lock_recovery_action(
+        obs, label='drawer cabinet', distance_m=2.7, side='left',
+        age_steps=1) is None
 
 
 # ---- VLM tool-call build / parse -------------------------------------------
@@ -283,6 +388,21 @@ def test_build_options_lists_context_marks():
         'center_x_norm': 0.74,
         'relevance': 'office_context',
     }
+
+
+def test_build_options_lists_corridor_scan():
+    obs = Observation(
+        target='office chair',
+        corridor_scan=[
+            {'view': 'right',
+             'objects': [{'label': 'desk', 'score': 0.52,
+                          'distance_m': 2.1, 'side': 'center',
+                          'relevance': 'office_context'}],
+             'summary': 'right corridor/view: desk'}
+        ])
+    scan = build_vlm_options(obs)['corridor_scan'][0]
+    assert scan['view'] == 'right'
+    assert scan['objects'][0]['label'] == 'desk'
 
 
 def test_build_options_serializes_unknown_distance_as_null():
@@ -323,7 +443,7 @@ def test_parse_remaps_context_mark_drive_to_semantic_turn():
     assert 'semantic_explore' in act.rationale
 
 
-def test_parse_remaps_center_context_mark_drive_to_short_forward():
+def test_parse_remaps_center_context_mark_drive_to_refresh_not_forward():
     obs = Observation(
         target='office chair',
         context_marks=[ContextMark(2, 'drawer cabinet', 0.40, distance_m=2.7,
@@ -331,10 +451,11 @@ def test_parse_remaps_center_context_mark_drive_to_short_forward():
                                    relevance='office_context')])
     act, reason = parse_vlm_action({'action': 'DRIVE_TO_VISIBLE', 'mark_id': 2}, obs)
     assert reason == 'OK'
-    assert act.kind == DRIVE_FORWARD and act.forward_dist_m == 0.4
+    assert act.kind == DETECT_ALL
+    assert 'not approach targets' in act.rationale
 
 
-def test_parse_remaps_center_context_mark_drive_to_turn_when_blocked():
+def test_parse_remaps_center_context_mark_drive_to_refresh_even_if_close():
     obs = Observation(
         target='office chair',
         context_marks=[
@@ -347,8 +468,8 @@ def test_parse_remaps_center_context_mark_drive_to_turn_when_blocked():
         ])
     act, reason = parse_vlm_action({'action': 'DRIVE_TO_VISIBLE', 'mark_id': 9}, obs)
     assert reason == 'OK'
-    assert act.kind == TURN and act.turn_yaw_rad > 0.0
-    assert 'forward probe blocked' in act.rationale
+    assert act.kind == DETECT_ALL
+    assert 'centered context does not define a safe approach target' in act.rationale
 
 
 def test_parse_still_rejects_low_relevance_context_mark_drive():
