@@ -2,8 +2,8 @@
 from planner_orchestrator.planner_logic import (
     Action, Candidate, CircuitBreaker, ContextMark, DegradationLatch, MockPlanner,
     NotesBuffer, Observation, ReplanScheduler, build_vlm_options, parse_vlm_action,
-    context_mark_promotable_to_target, lost_target_lock_recovery_action,
-    validate_action, DRIVE_TO_VISIBLE, DETECT_ALL, DRIVE_FORWARD, TURN, DONE,
+    lost_target_lock_recovery_action, validate_action, DRIVE_TO_VISIBLE, DETECT_ALL,
+    DRIVE_FORWARD, TURN, DONE,
 )
 
 
@@ -23,21 +23,6 @@ def test_mock_picks_best_matching_candidate():
                                   Candidate(3, 'office chair', 0.9, distance_m=3.0)])
     a = MockPlanner().plan(obs)
     assert a.kind == DRIVE_TO_VISIBLE and a.mark_id == 3   # best score among matches
-
-
-def test_target_like_context_can_be_promoted_to_target_candidate():
-    mark = ContextMark(2, 'office chair', 0.41, distance_m=1.9,
-                       side='right', relevance='target_like')
-    assert context_mark_promotable_to_target('chair', mark, min_score=0.35)
-
-
-def test_weak_or_non_target_context_is_not_promoted():
-    weak = ContextMark(9, 'chair', 0.26, distance_m=1.7,
-                       side='center', relevance='target_like')
-    desk = ContextMark(3, 'desk', 0.50, distance_m=1.5,
-                       side='left', relevance='office_context')
-    assert not context_mark_promotable_to_target('chair', weak, min_score=0.35)
-    assert not context_mark_promotable_to_target('chair', desk, min_score=0.35)
 
 
 def test_mock_detects_all_then_scans_then_done():
@@ -227,7 +212,7 @@ def test_parse_preserves_context_forward_corridor_probe():
     assert a.rationale == 'probe forward'
 
 
-def test_parse_blocks_context_forward_when_center_obstacle_is_close():
+def test_parse_shortens_context_forward_when_center_fragment_is_close():
     obs = Observation(
         target='office chair',
         context_marks=[
@@ -243,9 +228,10 @@ def test_parse_blocks_context_forward_when_center_obstacle_is_close():
          'rationale': 'corridor ahead'},
         obs)
     assert reason == 'OK'
-    assert a.kind == TURN and a.turn_yaw_rad < 0.0
-    assert 'requested corridor probe is blocked' in a.rationale
-    assert 'not to approach the context object' in a.rationale
+    assert a.kind == DRIVE_FORWARD
+    assert a.forward_dist_m == 0.30
+    assert 'guarded forward probe' in a.rationale
+    assert 'should not force another turn' in a.rationale
 
 
 def test_parse_normalizes_tiny_context_turn_to_directional_turn():

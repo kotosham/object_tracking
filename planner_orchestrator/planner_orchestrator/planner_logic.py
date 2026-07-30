@@ -43,7 +43,6 @@ CONTEXT_EXPLORE_FORWARD_M = 0.4
 CONTEXT_EXPLORE_MIN_CLEARANCE_M = 0.8
 TARGET_PROBE_TURN_RAD = 0.45
 TARGET_PROBE_FORWARD_M = 0.6
-TARGET_CONTEXT_PROMOTE_MIN_SCORE = 0.35
 STRICT_TARGET_DONE_DIST_M = 0.8
 TARGET_EDGE_REACQUIRE_MARGIN_NORM = 0.08
 
@@ -59,7 +58,7 @@ class Candidate:
     distance_m: float = 0.0
     side: str = 'center'                 # left / center / right in the camera image
     center_x_norm: float = 0.5
-    source: str = 'target'               # target / context_promoted / fallback
+    source: str = 'target'               # target / fallback
     pixel_x_norm: float = 0.5            # nav/depth point, not bbox center
     pixel_y_norm: float = 0.5
 
@@ -113,28 +112,6 @@ def context_relevance_for(target: str, label: str) -> str:
     if 'cabinet' in l or 'shelf' in l or 'box' in l:
         return 'ambiguous'
     return 'low'
-
-
-def context_mark_promotable_to_target(target: str, mark: ContextMark,
-                                      min_score: float = TARGET_CONTEXT_PROMOTE_MIN_SCORE
-                                      ) -> bool:
-    """Whether a context detection should be treated as a real target candidate.
-
-    A context pass can find the target under a broader query, e.g. target="chair"
-    while DINO office-context returns label="office chair". If the label really
-    matches the mission target and confidence is not just a tiny hint, promote it
-    so DRIVE_TO_VISIBLE may use its pixel/depth instead of only turning toward it.
-    """
-    if mark is None or int(mark.mark_id) <= 0:
-        return False
-    try:
-        score = float(mark.score)
-    except (TypeError, ValueError):
-        return False
-    if score < float(min_score):
-        return False
-    return (mark.relevance or '').lower() == 'target_like' and _label_matches(
-        target, mark.label)
 
 
 def distance_is_known(distance_m: float) -> bool:
@@ -393,8 +370,10 @@ def context_forward_to_directional_explore(action: Action, obs: Observation) -> 
     Context marks are semantic hints, not destinations. Older logic rewrote a
     VLM DRIVE_FORWARD into a TURN toward the strongest desk/cabinet, which made
     the robot orbit furniture instead of exploring the free corridor the map
-    showed. Preserve DRIVE_FORWARD unless a close centered context object makes
-    moving straight unsafe; in that case, turn to look for an adjacent corridor.
+    showed. Preserve DRIVE_FORWARD even if DINO sees a close desk/table fragment:
+    low camera viewpoints often include table edges at the bottom/center of the
+    frame while the actual corridor is still open. Shorten the step and let Nav2
+    costmaps/collision_monitor decide whether the guarded probe is safe.
     """
     if action.kind != DRIVE_FORWARD:
         return None
@@ -404,29 +383,20 @@ def context_forward_to_directional_explore(action: Action, obs: Observation) -> 
     if blocker is None:
         return None
 
-    best = best_directional_context_mark(obs)
     base = ('semantic_explore: target "%s" not visible; requested corridor '
-            'probe is blocked by close centered context mark %d "%s" at %s'
+            'probe sees close centered context mark %d "%s" at %s'
             % (obs.target, blocker.mark_id, blocker.label,
                format_distance(blocker.distance_m)))
     if action.rationale:
         base += '; original rationale: ' + action.rationale
-    if best is None:
-        return Action(DETECT_ALL,
-                      rationale=(base + '; refresh detections before moving, '
-                                 'do not drive into the context object'))
-    if best.side == 'left':
-        return Action(TURN, turn_yaw_rad=CONTEXT_EXPLORE_TURN_RAD,
-                      arg_label=best.label,
-                      rationale=(base + '; turn left to search for free space '
-                                 'beside the obstacle, not to approach the context object'))
-    if best.side == 'right':
-        return Action(TURN, turn_yaw_rad=-CONTEXT_EXPLORE_TURN_RAD,
-                      arg_label=best.label,
-                      rationale=(base + '; turn right to search for free space '
-                                 'beside the obstacle, not to approach the context object'))
-
-    return None
+    guarded_step = min(max(0.05, float(action.forward_dist_m)), 0.30)
+    return Action(
+        DRIVE_FORWARD,
+        forward_dist_m=guarded_step,
+        arg_label=action.arg_label,
+        rationale=(base + '; keep exploring the visible corridor with a shortened '
+                   'guarded forward probe; context furniture is not a destination '
+                   'and should not force another turn'))
 
 
 def context_turn_to_directional_explore(action: Action, obs: Observation) -> Optional[Action]:

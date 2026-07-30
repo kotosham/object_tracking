@@ -2,6 +2,7 @@
 
 from planner_orchestrator.orchestrator_node import PlannerOrchestrator
 from geometry_msgs.msg import PointStamped, PoseStamped
+from ar_project_msgs.action import ApproachDetection
 
 from planner_orchestrator.planner_logic import (
     Action, Candidate, ContextMark, NotesBuffer, Observation, DRIVE_FORWARD,
@@ -11,6 +12,9 @@ from planner_orchestrator.planner_logic import (
 
 class _Logger:
     def info(self, *_args, **_kwargs):
+        pass
+
+    def warn(self, *_args, **_kwargs):
         pass
 
 
@@ -30,6 +34,9 @@ def _bare_orchestrator():
     node._semantic_turn_streak = 2
     node.locked_target_approach_max_attempts = 8
     node._target_nav_lock = None
+    node.target_approach_blocked_recovery_steps = 2
+    node.target_approach_blocked_forward_m = 0.55
+    node._target_approach_blocked = None
     node._corridor_scan = {}
     node.notes = NotesBuffer()
     node.get_logger = lambda: _Logger()
@@ -53,6 +60,21 @@ def _nav_lock(target='office chair'):
         'final_goal_pose': pose,
         'attempts': 0,
     }
+
+
+def _approach_result(outcome=ApproachDetection.Result.SUCCEEDED):
+    res = ApproachDetection.Result()
+    res.outcome = outcome
+    res.target_point = PointStamped()
+    res.target_point.header.frame_id = 'map'
+    res.target_point.point.x = 4.0
+    res.target_point.point.y = 1.5
+    res.final_goal_pose = PoseStamped()
+    res.final_goal_pose.header.frame_id = 'map'
+    res.final_goal_pose.pose.position.x = 3.4
+    res.final_goal_pose.pose.position.y = 1.3
+    res.final_distance_m = 3.2
+    return res
 
 
 def test_antioscillation_probes_forward_even_with_close_dino_context():
@@ -117,12 +139,12 @@ def test_initial_scan_sweeps_right_then_left_when_strict_target_absent():
     assert node._action_role(right, obs) == 'initial_scan'
 
 
-def test_initial_scan_ignores_context_promoted_but_stops_for_strict_target():
+def test_initial_scan_ignores_context_marks_but_stops_for_strict_target():
     node = _bare_orchestrator()
-    promoted = Observation(
+    context_only = Observation(
         target='office chair',
-        candidates=[Candidate(3, 'office chair', 0.44, distance_m=2.0,
-                              source='context_promoted')],
+        context_marks=[ContextMark(3, 'office chair', 0.44, distance_m=2.0,
+                                   side='right', relevance='target_like')],
     )
     strict = Observation(
         target='office chair',
@@ -130,7 +152,7 @@ def test_initial_scan_ignores_context_promoted_but_stops_for_strict_target():
                               source='target')],
     )
 
-    assert node._initial_scan_actions(promoted, 0)
+    assert node._initial_scan_actions(context_only, 0)
     assert node._initial_scan_actions(strict, 0) == []
 
 
@@ -187,3 +209,46 @@ def test_nav_lock_updates_from_strict_visible_target_without_vlm():
     assert action.kind == DRIVE_TO_VISIBLE
     assert action.mark_id == 7
     assert 'update the locked map point' in action.rationale
+
+
+def test_blocked_target_approach_generates_active_forward_recovery():
+    node = _bare_orchestrator()
+    node._target_approach_blocked = {
+        'target': 'office chair',
+        'label': 'office chair',
+        'distance_m': 6.8,
+        'recoveries': 0,
+        'reason': 'no safe bounded approach',
+    }
+    obs = Observation(
+        target='office chair',
+        candidates=[Candidate(1, 'office chair', 0.9, distance_m=6.8,
+                              source='target')],
+    )
+
+    action = node._target_approach_blocked_action(obs, 'office chair', step_index=9)
+
+    assert action.kind == DRIVE_FORWARD
+    assert action.forward_dist_m == node.target_approach_blocked_forward_m
+    assert node._action_role(action, obs) == 'target_approach_blocked'
+    assert 'no safe bounded approach' in action.rationale
+
+
+def test_aborted_approach_sets_blocked_recovery_and_keeps_target_lock():
+    node = _bare_orchestrator()
+    node._last_approach_result = _approach_result(ApproachDetection.Result.ABORTED)
+    action = Action(DRIVE_TO_VISIBLE, mark_id=1, arg_label='office chair')
+    obs = Observation(
+        target='office chair',
+        candidates=[Candidate(1, 'office chair', 0.9, distance_m=6.8,
+                              source='target')],
+    )
+
+    blocked = node._remember_target_approach_blocked(
+        action, obs, 'office chair', step_index=4, ok=False)
+
+    assert blocked
+    assert node._target_approach_blocked['label'] == 'office chair'
+    assert node._target_approach_blocked['recoveries'] == 0
+    assert node._target_nav_lock['target_point'].point.x == 4.0
+    assert node._target_nav_lock['blocked'] is True

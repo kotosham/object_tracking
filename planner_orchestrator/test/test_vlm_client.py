@@ -85,6 +85,7 @@ def test_system_prompt_prioritizes_corridor_exploration():
     assert 'Do not spend many steps rotating' in SYSTEM_PROMPT
     assert 'Context objects are ONLY cues' in SYSTEM_PROMPT
     assert 'not destinations and not objects to approach' in SYSTEM_PROMPT
+    assert 'context_promoted' not in SYSTEM_PROMPT
     assert 'initial_scan turns are already done' in SYSTEM_PROMPT
     assert 'corridor_scan entries' in SYSTEM_PROMPT
     assert 'prefer a real free/unknown corridor' in SYSTEM_PROMPT

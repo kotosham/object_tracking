@@ -62,8 +62,7 @@ from planner_orchestrator import orchestration as orch
 from planner_orchestrator.planner_logic import (
     Action, Candidate, CircuitBreaker, ContextMark, DegradationLatch,
     NotesBuffer, Observation, DETECT_ALL, DRIVE_FORWARD, DRIVE_TO_VISIBLE,
-    TURN, context_mark_promotable_to_target,
-    context_relevance_for, distance_for_options, distance_is_known,
+    TURN, context_relevance_for, distance_for_options, distance_is_known,
     format_distance, image_side, lost_target_lock_recovery_action,
 )
 from planner_orchestrator.vlm_client import make_client
@@ -156,7 +155,7 @@ class PlannerOrchestrator(Node):
         # detection and DETECT_ALL. Prefer the split thresholds below: they mirror
         # the diploma tracker (DINO strict for target, YOLOE permissive for overview).
         self.declare_parameter('detect_conf', 0.0)
-        self.declare_parameter('target_detect_conf', 0.50)
+        self.declare_parameter('target_detect_conf', 0.60)
         self.declare_parameter('detect_all_conf', 0.08)
         # DINO occasionally emits one-frame semantic spikes ("chair" on a handle,
         # ball, table edge). Require the target-like object to be seen twice on
@@ -171,6 +170,8 @@ class PlannerOrchestrator(Node):
         # falling straight into a blind scan.
         self.declare_parameter('auto_context_when_target_absent', True)
         self.declare_parameter('context_detect_conf', 0.30)
+        # Legacy no-op kept so old runbook commands with this parameter still start.
+        # Context detections are no longer promoted to visible target candidates.
         self.declare_parameter('context_target_promote_conf', 0.35)
         self.declare_parameter('semantic_turn_antioscillation', True)
         self.declare_parameter('semantic_turn_max_streak', 1)
@@ -186,6 +187,11 @@ class PlannerOrchestrator(Node):
         # because it overflows the camera; that should not drop us back to context
         # search while a saved target coordinate is still actionable.
         self.declare_parameter('locked_target_approach_max_attempts', 8)
+        # If the target is confidently localized but ApproachDetection cannot find
+        # a safe final or bounded approach pose yet, do not keep retrying the same
+        # blocked target. Move a little to expand the map/reposition, then retry.
+        self.declare_parameter('target_approach_blocked_recovery_steps', 2)
+        self.declare_parameter('target_approach_blocked_forward_m', 0.55)
         self.declare_parameter(
             'office_context_query',
             'desk | table | drawer cabinet | cabinet | file cabinet | bookshelf | shelf | '
@@ -237,7 +243,7 @@ class PlannerOrchestrator(Node):
             0.0, float(g('target_confirm_depth_tolerance_m')))
         self.auto_context_when_target_absent = bool(g('auto_context_when_target_absent'))
         self.context_detect_conf = float(g('context_detect_conf'))
-        self.context_target_promote_conf = float(g('context_target_promote_conf'))
+        self.context_target_promote_conf = float(g('context_target_promote_conf'))  # legacy no-op
         self.semantic_turn_antioscillation = bool(g('semantic_turn_antioscillation'))
         self.semantic_turn_max_streak = max(1, int(g('semantic_turn_max_streak')))
         self.semantic_probe_forward_m = float(g('semantic_probe_forward_m'))
@@ -250,6 +256,11 @@ class PlannerOrchestrator(Node):
         self.locked_target_approach_max_attempts = max(
             0, int(g('locked_target_approach_max_attempts')))
         self._target_nav_lock = None
+        self.target_approach_blocked_recovery_steps = max(
+            0, int(g('target_approach_blocked_recovery_steps')))
+        self.target_approach_blocked_forward_m = max(
+            0.05, float(g('target_approach_blocked_forward_m')))
+        self._target_approach_blocked = None
         self._corridor_scan = {}
         self.office_context_query = str(g('office_context_query'))
         self.camera_image_width = max(1, int(g('camera_image_width')))
@@ -424,10 +435,7 @@ class PlannerOrchestrator(Node):
         context_marks = []
         skip_context_for_nav_lock = self._active_target_nav_lock(target) is not None
         if not cands and self.auto_context_when_target_absent and not skip_context_for_nav_lock:
-            context_marks, context_jpeg, promoted_cands, promoted_pixels = self._detect_context(target)
-            if promoted_cands:
-                cands = promoted_cands
-                pixels = promoted_pixels
+            context_marks, context_jpeg = self._detect_context(target)
             if context_jpeg:
                 jpeg = context_jpeg
         map_jpeg, map_text = self._render_map()
@@ -531,9 +539,9 @@ class PlannerOrchestrator(Node):
         current observation. If it is empty, look right first, then sweep left in
         two signed 90-degree turns. Splitting the 180-degree sweep avoids the Nav2
         ambiguity where the controller can choose either physical direction for a
-        pi-radian yaw change. Context/promoted hints do not cancel the scan: they
-        are useful for later corridor choice, but too noisy to skip the initial
-        map-building sweep.
+        pi-radian yaw change. Context hints do not cancel the scan: they are useful
+        for later corridor choice, but too noisy to skip the initial map-building
+        sweep.
         """
         if not self.initial_scan_when_target_absent or obs is None:
             return []
@@ -674,7 +682,8 @@ class PlannerOrchestrator(Node):
         except AttributeError:
             return False
 
-    def _remember_target_nav_lock(self, target, label, result, step_index):
+    def _remember_target_nav_lock(self, target, label, result, step_index,
+                                  allow_blocked=False):
         """Latch the map target from a successful strict visual approach.
 
         This is the missing contract between perception and navigation: after one
@@ -682,7 +691,10 @@ class PlannerOrchestrator(Node):
         erase the saved map coordinate. Later steps may update this lock from a
         fresh strict detection, or continue toward the locked point directly.
         """
-        if result is None or getattr(result, 'outcome', None) != 0:
+        outcome = getattr(result, 'outcome', None)
+        blocked = outcome == ApproachDetection.Result.ABORTED
+        if result is None or (outcome != ApproachDetection.Result.SUCCEEDED
+                              and not (allow_blocked and blocked)):
             return
         target_point = getattr(result, 'target_point', None)
         final_goal_pose = getattr(result, 'final_goal_pose', None)
@@ -698,14 +710,16 @@ class PlannerOrchestrator(Node):
             'bounded_step': bool(getattr(result, 'bounded_step', False)),
             'step': int(step_index),
             'attempts': int(previous.get('attempts', 0)),
+            'blocked': bool(blocked),
         }
         self.get_logger().info(
             'target_nav_lock: remembered "%s" target=(%.2f,%.2f) final_goal=(%.2f,%.2f) '
-            'bounded=%s final_distance=%.2fm'
+            'bounded=%s blocked=%s final_distance=%.2fm'
             % (self._target_nav_lock['label'],
                target_point.point.x, target_point.point.y,
                final_goal_pose.pose.position.x, final_goal_pose.pose.position.y,
                self._target_nav_lock['bounded_step'],
+               self._target_nav_lock['blocked'],
                self._target_nav_lock['final_distance_m']))
         self._activity(
             'target_nav_lock',
@@ -716,6 +730,7 @@ class PlannerOrchestrator(Node):
             final_goal_x=round(float(final_goal_pose.pose.position.x), 2),
             final_goal_y=round(float(final_goal_pose.pose.position.y), 2),
             bounded=bool(self._target_nav_lock['bounded_step']),
+            blocked=bool(self._target_nav_lock['blocked']),
             final_distance_m=round(float(self._target_nav_lock['final_distance_m']), 2))
 
     def _active_target_nav_lock(self, target):
@@ -752,6 +767,109 @@ class PlannerOrchestrator(Node):
                        'the object is not currently visible in the frame')
             % (lock['target_point'].point.x, lock['target_point'].point.y,
                lock['target_point'].header.frame_id))
+
+    def _active_target_approach_blocked(self, target):
+        block = self._target_approach_blocked
+        if not block or block.get('target') != target:
+            return None
+        if self.target_approach_blocked_recovery_steps <= 0:
+            return None
+        if int(block.get('recoveries', 0)) >= self.target_approach_blocked_recovery_steps:
+            return None
+        return block
+
+    def _target_approach_blocked_action(self, obs, target, step_index):
+        block = self._active_target_approach_blocked(target)
+        if block is None:
+            return None
+        remaining = self.target_approach_blocked_recovery_steps - int(
+            block.get('recoveries', 0))
+        label = str(block.get('label') or target)
+        reason = str(block.get('reason') or 'approach aborted')
+        distance = block.get('distance_m', None)
+        dist_text = ('unknown' if not distance_is_known(distance)
+                     else '%.2fm' % float(distance))
+        return Action(
+            DRIVE_FORWARD,
+            forward_dist_m=self.target_approach_blocked_forward_m,
+            arg_label=label,
+            rationale=(
+                'target_approach_blocked: confirmed target "%s" is localized but '
+                'ApproachDetection found no safe bounded approach (%s, target_range=%s); '
+                'advance %.2fm through the current free corridor to expand/reposition, '
+                'then retry the saved target (%d recovery step(s) left)'
+                % (label, reason, dist_text, self.target_approach_blocked_forward_m,
+                   remaining)))
+
+    @staticmethod
+    def _is_target_approach_blocked_recovery(action):
+        return bool(
+            action is not None
+            and action.kind in (TURN, DRIVE_FORWARD)
+            and 'target_approach_blocked:' in (action.rationale or '').lower())
+
+    def _remember_target_approach_blocked_motion(self, action, ok):
+        if not self._is_target_approach_blocked_recovery(action):
+            return
+        block = self._target_approach_blocked
+        if not block:
+            return
+        block['recoveries'] = int(block.get('recoveries', 0)) + 1
+        self._activity(
+            'target_approach_blocked_recovery',
+            label=block.get('label', ''),
+            recovery=block['recoveries'],
+            max_recovery=self.target_approach_blocked_recovery_steps,
+            motion_ok=bool(ok))
+
+    def _remember_target_approach_blocked(self, action, obs, target, step_index, ok):
+        if action.kind != DRIVE_TO_VISIBLE:
+            return False
+        if ok:
+            if self._target_approach_blocked is not None:
+                self.get_logger().info(
+                    'target_approach_blocked: cleared after successful target approach')
+            self._target_approach_blocked = None
+            return False
+        res = self._last_approach_result
+        if getattr(res, 'outcome', None) != ApproachDetection.Result.ABORTED:
+            return False
+        cand = None
+        if obs is not None and int(action.mark_id) != 0:
+            cand = next((c for c in obs.candidates
+                         if int(c.mark_id) == int(action.mark_id)), None)
+        lock = self._active_target_nav_lock(target)
+        label = (
+            getattr(cand, 'label', None)
+            or action.arg_label
+            or (lock.get('label') if lock else None)
+            or target)
+        distance = (
+            getattr(cand, 'distance_m', None)
+            if cand is not None else
+            (lock.get('final_distance_m') if lock else None))
+        self._remember_target_nav_lock(
+            target, label, res, step_index, allow_blocked=True)
+        self._target_approach_blocked = {
+            'target': target,
+            'label': label,
+            'distance_m': distance,
+            'step': int(step_index),
+            'recoveries': 0,
+            'reason': 'no safe bounded approach',
+        }
+        self.get_logger().warn(
+            'target_approach_blocked: "%s" approach aborted; will do %d recovery '
+            'motion(s) before retrying target'
+            % (label, self.target_approach_blocked_recovery_steps))
+        self._activity(
+            'target_approach_blocked',
+            step=step_index,
+            label=label,
+            distance_m=distance_for_options(distance),
+            recovery_steps=self.target_approach_blocked_recovery_steps,
+            action=self._action_brief(action))
+        return True
 
     def _refresh_candidates(self, target):
         """Query the edge DetectTarget service. Returns (candidates, pixels, jpeg)
@@ -960,7 +1078,7 @@ class PlannerOrchestrator(Node):
         gives the VLM semantic search cues such as 'desk on the left' without
         pretending those context objects are final approach targets."""
         if not self._detect.wait_for_server(timeout_sec=1.0):
-            return [], None, [], {}
+            return [], None
         query = self._context_query_for_target(target)
         conf_threshold = self.context_detect_conf if query else self.detect_all_conf
         res = self._call_detect_target(query, conf_threshold, True)
@@ -996,36 +1114,10 @@ class PlannerOrchestrator(Node):
                 if ((m.relevance or '').lower() != 'target_like'
                     or int(m.mark_id) in confirmed_target_like_ids)
             ]
-        promotable_ids = {
-            int(m.mark_id) for m in marks
-            if context_mark_promotable_to_target(
-                target, m, self.context_target_promote_conf)
-        }
-        promoted = [
-            Candidate(mark_id=c.mark_id, label=c.label, score=c.score,
-                      distance_m=c.distance_m, side=c.side,
-                      center_x_norm=c.center_x_norm,
-                      pixel_x_norm=c.pixel_x_norm,
-                      pixel_y_norm=c.pixel_y_norm,
-                      source='context_promoted')
-            for c in det_cands if int(c.mark_id) in promotable_ids
-        ]
-        promoted_pixels = {
-            int(mark_id): point for mark_id, point in det_pixels.items()
-            if int(mark_id) in promotable_ids
-        }
         if marks:
             backend = 'dino_office' if query else 'yoloe_all'
             self.get_logger().info('context_detect[%s]: %d object(s): %s' % (
                 backend, len(marks), ', '.join(self._context_brief(m) for m in marks)))
-        if promoted:
-            self.get_logger().info(
-                'context_promote: %d target-like context object(s) promoted to candidates: %s'
-                % (len(promoted), ', '.join(
-                    '%d:%s(%.2f@%s,%s)' % (
-                        c.mark_id, c.label, c.score,
-                        format_distance(c.distance_m), c.side)
-                    for c in promoted)))
         self._activity(
             'context_detect',
             backend='dino_office' if query else 'yoloe_all',
@@ -1033,13 +1125,8 @@ class PlannerOrchestrator(Node):
                       'score': round(float(m.score), 2),
                       'distance_m': distance_for_options(m.distance_m),
                       'side': m.side, 'relevance': m.relevance}
-                     for m in marks],
-            promoted=[{'mark_id': c.mark_id, 'label': c.label,
-                       'score': round(float(c.score), 2),
-                       'distance_m': distance_for_options(c.distance_m),
-                       'side': c.side}
-                      for c in promoted])
-        return marks, jpeg, promoted, promoted_pixels
+                     for m in marks])
+        return marks, jpeg
 
     def _lookup_robot_pose(self, target_frame, timeout_s=0.0):
         try:
@@ -1151,9 +1238,14 @@ class PlannerOrchestrator(Node):
         ctx = ('' if best_context is None else " context=%d best_context='%s' %s %.2f @%s"
                % (len(obs.context_marks), best_context.label, best_context.side,
                   best_context.score, format_distance(best_context.distance_m)))
-        locked_action = self._locked_target_action(obs, target, step)
-        initial_scan_actions = [] if locked_action is not None else self._initial_scan_actions(obs, step)
-        if locked_action is not None:
+        blocked_action = self._target_approach_blocked_action(obs, target, step)
+        locked_action = None if blocked_action is not None else self._locked_target_action(
+            obs, target, step)
+        initial_scan_actions = [] if (blocked_action is not None or locked_action is not None) \
+            else self._initial_scan_actions(obs, step)
+        if blocked_action is not None:
+            planner_name = 'target_approach_blocked'
+        elif locked_action is not None:
             planner_name = 'target_nav_lock'
         elif initial_scan_actions:
             planner_name = 'initial_scan'
@@ -1187,6 +1279,20 @@ class PlannerOrchestrator(Node):
                 actions=[{'action': self._action_brief(a),
                           'role': self._action_role(a, obs),
                           'rationale': a.rationale or ''} for a in actions])
+            self.heartbeat.set_latency_ms(0.0)
+            self.heartbeat.set_status(
+                Heartbeat.DEGRADED if (self.cb.is_open or self._degrade.degraded)
+                else Heartbeat.OK)
+            return _PlanBundle(actions, pixels, obs)
+        if blocked_action is not None:
+            actions = [blocked_action]
+            self.get_logger().info('plan@step %d: target blocked recovery action: %s'
+                                   % (step, self._action_brief(blocked_action)))
+            self._activity(
+                'plan', step=step, latency_ms=0.0, source='target_approach_blocked',
+                actions=[{'action': self._action_brief(blocked_action),
+                          'role': self._action_role(blocked_action, obs),
+                          'rationale': blocked_action.rationale or ''}])
             self.heartbeat.set_latency_ms(0.0)
             self.heartbeat.set_status(
                 Heartbeat.DEGRADED if (self.cb.is_open or self._degrade.degraded)
@@ -1282,6 +1388,7 @@ class PlannerOrchestrator(Node):
         self._semantic_turn_streak = 0
         self._target_lock = None
         self._target_nav_lock = None
+        self._target_approach_blocked = None
         self._corridor_scan = {}
         step = 0
         pending = None
@@ -1340,6 +1447,15 @@ class PlannerOrchestrator(Node):
                                    action=self._action_brief(action),
                                    result='ok' if ok else 'failed',
                                    duration_s=round(time.monotonic() - t0, 2))
+                    blocked = self._remember_target_approach_blocked(
+                        action, bundle.obs, target, step, ok)
+                    self._remember_target_approach_blocked_motion(action, ok)
+                    if blocked and pending is not None:
+                        # A precomputed async plan may still contain the now-known
+                        # blocked DRIVE_TO_VISIBLE retry. Drop it so the next plan
+                        # sees target_approach_blocked and actively repositions.
+                        pending.cancel()
+                        pending = None
                     self._remember_semantic_motion(action, bundle.obs, role, ok)
                     self._publish_notes(target)
                     self._settle_after_turn(action, ok)
@@ -1402,6 +1518,8 @@ class PlannerOrchestrator(Node):
             return 'target_approach'
         if action.kind in (TURN, DRIVE_FORWARD):
             rationale = (action.rationale or '').lower()
+            if 'target_approach_blocked:' in rationale:
+                return 'target_approach_blocked'
             if 'initial_scan:' in rationale:
                 return 'initial_scan'
             useful_context = bool(
@@ -1515,18 +1633,6 @@ class PlannerOrchestrator(Node):
         if obs is not None:
             cand = next((c for c in obs.candidates
                          if int(c.mark_id) == int(action.mark_id)), None)
-        if cand is not None and (cand.source or '') == 'context_promoted':
-            self.get_logger().info(
-                'context-promoted target approach succeeded -> continuing mission '
-                'until strict target detector confirms the goal')
-            self._activity(
-                'step_progress', action=self._action_brief(action),
-                result='context_promoted_probe',
-                candidate_label=cand.label,
-                candidate_score=round(float(cand.score), 2),
-                final_distance_m=(round(float(final_distance), 2)
-                                  if distance_is_known(final_distance) else None))
-            return False
         if bounded_step:
             final_threshold = self.approach_offset + 0.35
             if distance_is_known(final_distance):
@@ -1605,6 +1711,7 @@ class PlannerOrchestrator(Node):
             gx, gy, gyaw = orch.relative_goal(pose[0], pose[1], pose[2], action)
             return self._send_goto(gx, gy, gyaw, frame_id=pose[3])
         if action.kind == DRIVE_TO_VISIBLE:
+            self._last_approach_result = None
             if action.mark_id == 0 and action.arg_label == '__locked_target__':
                 return self._send_locked_target_approach(target, step_index)
             return self._send_approach_mark(
