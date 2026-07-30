@@ -6,7 +6,8 @@ from planner_orchestrator.planner_logic import (
 )
 from planner_orchestrator.orchestration import (
     skill_for_action, is_terminal, relative_goal, wrap_angle, should_launch_lead_replan,
-    describe_occupancy_grid, forward_clearance,
+    describe_occupancy_grid, detection_map_xy, drive_goal_candidates,
+    forward_clearance, rooms_to_map_frame,
     SKILL_GO_TO_POSE, SKILL_APPROACH, SKILL_NONE,
 )
 
@@ -117,3 +118,93 @@ def test_describe_occupancy_grid():
     assert '0.50' in desc and '-0.50' in desc        # robot pose, %.2f
     assert '50%' in desc                              # (600+200)/1600 explored
     assert 'white=free' in desc and 'gray=unknown' in desc   # legend for the VLM
+    # Не только цвет, но и что он значит для поиска: серое = где ещё не были,
+    # значит именно туда и надо ехать. Без этой фразы карта модели ничего не
+    # давала — она кружила по уже разведанному белому пятну.
+    low = desc.lower()
+    assert 'already seen' in low and 'toward gray' in low
+
+
+def test_drive_goal_candidates_prefers_straight_then_far():
+    cands = drive_goal_candidates(1.0, 0.25, max_bearing_rad=0.7,
+                                  bearing_step_rad=0.35, dist_step_m=0.25)
+    # первым идёт ровно то, что просили: прямо по курсу и на всю дистанцию
+    assert cands[0] == (0.0, 1.0)
+    # внутри одного направления — от дальнего к ближнему
+    straight = [d for b, d in cands if b == 0.0]
+    assert straight == sorted(straight, reverse=True) and straight[-1] >= 0.25
+    # отклонения растут по модулю; за max_bearing не выходим
+    order = []
+    for b, _ in cands:
+        if not order or order[-1] != b:
+            order.append(b)
+    assert order == [0.0, 0.35, -0.35, 0.7, -0.7]
+    assert all(abs(b) <= 0.7 + 1e-9 for b, _ in cands)
+
+
+def test_rooms_shift_from_world_into_map_frame():
+    # Мир house: спавн (-7, 0), значит начало кадра `map` там же. Комната,
+    # занимающая в мире x -7.4..-2.0, на карте SLAM начинается у -0.4.
+    rooms = {'bedroom': (-7.4, -2.0, 1.1, 4.9)}
+    out = rooms_to_map_frame(rooms, -7.0, 0.0, 0.0)
+    x0, x1, y0, y1 = out['bedroom']
+    assert math.isclose(x0, -0.4) and math.isclose(x1, 5.0)
+    assert math.isclose(y0, 1.1) and math.isclose(y1, 4.9)   # по Y сдвига нет
+
+
+def test_rooms_unchanged_when_spawn_is_origin():
+    rooms = {'hall': (-1.0, 1.0, -2.0, 2.0)}
+    assert rooms_to_map_frame(rooms, 0.0, 0.0, 0.0) == rooms
+    assert rooms_to_map_frame({}, 3.0, 4.0, 1.0) == {}
+
+
+def test_rooms_rotated_spawn_gives_enclosing_box():
+    # Курс старта 90°: мировая ось X становится осью Y карты. Комната
+    # 1..2 x -0.5..0.5 переходит в -0.5..0.5 x 1..2 (с точностью до знака оси).
+    out = rooms_to_map_frame({'r': (1.0, 2.0, -0.5, 0.5)}, 0.0, 0.0, math.pi / 2)
+    x0, x1, y0, y1 = out['r']
+    assert math.isclose(x0, -0.5, abs_tol=1e-9) and math.isclose(x1, 0.5, abs_tol=1e-9)
+    assert math.isclose(y0, -2.0, abs_tol=1e-9) and math.isclose(y1, -1.0, abs_tol=1e-9)
+
+
+def test_detection_lands_ahead_of_the_robot():
+    # метка в центре кадра, 2 м: строго по курсу
+    x, y = detection_map_xy(1.0, 2.0, 0.0, 2.0, u_px=320.0, fx=600.0, cx=320.0)
+    assert math.isclose(x, 3.0) and math.isclose(y, 2.0)
+
+
+def test_detection_right_of_centre_goes_right_of_heading():
+    # пиксель правее центра при курсе 0 -> предмет ЮЖНЕЕ (вправо по курсу)
+    x, y = detection_map_xy(0.0, 0.0, 0.0, 2.0, u_px=620.0, fx=600.0, cx=320.0)
+    assert math.isclose(x, 2.0)
+    assert y < 0.0 and math.isclose(y, -2.0 * 300.0 / 600.0)
+    # тот же пиксель при курсе +90° -> предмет ВОСТОЧНЕЕ и впереди по Y
+    x2, y2 = detection_map_xy(0.0, 0.0, math.pi / 2, 2.0, 620.0, 600.0, 320.0)
+    assert math.isclose(x2, 1.0, abs_tol=1e-9) and math.isclose(y2, 2.0, abs_tol=1e-9)
+
+
+def test_drive_goal_candidates_offer_deviations_beyond_the_clamped_distance():
+    """Регрессия: перебор обязан ПРОДОЛЖАТЬСЯ за прямым курсом.
+
+    Исполнитель берёт объезд только если он дальше обрезанного лидаром хода. Если
+    поиск останавливается на близкой цели прямо по курсу, вызывающий её
+    отбрасывает — и веер отклонений не рассматривается вовсе, то есть ветка
+    объезда мертва. Проверяем, что среди целей ДАЛЬШЕ обрезанного хода есть
+    отклонённые от курса.
+    """
+    asked, clamped = 1.2, 0.7
+    cands = drive_goal_candidates(asked, 0.25, max_bearing_rad=1.05,
+                                  bearing_step_rad=0.35, dist_step_m=0.25)
+    better = [(b, d) for b, d in cands if d > clamped + 1e-6]
+    assert better, 'нет ни одной цели дальше обрезанного хода'
+    assert any(b != 0.0 for b, _ in better), 'все дальние цели строго по курсу'
+    # и самая дальняя строго по курсу тоже в списке: она законна, когда карта
+    # говорит, что впереди свободно, а лидар видит стену не по центру корпуса
+    assert (0.0, asked) in cands
+
+
+def test_drive_goal_candidates_never_shorter_than_minimum():
+    # запрос короче минимального шага не должен рождать заведомо мёртвые цели:
+    # Nav2 такую цель считает достигнутой мгновенно, и робот не трогается
+    cands = drive_goal_candidates(0.1, 0.25, max_bearing_rad=0.0)
+    assert cands == [(0.0, 0.25)]

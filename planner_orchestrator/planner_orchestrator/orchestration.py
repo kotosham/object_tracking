@@ -61,23 +61,117 @@ def describe_occupancy_grid(width: int, height: int, resolution: float,
                             n_free: int, n_occupied: int, n_unknown: int) -> str:
     """Human description of the SLAM occupancy map attached as the 2nd image, so the
     VLM can read it: what kind of map it is, scale, legend, and where the robot is.
-    Pure text (the pixels are rendered ROS-side). explored% = mapped / total cells."""
+    Pure text (the pixels are rendered ROS-side). explored% = mapped / total cells.
+
+    Легенда намеренно объясняет не только ЦВЕТ, но и его смысл для поиска: белое —
+    уже осмотренное, серое — куда ни один датчик не заглядывал. Без этой фразы
+    карта модели практически ничего не давала: она видела картинку, но не знала,
+    что серое — это и есть «где ещё не были», то есть единственное место, где
+    ненайденный предмет может находиться. Наблюдалось ровно так — робот кружил по
+    уже разведанному белому пятну, имея под боком неисследованные комнаты.
+    """
     total = max(1, width * height)
     explored = 100.0 * (n_free + n_occupied) / total
     span_x = width * resolution
     span_y = height * resolution
     rx, ry = robot_xy
     return (
-        'Top-down SLAM occupancy map (built incrementally as the robot drives), '
-        'attached as the 2nd image. %dx%d cells at %.3f m/cell (~%.1fm x %.1fm). '
-        'Legend: white=free/driveable, black=obstacle, gray=unknown/unexplored. '
-        'Red dot=robot, red line=its heading. Map is north-up, metric. '
-        'Explored %.0f%% (gray is still unknown). Robot at map (%.2f, %.2f) m.'
+        'Top-down SLAM occupancy map (2nd image), built by the robot itself as it '
+        'drives. %dx%d cells at %.3f m/cell (~%.1fm x %.1fm), north-up, metric. '
+        'Legend: white=free floor you have ALREADY seen and can drive on; '
+        'black=wall/obstacle; gray=unknown, never seen by any sensor. '
+        'Red dot=you, red line=the way you face. '
+        'Anything you have not found yet is in the GRAY, so explore by heading '
+        'toward gray and into rooms you have not entered -- driving around the '
+        'white searches ground you have already searched. '
+        'Explored %.0f%% of this view. You are at map (%.2f, %.2f) m.'
         % (width, height, resolution, span_x, span_y, explored, rx, ry))
 
 
 def wrap_angle(a: float) -> float:
     return math.atan2(math.sin(a), math.cos(a))
+
+
+def rooms_to_map_frame(rooms: dict, ox: float, oy: float, oyaw: float) -> dict:
+    """Комнаты из МИРОВЫХ координат в кадр `map`. {имя: (x0, x1, y0, y1)}.
+
+    Комнаты приходят из worlds.yaml, то есть в координатах мира Gazebo, а карта
+    SLAM живёт в кадре `map`, начало которого — ПОЗА СТАРТА робота. Пока эту
+    разницу не учитывали, подписи ехали ровно на вектор старта: в мире house
+    спавн (-7.0, 0.0), и прямоугольники комнат рисовались на семь метров левее
+    настоящих стен — на карте это выглядело как аккуратная сетка комнат,
+    съехавшая с занятого белым плана здания.
+
+    AABB под поворотом перестаёт быть AABB, поэтому при ненулевом yaw берётся
+    описанный прямоугольник по четырём повёрнутым углам: подпись останется в
+    своей комнате, рамка станет чуть шире. Во всех текущих мирах курс старта
+    нулевой, и путь точный.
+    """
+    if not rooms:
+        return {}
+    if abs(ox) < 1e-9 and abs(oy) < 1e-9 and abs(oyaw) < 1e-9:
+        return dict(rooms)
+    cos_y, sin_y = math.cos(-oyaw), math.sin(-oyaw)
+    out = {}
+    for name, (x0, x1, y0, y1) in rooms.items():
+        xs, ys = [], []
+        for wx, wy in ((x0, y0), (x1, y0), (x0, y1), (x1, y1)):
+            dx, dy = wx - ox, wy - oy
+            xs.append(dx * cos_y - dy * sin_y)
+            ys.append(dx * sin_y + dy * cos_y)
+        out[name] = (min(xs), max(xs), min(ys), max(ys))
+    return out
+
+
+def detection_map_xy(rx: float, ry: float, ryaw: float, depth_m: float,
+                     u_px: float, fx: float, cx: float) -> Tuple[float, float]:
+    """Куда в кадре `map` попадает детекция: поза робота + пиксель + глубина.
+
+    Глубина RealSense — это z вдоль оптической оси, а не радиус, поэтому
+    смещение вбок считается подобием, без тригонометрии: lateral =
+    depth * (u - cx) / fx. Дальше поворот в кадр карты, где forward =
+    (cos yaw, sin yaw), а right = (sin yaw, -cos yaw): пиксель правее центра
+    даёт положительный lateral, то есть смещение ВПРАВО от курса.
+
+    Смещение камеры относительно base_link (единицы сантиметров) не
+    учитывается: оно заведомо меньше ошибки самой привязки.
+    """
+    lateral = depth_m * (u_px - cx) / fx
+    return (rx + depth_m * math.cos(ryaw) + lateral * math.sin(ryaw),
+            ry + depth_m * math.sin(ryaw) - lateral * math.cos(ryaw))
+
+
+def drive_goal_candidates(asked_m: float, min_drive_m: float,
+                          max_bearing_rad: float = 1.05,
+                          bearing_step_rad: float = 0.35,
+                          dist_step_m: float = 0.25):
+    """Порядок перебора целей для DRIVE_FORWARD, когда прямо ехать некуда:
+    (отклонение от курса в радианах, расстояние в метрах), от самого желанного к
+    наименее.
+
+    Смысл: команду «вперёд» исполняет Nav2 по ПОСТРОЕННОЙ КАРТЕ, а не слепой
+    рывок по курсу. Если точка прямо по курсу лежит в стене, планировщику
+    предлагается ближайшая свободная точка примерно в том же направлении, и
+    маршрут до неё Nav2 прокладывает сам — в обход препятствия. Поэтому порядок
+    ровно такой: сперва минимальное отклонение от курса (это всё ещё «вперёд»),
+    и уже внутри него — от дальней точки к ближней, потому что далеко полезнее.
+
+    Веер ограничен ±max_bearing (по умолчанию 60°): дальше это уже не «вперёд», а
+    поворот, и решение поворачивать принимает модель, а не исполнитель.
+    """
+    asked = max(float(asked_m), float(min_drive_m))
+    bearings = [0.0]
+    b = float(bearing_step_rad)
+    while b <= float(max_bearing_rad) + 1e-9:
+        bearings += [b, -b]
+        b += float(bearing_step_rad)
+    out = []
+    for bearing in bearings:
+        d = asked
+        while d >= float(min_drive_m) - 1e-9:
+            out.append((bearing, round(d, 3)))
+            d -= float(dist_step_m)
+    return out
 
 
 def relative_goal(x: float, y: float, yaw: float, action: Action) -> Tuple[float, float, float]:

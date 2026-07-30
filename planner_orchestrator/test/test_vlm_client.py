@@ -7,7 +7,7 @@ from planner_orchestrator.planner_logic import (
     Candidate, Observation, DRIVE_TO_VISIBLE, DETECT_ALL, TURN,
 )
 from planner_orchestrator.vlm_client import (
-    ENV_API_KEY, ENV_BASE_URL, ENV_MODEL,
+    ENV_API_KEY, ENV_BASE_URL, ENV_MODEL, FEWSHOT, SYSTEM_PROMPT,
     MockVlmClient, OpenAICompatibleClient, make_client, resolve_credentials,
 )
 
@@ -92,6 +92,63 @@ def test_build_messages_attaches_map_as_second_image():
     images = [p for p in msgs[-1]['content'] if p['type'] == 'image_url']
     assert len(images) == 2                      # camera + map
     assert 'occupancy map' in msgs[-1]['content'][0]['text']   # map described in opts
+
+
+def test_system_prompt_states_the_role_and_every_input():
+    """Модель должна знать, ЧЕМ она управляет и ЧТО ей дают. Без этого она
+    получала три источника данных и не понимала, что с ними делать: смотрела на
+    карту SLAM, не зная, что серое — единственное место, где может быть
+    ненайденное, и на free_ahead_m, не зная, что это измерение, а не оценка."""
+    p = SYSTEM_PROMPT.lower()
+    assert 'wheeled robot' in p and 'find the target' in p
+    for source in ('camera image', 'visible_marks', 'depth camera',
+                   'free_ahead_m', 'objects_found', 'notes'):
+        assert source.lower() in p, source
+    # смысл цветов карты, а не только сами цвета
+    assert 'gray = never seen' in p and 'already seen' in p
+    # задний ход и потолок поворотов подряд — то, чего в промпте не было
+    assert 'no rear sensor' in p and 'two turns in a row' in p
+    # ReAct: думать раньше, чем действовать, и порядок ключей это закрепляет
+    assert p.index('"think"') < p.index('"action"')
+
+
+def test_fewshot_examples_use_the_real_request_shape():
+    """Пример в другой форме учит отвечать на запрос, которого не будет.
+    Проверяем, что реплика примера собирается той же функцией и той же формы,
+    что настоящая."""
+    c = OpenAICompatibleClient('http://x/v1', 'k', 'qwen')
+    msgs = c.build_messages(Observation(target='bus'), None)
+    real = msgs[-1]['content'][0]['text']
+    shots = [m['content'] for m in msgs if m['role'] == 'user'][:-1]
+    assert len(shots) == len(FEWSHOT) >= 4
+    for shot in shots:
+        assert shot.startswith('Target: ')
+        assert 'Options (JSON):' in shot
+        assert shot.splitlines()[-1] == real.splitlines()[-1]   # тот же хвост
+        json.loads(shot.splitlines()[2])                        # опции — валидный JSON
+    replies = [m['content'] for m in msgs if m['role'] == 'assistant']
+    for reply in replies:
+        parsed = json.loads(reply)
+        assert 'think' in parsed and 'action' in parsed
+        assert list(parsed).index('think') == 0                 # think идёт ПЕРВЫМ
+
+
+def test_fewshot_covers_the_failure_modes_seen_in_runs():
+    """Каждый пример существует из-за конкретной наблюдавшейся поломки: упёрлась
+    в стену, крутится на месте, получила отказ исполнителя, ищет не в той
+    комнате. Проверяем, что все четыре ответа в наборе есть."""
+    replies = [json.loads(r) for _, r in FEWSHOT]
+    opts = [o for o, _ in FEWSHOT]
+    wall = [r for o, r in zip(opts, replies) if o.get('free_ahead_m', 9) < 0.5]
+    assert any(r['action'] == 'TURN' for r in wall)          # у стены — поворот
+    spin = [r for o, r in zip(opts, replies)
+            if sum('TURN' in n for n in o.get('notes', [])) >= 2]
+    assert spin and all(r['action'] == 'DRIVE_FORWARD' for r in spin)
+    blocked = [r for o, r in zip(opts, replies)
+               if any('blocked' in n for n in o.get('notes', []))]
+    assert blocked and all(r['forward_dist_m'] < 0 or r['action'] == 'TURN'
+                           for r in blocked)                 # отказ -> смена приёма
+    assert any(o.get('objects_found') for o in opts)         # память о найденном
 
 
 def test_parse_response_valid_tool_call():

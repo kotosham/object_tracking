@@ -121,6 +121,21 @@ def test_build_options_omits_map_when_absent():
     assert 'map' not in opt
 
 
+def test_build_options_carries_measured_clearance_and_memory():
+    obs = Observation(target='toilet', free_ahead_m=0.3456,
+                      objects_found=[{'label': 'bed', 'x': -5.1, 'y': 3.0}])
+    opt = build_vlm_options(obs)
+    assert opt['free_ahead_m'] == 0.35            # округлено до сантиметров
+    assert opt['objects_found'] == [{'label': 'bed', 'x': -5.1, 'y': 3.0}]
+
+
+def test_build_options_omits_clearance_and_memory_when_unknown():
+    # None и пустой список — это ОТСУТСТВИЕ данных, а модель прочла бы их как
+    # факты («ноль метров впереди», «ничего не найдено»). Ключей быть не должно.
+    opt = build_vlm_options(Observation(target='bus'))
+    assert 'free_ahead_m' not in opt and 'objects_found' not in opt
+
+
 def test_parse_valid_tool_call():
     obs = Observation(target='bus', candidates=[Candidate(2, 'bus', distance_m=2.0)])
     act, reason = parse_vlm_action({'action': 'DRIVE_TO_VISIBLE', 'mark_id': 2,

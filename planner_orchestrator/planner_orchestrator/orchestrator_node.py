@@ -2,12 +2,19 @@
 """Planner Orchestrator (Phase 4): VLM-mode planner over the FLAT executive.
 
 Replans every N ATOMIC steps. Each step: build an Observation from the latest
-detections + notes (+ the camera frame for the VLM), ask the client (mock or
-OpenAI-compatible) for up to N atomic actions, and dispatch each:
-  TURN / DRIVE_FORWARD -> GoToPose at a pose RELATIVE to the robot's real pose
+detections + notes (+ the camera frame, the top-down SLAM map, the measured
+forward clearance and the map coordinates of everything found so far), ask the
+client (mock or OpenAI-compatible) for up to N atomic actions, and dispatch each:
+  TURN                 -> GoToPose at a pose RELATIVE to the robot's real pose
+  DRIVE_FORWARD        -> GoToPose ahead; when the way straight is blocked, a
+                          free goal off the heading found on the SLAM map, so
+                          Nav2 routes AROUND the obstacle instead of refusing
   DRIVE_TO_VISIBLE     -> ApproachDetection (drive to a detected object via Nav)
   DETECT_ALL           -> broad-vocab detector call -> objects + classes into notes
   DONE                 -> finish
+Every motion step reports back what PHYSICALLY happened -- measured displacement
+or rotation, plus the executive's refusal reason -- because an 'ok' the robot did
+not earn is what kept the model repeating a move that changed nothing.
 The vocabulary is deliberately small (raw motion + perception) so the VLM does its
 own navigation reasoning -- a fair comparison against the FLAT policy. The VLM is
 never on the reactive path; the executive owns motion + safety. A
@@ -49,7 +56,7 @@ from rclpy.qos import (DurabilityPolicy, HistoryPolicy, QoSProfile,
 
 from geometry_msgs.msg import PointStamped, PoseStamped
 from nav_msgs.msg import OccupancyGrid
-from sensor_msgs.msg import CompressedImage, Image, LaserScan
+from sensor_msgs.msg import CameraInfo, CompressedImage, Image, LaserScan
 from std_msgs.msg import Empty, String
 from tf2_ros import (Buffer, ConnectivityException, ExtrapolationException,
                      LookupException, TransformListener)
@@ -92,6 +99,31 @@ REPEAT_WARN_AFTER = 3
 # смотрят вперёд, — поэтому шаг заведомо короткий: освободить место для
 # разворота хватает, а вкатиться во что-то позади за 0.5 м трудно.
 REVERSE_MAX_M = 0.5
+
+# Радиус, который должен быть свободен вокруг ЦЕЛЕВОЙ точки объезда. Робот
+# ~0.35 м в ширину, Nav2 раздувает препятствия примерно на 0.25 м; 0.30 —
+# компромисс: цель заведомо не в стене, но и не отбрасываются проходы в дверях.
+GOAL_CLEAR_RADIUS_M = 0.30
+
+# Горизонтальное поле зрения цветной камеры RealSense D435 (~69°). Нужно только
+# как запасной вариант, когда /camera_info ещё не пришёл: по нему считается
+# азимут метки, чтобы положить найденный предмет на карту.
+DEFAULT_HFOV_RAD = 1.204
+
+# Порог уверенности, с которого детекция ЗАПОМИНАЕТСЯ на карте. Отдельный и
+# заведомо высокий: DETECT_ALL работает с порогом 0.12 ради полноты списка на
+# один шаг, и отмечать это на карте значило бы засеять её галлюцинациями,
+# которые потом никуда не денутся — модель им верит, потому что «уже найдено».
+DETECT_MEMORY_CONF = 0.55
+
+# Ближе этого две детекции одного класса считаются одним предметом (метры).
+# Пол-метра — примерно точность привязки: поза робота в карте, азимут пикселя и
+# дальность каждый дают свою ошибку.
+OBJECT_MERGE_M = 0.5
+
+# Сколько предметов держим в памяти. Дальше вытесняем самые неуверенные: список
+# уходит в промпт, и бесконечный он быть не может.
+OBJECT_MEMORY_MAX = 30
 
 
 def _parse_rooms(raw, logger=None):
@@ -250,6 +282,23 @@ class PlannerOrchestrator(Node):
         # его передаёт консоль из worlds.yaml. Пусто = карта остаётся чистой
         # SLAM-сеткой, как раньше.
         self.declare_parameter('rooms_spec', '')
+        # Поза начала кадра `map` в МИРОВЫХ координатах. Для SLAM это точка
+        # старта робота, поэтому консоль передаёт сюда тот же spawn, что и
+        # Gazebo. Нужна ровно затем, чтобы комнаты из worlds.yaml (мировые
+        # координаты) легли на карту SLAM, а не на семь метров в сторону.
+        self.declare_parameter('rooms_origin_x', 0.0)
+        self.declare_parameter('rooms_origin_y', 0.0)
+        self.declare_parameter('rooms_origin_yaw', 0.0)
+        # Объезд для DRIVE_FORWARD. Команду «вперёд» исполняет Nav2 по
+        # построенной карте: если точка прямо по курсу в стене, берётся
+        # ближайшая свободная примерно в том же направлении, и маршрут до неё
+        # Nav2 прокладывает сам. false = прежнее поведение (честный отказ).
+        self.declare_parameter('nav_detour', True)
+        self.declare_parameter('detour_max_bearing_rad', 1.05)
+        # Запоминание найденных предметов на карте (см. DETECT_MEMORY_CONF).
+        self.declare_parameter('detect_memory_conf', DETECT_MEMORY_CONF)
+        self.declare_parameter('camera_info_topic',
+                               '/camera/camera/color/camera_info')
         g = lambda n: self.get_parameter(n).value
         self.replan_n = max(1, int(g('replan_every_n')))
         self.turn_step = float(g('turn_step_rad'))
@@ -283,7 +332,13 @@ class PlannerOrchestrator(Node):
         self.scan_topic = str(g('scan_topic'))
         self.forward_standoff_m = float(g('forward_standoff_m'))
         self.min_drive_m = float(g('min_drive_m'))
-        self.rooms = _parse_rooms(str(g('rooms_spec') or ''), self.get_logger())
+        self.rooms = orch.rooms_to_map_frame(
+            _parse_rooms(str(g('rooms_spec') or ''), self.get_logger()),
+            float(g('rooms_origin_x')), float(g('rooms_origin_y')),
+            float(g('rooms_origin_yaw')))
+        self.nav_detour = bool(g('nav_detour'))
+        self.detour_max_bearing_rad = float(g('detour_max_bearing_rad'))
+        self.detect_memory_conf = float(g('detect_memory_conf'))
         self.forward_corridor_half_width_m = float(g('forward_corridor_half_width_m'))
         self.async_replan = bool(g('async_replan'))
         self._planner_pool = ThreadPoolExecutor(max_workers=1,
@@ -330,7 +385,14 @@ class PlannerOrchestrator(Node):
         self._lock = threading.Lock()
         self._bridge = CvBridge() if _HAVE_CV else None
         sub = ReentrantCallbackGroup()
-        if self.send_map:
+        # /map нужен ДВУМ потребителям: картинке для VLM (send_map) и объезду
+        # DRIVE_FORWARD по карте (nav_detour). Связывать их одним флагом нельзя:
+        # send_map:=false — рекомендованный в RUNBOOK способ облегчить запрос к
+        # медленному VLM, и он молча отключал бы объезд, оставляя в заметках
+        # фразу «карта не показывает свободного места» при том, что карту вообще
+        # не получали. _render_map отдельно проверяет send_map, так что подписка
+        # сама по себе ничего в промпт не тащит.
+        if self.send_map or (self.nav_detour and _HAVE_CV):
             self.create_subscription(OccupancyGrid, g('map_topic'), self._on_map,
                                      _map_latched_qos(), callback_group=sub)
         # BEST_EFFORT/no-deadline to match the detector/tracker's offered QoS (a
@@ -360,8 +422,24 @@ class PlannerOrchestrator(Node):
                                  callback_group=sub)
         self._scan = None                # latest LaserScan (forward-clearance clamp)
         self._exec_note = None           # honest per-step execution detail for notes
+        self._skill_reason = ''          # почему исполнитель отказал (в заметки)
         self._last_action_name = ''      # для счётчика повторов подряд
         self._same_action_run = 0
+        # Найденные предметы: {(label, cell_x, cell_y): {'label','x','y','score'}}
+        # в метрах кадра `map`. Живут в пределах миссии (сбрасываются в
+        # _run_mission вместе с заметками) и рисуются на карте для модели.
+        self._objects = {}
+        self._objects_lock = threading.Lock()
+        # Интринсики цветной камеры: по ним считается азимут метки, без него
+        # предмет некуда положить на карту. До прихода /camera_info работает
+        # запасной путь по DEFAULT_HFOV_RAD.
+        self._cam_fx = None
+        self._cam_cx = None
+        camera_info_topic = str(g('camera_info_topic') or '')
+        if camera_info_topic and _HAVE_CV:
+            self.create_subscription(CameraInfo, camera_info_topic,
+                                     self._on_camera_info, media_besteffort(),
+                                     callback_group=sub)
         if self.scan_topic:
             self.create_subscription(LaserScan, self.scan_topic, self._on_scan,
                                      media_besteffort(), callback_group=sub)
@@ -418,6 +496,16 @@ class PlannerOrchestrator(Node):
 
     def _on_scan(self, msg):
         self._scan = msg
+
+    def _on_camera_info(self, msg):
+        # k = [fx 0 cx; 0 fy cy; 0 0 1]. Нули значат «камера ещё не
+        # откалибрована» — такие сообщения пропускаем, иначе деление на fx=0.
+        try:
+            fx, cx = float(msg.k[0]), float(msg.k[2])
+        except (AttributeError, IndexError, TypeError, ValueError):
+            return
+        if fx > 1.0:
+            self._cam_fx, self._cam_cx = fx, cx
 
     def _on_pixel(self, msg):
         with self._lock:
@@ -509,7 +597,9 @@ class PlannerOrchestrator(Node):
         map_jpeg, map_text = self._render_map()
         obs = Observation(target=target, candidates=cands,
                           notes_facts=self.notes.facts, step_index=step_index,
-                          map_text=map_text)
+                          map_text=map_text,
+                          free_ahead_m=self._forward_clearance_m(),
+                          objects_found=self._objects_for_prompt())
         return obs, pixels, jpeg, map_jpeg
 
     def _refresh_candidates(self, target):
@@ -527,6 +617,7 @@ class PlannerOrchestrator(Node):
             g.conf_threshold = self.target_detect_conf
             res = self._call_action(self._detect, g, self.detect_timeout_s)
             if res is not None and getattr(res, 'candidates', None):
+                self._remember_objects(res.candidates)
                 cands, pix = [], {}
                 for c in res.candidates:
                     cands.append(Candidate(mark_id=int(c.mark_id), label=c.label,
@@ -563,6 +654,81 @@ class PlannerOrchestrator(Node):
             return ([Candidate(mark_id=1, label=target, score=1.0,
                                distance_m=float(px.point.z))], {1: px.point}, jpeg)
         return [], {}, jpeg
+
+    # ---- память о найденных предметах (отметки на карте SLAM) ----------------
+    def _remember_objects(self, detections):
+        """Положить уверенные детекции на карту: пиксель + глубина -> метры кадра
+        `map`, рядом с позой робота в момент съёмки.
+
+        Зачем: без этого найденное жило только строкой в заметках, откуда
+        вытеснялось через пару десятков шагов. Робот честно видел кровать,
+        сообщал о ней и через двадцать шагов не знал ни что видел её, ни где.
+        Порог намеренно высокий (detect_memory_conf, 0.55): отметка ставится
+        НАВСЕГДА в пределах миссии, и ошибка в ней дороже пропуска — модель
+        поверит собственной памяти и уедет искать несуществующий унитаз.
+
+        Геометрия — в orch.detection_map_xy. Смещение камеры относительно
+        base_link (единицы сантиметров) не учитывается: оно заведомо меньше
+        ошибки самой привязки.
+
+        Поза берётся ТЕКУЩАЯ, а не на момент кадра. Детекция случается на
+        границе шага, когда робот стоит, так что расхождения нет; но при
+        async_replan=true (в запуске выключен) перепланирование идёт параллельно
+        движению, и тогда отметка уедет на путь, пройденный за время инференса.
+        """
+        pose = self._robot_pose()
+        if pose is None or not detections:
+            return
+        rx, ry, ryaw, _ = pose
+        fx, cx = self._cam_fx, self._cam_cx
+        with self._lock:
+            frame = self._cam_bgr
+        width = frame.shape[1] if frame is not None else None
+        added = []
+        for det in detections:
+            try:
+                score = float(det.confidence)
+                depth = float(det.pixel.z)
+                u = float(det.pixel.x)
+                label = str(det.label or '').strip()
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if not label or score < self.detect_memory_conf:
+                continue
+            if not distance_is_known(depth):
+                continue
+            if fx and cx is not None:
+                use_fx, use_cx = fx, cx
+            elif width:
+                # Запасной путь без /camera_info: fx = (w/2) / tan(hfov/2).
+                use_fx = (width / 2.0) / math.tan(DEFAULT_HFOV_RAD / 2.0)
+                use_cx = width / 2.0
+            else:
+                continue
+            ox, oy = orch.detection_map_xy(rx, ry, ryaw, depth, u, use_fx, use_cx)
+            key = (label, round(ox / OBJECT_MERGE_M), round(oy / OBJECT_MERGE_M))
+            with self._objects_lock:
+                old = self._objects.get(key)
+                if old is None or score > old['score']:
+                    self._objects[key] = {'label': label, 'x': ox, 'y': oy,
+                                          'score': score}
+                    if old is None:
+                        added.append('%s at map (%.1f, %.1f)' % (label, ox, oy))
+                if len(self._objects) > OBJECT_MEMORY_MAX:
+                    worst = min(self._objects, key=lambda k: self._objects[k]['score'])
+                    self._objects.pop(worst, None)
+        if added:
+            self.get_logger().info('на карту добавлено: ' + '; '.join(added))
+
+    def _objects_snapshot(self):
+        with self._objects_lock:
+            return sorted(self._objects.values(),
+                          key=lambda o: (o['label'], o['x'], o['y']))
+
+    def _objects_for_prompt(self):
+        """Найденное для JSON-опций: метка + координаты карты, без score."""
+        return [{'label': o['label'], 'x': round(o['x'], 2), 'y': round(o['y'], 2)}
+                for o in self._objects_snapshot()]
 
     def _lookup_robot_pose(self, target_frame, timeout_s=0.0):
         try:
@@ -707,7 +873,13 @@ class PlannerOrchestrator(Node):
         """Render the latest SLAM OccupancyGrid to a compact top-down JPEG with the
         robot drawn on it (white=free, black=obstacle, gray=unknown; red dot+line =
         robot pose+heading), plus a text description. North-up, metric. Returns
-        (jpeg_bytes | None, description | '')."""
+        (jpeg_bytes | None, description | '').
+
+        Поверх сетки — зелёные рамки и названия комнат из плана здания и синие
+        точки с подписями для уже найденных предметов. И то и другое дублируется
+        текстом в описании: надпись на картинке даёт пространственную привязку,
+        текст переживает сжатие JPEG. Всё в кадре `map`, включая комнаты (их
+        сдвигает orch.rooms_to_map_frame — приходят они в мировых координатах)."""
         grid = self._map
         if not self.send_map or grid is None or not _HAVE_CV:
             return None, ''
@@ -727,6 +899,11 @@ class PlannerOrchestrator(Node):
         n_unknown = int(np.count_nonzero(data < 0))
         n_occ = int(np.count_nonzero(data >= 50))
         n_free = w * h - n_unknown - n_occ
+        # Освоенность комнат считается ДО расширения холста: ox/oy/w/h ниже
+        # переопределяются под габариты здания, а `data` остаётся исходной
+        # сеткой SLAM. Это перевод «серого» из картинки в факт: «в спальне не
+        # были совсем» — то, на что модель может опереться, глядя на подписи.
+        explored_by_room = self._room_exploration(data, ox, oy, res, w, h)
         # Холст расширяется до габаритов ЗДАНИЯ, если комнаты известны. Без
         # этого видна только уже исследованная часть: SLAM-сетка растёт по мере
         # разведки, и подписи комнат, куда робот ещё не заходил, просто не
@@ -771,9 +948,10 @@ class PlannerOrchestrator(Node):
                              interpolation=cv2.INTER_NEAREST)
         else:
             scale = 1.0
-        # Подписи комнат — ПОСЛЕ масштабирования: иначе текст ужимается вместе с
-        # картинкой и на выходе нечитаем.
-        rooms_line = self._draw_rooms(img, ox, oy, res, h, scale)
+        # Подписи комнат и найденные предметы — ПОСЛЕ масштабирования: иначе
+        # текст ужимается вместе с картинкой и на выходе нечитаем.
+        rooms_line = self._draw_rooms(img, ox, oy, res, h, scale, explored_by_room)
+        objects_line = self._draw_objects(img, ox, oy, res, h, scale)
         ok, buf = cv2.imencode('.jpg', img)
         if not ok:
             return None, ''
@@ -781,41 +959,115 @@ class PlannerOrchestrator(Node):
             w, h, res, robot_xy, n_free, n_occ, n_unknown)
         if rooms_line:
             text = text + ' ' + rooms_line
+        if objects_line:
+            text = text + ' ' + objects_line
         return buf.tobytes(), text
 
-    def _draw_rooms(self, img, ox, oy, res, grid_h, scale):
+    def _room_exploration(self, data, ox, oy, res, w, h):
+        """{имя комнаты: доля НЕ осмотренных клеток} по исходной сетке SLAM.
+
+        Клетки за пределами сетки считаются неизвестными — так и есть, сетка
+        растёт только там, где датчики что-то видели. Комната, целиком лежащая
+        вне сетки, получает 1.0, то есть «не были совсем».
+        """
+        out = {}
+        if not self.rooms:
+            return out
+        for name, (x0, x1, y0, y1) in self.rooms.items():
+            cx0 = int(math.floor((x0 - ox) / res))
+            cx1 = int(math.ceil((x1 - ox) / res))
+            cy0 = int(math.floor((y0 - oy) / res))
+            cy1 = int(math.ceil((y1 - oy) / res))
+            total = max(1, (cx1 - cx0) * (cy1 - cy0))
+            ix0, ix1 = max(0, cx0), min(w, cx1)
+            iy0, iy1 = max(0, cy0), min(h, cy1)
+            if ix1 <= ix0 or iy1 <= iy0:
+                out[name] = 1.0
+                continue
+            known = int(np.count_nonzero(data[iy0:iy1, ix0:ix1] >= 0))
+            out[name] = max(0.0, 1.0 - known / float(total))
+        return out
+
+    def _draw_rooms(self, img, ox, oy, res, grid_h, scale, explored=None):
         """Подписать комнаты на карте и вернуть их же строкой для промпта.
 
         Две формы одного и того же намеренно: надпись на картинке даёт модели
         пространственную привязку («туалет — вон та комната сверху»), а строка
         текстом переживает любое качество JPEG и читается вернее, чем мелкие
         буквы. Что-то одно регулярно теряется.
+
+        К каждой комнате приписывается, насколько она осмотрена. Одной легенды
+        «серое = не были» мало: по картинке 384 px модель не считает доли, а
+        решение «куда ехать» — это именно выбор наименее осмотренной комнаты.
         """
         if not self.rooms:
             return ''
-        def to_px(wx, wy):
-            cx = (wx - ox) / res
-            cy = (wy - oy) / res
-            return int(cx * scale), int((grid_h - 1 - cy) * scale)
-
+        explored = explored or {}
         parts = []
         for name in sorted(self.rooms):
             x0, x1, y0, y1 = self.rooms[name]
-            p0, p1 = to_px(x0, y1), to_px(x1, y0)     # верхний-левый, нижний-правый
+            p0 = self._to_px(x0, y1, ox, oy, res, grid_h, scale)   # верхний-левый
+            p1 = self._to_px(x1, y0, ox, oy, res, grid_h, scale)   # нижний-правый
             cv2.rectangle(img, p0, p1, (0, 140, 0), 1)
-            label = str(name)
-            # Подпись в центре комнаты, с тёмной подложкой: белые стены и серое
-            # «неизвестно» съедают тонкий текст без неё.
-            tx, ty = to_px((x0 + x1) / 2.0, (y0 + y1) / 2.0)
-            fs = max(0.35, 0.45 * scale) if scale < 1.0 else 0.45
-            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, fs, 1)
-            org = (max(0, tx - tw // 2), max(th, ty + th // 2))
-            cv2.rectangle(img, (org[0] - 2, org[1] - th - 2),
-                          (org[0] + tw + 2, org[1] + 3), (255, 255, 255), -1)
-            cv2.putText(img, label, org, cv2.FONT_HERSHEY_SIMPLEX, fs,
-                        (0, 120, 0), 1, cv2.LINE_AA)
-            parts.append('%s at x %.1f..%.1f, y %.1f..%.1f' % (name, x0, x1, y0, y1))
-        return 'Rooms (from the building plan): ' + '; '.join(parts) + '.'
+            tx, ty = self._to_px((x0 + x1) / 2.0, (y0 + y1) / 2.0,
+                                 ox, oy, res, grid_h, scale)
+            self._put_label(img, str(name), tx, ty, scale, (0, 120, 0))
+            unknown = explored.get(name)
+            if unknown is None:
+                state = ''
+            elif unknown >= 0.7:
+                state = ', NOT visited yet'
+            elif unknown >= 0.25:
+                state = ', %.0f%% of it still unseen' % (100.0 * unknown)
+            else:
+                state = ', already searched'
+            parts.append('%s at x %.1f..%.1f, y %.1f..%.1f%s'
+                         % (name, x0, x1, y0, y1, state))
+        return ('Rooms (from the building plan, in your own map coordinates): '
+                + '; '.join(parts) + '.')
+
+    def _draw_objects(self, img, ox, oy, res, grid_h, scale):
+        """Отметить найденные предметы на карте и вернуть их же строкой.
+
+        Отметка ставится там, где предмет РЕАЛЬНО стоит в кадре `map`, а не там,
+        где робот его увидел: модель спрашивает «где я это видел», и ответом
+        должно быть место предмета. Синий кружок с подписью, чтобы не спутать с
+        красной позой робота и зелёными рамками комнат.
+        """
+        objs = self._objects_snapshot()
+        if not objs:
+            return ''
+        parts = []
+        for o in objs:
+            px, py = self._to_px(o['x'], o['y'], ox, oy, res, grid_h, scale)
+            if not (0 <= px < img.shape[1] and 0 <= py < img.shape[0]):
+                continue
+            cv2.circle(img, (px, py), max(2, img.shape[1] // 110), (255, 90, 0), -1)
+            self._put_label(img, o['label'], px, py - 8, scale, (200, 60, 0))
+            parts.append('%s at (%.1f, %.1f)' % (o['label'], o['x'], o['y']))
+        if not parts:
+            return ''
+        return ('Objects you have already found (blue dots on the map): '
+                + '; '.join(parts) + '.')
+
+    @staticmethod
+    def _to_px(wx, wy, ox, oy, res, grid_h, scale):
+        """Метры кадра `map` -> пиксель отмасштабированной картинки."""
+        cx = (wx - ox) / res
+        cy = (wy - oy) / res
+        return int(cx * scale), int((grid_h - 1 - cy) * scale)
+
+    @staticmethod
+    def _put_label(img, text, tx, ty, scale, color):
+        """Подпись с белой подложкой: тонкий текст без неё теряется и на белом
+        свободном месте, и на сером неизвестном."""
+        fs = max(0.35, 0.45 * scale) if scale < 1.0 else 0.45
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, fs, 1)
+        org = (max(0, tx - tw // 2), max(th, ty + th // 2))
+        cv2.rectangle(img, (org[0] - 2, org[1] - th - 2),
+                      (org[0] + tw + 2, org[1] + 3), (255, 255, 255), -1)
+        cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, fs, color, 1,
+                    cv2.LINE_AA)
 
     # ---- anytime/async mission loop (Phase 4.6): replan overlaps execution ----
     def _compute_plan(self, target, step):
@@ -895,6 +1147,12 @@ class PlannerOrchestrator(Node):
         self.notes = NotesBuffer()
         self.cb = CircuitBreaker()
         self._degrade = DegradationLatch()   # fresh mission retries the VLM
+        # Память о найденном — ровно на одну миссию: предметы могли переставить,
+        # а робота вернуть в исходную точку кнопкой сброса, и старые отметки
+        # тогда врут увереннее, чем помогают.
+        with self._objects_lock:
+            self._objects = {}
+        self._last_action_name, self._same_action_run = '', 0
         step = 0
         pending = None
         try:
@@ -1025,6 +1283,11 @@ class PlannerOrchestrator(Node):
                                       self.forward_corridor_half_width_m)
 
     def _dispatch(self, action, cand_pixels):
+        # Причину отказа гасим на входе: её выставляет _send_and_wait, а часть
+        # ветвей до исполнителя не доходит вовсе (нечем ехать, метка пропала). С
+        # прошлой причиной в поле такой шаг получил бы в заметки чужое
+        # объяснение — худший вид неправды, потому что выглядит осмысленно.
+        self._skill_reason = ''
         if action.kind in (TURN, DRIVE_FORWARD):
             pose = self._motion_pose()
             if pose is None:
@@ -1032,32 +1295,69 @@ class PlannerOrchestrator(Node):
                     'no TF for relative motion (%s->%s or %s->%s); skip motion'
                     % (self.map_frame, self.robot_frame,
                        self.motion_fallback_frame, self.robot_frame))
+                self._exec_note = ('blocked: the robot does not know where it is '
+                                   '(no localisation)')
                 return False
             if action.kind == DRIVE_FORWARD:
-                return self._drive_forward_clamped(action, pose)
-            gx, gy, gyaw = orch.relative_goal(pose[0], pose[1], pose[2], action)
-            return self._send_goto(gx, gy, gyaw, frame_id=pose[3])
+                ok = self._drive_forward_clamped(action, pose)
+            else:
+                gx, gy, gyaw = orch.relative_goal(pose[0], pose[1], pose[2], action)
+                ok = self._send_goto(gx, gy, gyaw, frame_id=pose[3])
+            self._append_motion_result(action, pose, ok)
+            return ok
         if action.kind == DRIVE_TO_VISIBLE:
-            return self._send_approach_mark(action.mark_id, action.arg_label, cand_pixels)
+            ok = self._send_approach_mark(action.mark_id, action.arg_label, cand_pixels)
+            if not ok and self._skill_reason and not self._exec_note:
+                self._exec_note = self._skill_reason
+            return ok
         if action.kind == DETECT_ALL:
             return self._do_detect_all()
         return False
 
-    def _drive_forward_clamped(self, action, pose):
-        """Execute DRIVE_FORWARD truncated to the physically free distance ahead,
-        and leave an honest one-line account in _exec_note for the step's fact.
+    def _append_motion_result(self, action, pose_before, ok):
+        """Дописать в заметку ИЗМЕРЕННЫЙ результат движения и причину отказа.
 
-        This is the executive's safety layer, not plan editing: the VLM's chosen
-        action always runs as far as physics allows, and when physics said no the
-        model is TOLD so ("asked +1.00m, obstacle ~0.6m ahead, drove +0.20m")
-        instead of the old unconditional "-> ok". Without the clamp Nav2 accepts
-        a goal inside a wall, NavFn's tolerance shifts it to the inflation
-        boundary, the drive "succeeds", and five repeats walk the robot into the
-        collision guard (measured: s7 ended at scan min 0.154 m). Without the
-        note the model cannot know its forward motion is being eaten by a wall --
-        the map alone was demonstrably not enough for it to stop ramming.
-        Clearances are rounded to 0.1 m so a repeated ram produces the SAME fact
-        and the notes buffer dedups it instead of flooding."""
+        Это ответ на самую дорогую из наблюдавшихся поломок: одометрия врёт,
+        когда робот буксует носом в стену. Nav2 считает цель достигнутой,
+        исполнитель рапортует «ok», а робот не сдвинулся — и модель получала
+        подтверждение, что поворот выполнен, глядя на ту же самую стену. Теперь
+        в заметку идёт разница поз ДО и ПОСЛЕ: «rotated +0.03 rad» при заказе
+        1.57 — наблюдение, на которое модели есть чем ответить.
+
+        Мерим в том же кадре, в котором ставили цель (map или odom): смешивать
+        их нельзя, map->odom правится SLAM прямо во время движения.
+        """
+        after = self._lookup_robot_pose(pose_before[3], timeout_s=0.5)
+        moved = ''
+        if after is not None:
+            dx, dy = after[0] - pose_before[0], after[1] - pose_before[1]
+            dist = math.hypot(dx, dy)
+            dyaw = orch.wrap_angle(after[2] - pose_before[2])
+            moved = ('rotated %+.2f rad' % dyaw if action.kind == TURN
+                     else 'moved %.2f m' % dist)
+        parts = [p for p in (self._exec_note, moved,
+                             '' if ok else self._skill_reason) if p]
+        self._exec_note = '; '.join(parts) if parts else None
+
+    def _drive_forward_clamped(self, action, pose):
+        """Исполнить DRIVE_FORWARD и честно отчитаться в _exec_note.
+
+        Ветви в порядке предпочтения:
+          0. запрос отрицательный -> задний ход; короче минимального шага -> отказ;
+          1. по курсу свободно на всю длину -> едем прямо;
+          2. впереди препятствие -> ищем по карте свободную точку примерно по
+             курсу и отдаём её Nav2; маршрут в обход прокладывает он (см.
+             _detour_goal). Берём, только если она дальше обрезанного хода;
+          3. объезда нет -> едем прямо, насколько пустил лидар;
+          4. и на минимальный шаг места нет -> честный отказ с причиной.
+
+        Обрезка лидаром — слой безопасности исполнителя, а не правка плана: Nav2
+        принимает цель внутри стены, допуск NavFn сдвигает её к границе раздутия,
+        движение «удаётся», и пять повторов доводят робота до срабатывания защиты
+        (замер: s7 закончился на минимуме скана 0.154 м). Расстояния в заметках
+        округлены до 0.1 м, чтобы повторный упор давал ТУ ЖЕ запись и буфер
+        заметок дедуплицировал её, а не переполнялся.
+        """
         asked = float(action.forward_dist_m)
         # ЗАДНИЙ ХОД — отдельная ветка, и без неё он не работал ВООБЩЕ. Клэмп
         # ниже считает свободное место передним лидаром и обрезает им запрос;
@@ -1072,46 +1372,156 @@ class PlannerOrchestrator(Node):
         if asked < 0.0:
             drive = max(asked, -REVERSE_MAX_M)
             if abs(drive) < self.min_drive_m:
-                self._exec_note = ('blocked: задний ход %.2fm короче минимального '
-                                   'шага %.2fm' % (abs(drive), self.min_drive_m))
+                self._exec_note = ('blocked: a reverse step of %.2f m is shorter '
+                                   'than the %.2f m minimum, the robot will not '
+                                   'move' % (abs(drive), self.min_drive_m))
                 return False
             x, y, yaw, frame = pose
             ok = self._send_goto(x + drive * math.cos(yaw), y + drive * math.sin(yaw),
                                  yaw, frame_id=frame)
-            self._exec_note = ('отъехал назад вслепую %.2fm (заднего датчика нет)'
-                               % abs(drive))
+            # «tried to», а не «backed up»: рядом в заметке встанет измеренное
+            # перемещение, и утверждать успех до него — значит спорить с ним же.
+            self._exec_note = ('tried to back up %.2f m blind (there is no rear '
+                               'sensor)' % abs(drive))
             return ok
+        # Слишком короткий запрос отбивается СРАЗУ, до всякой геометрии: цель
+        # попадает внутрь допуска Nav2 (xy_goal_tolerance 0.20), controller_server
+        # мгновенно рапортует «Reached the goal», и модель получает «ok» на
+        # движение, которого не было. Наблюдалось у оператора ровно так: сорок
+        # шагов DRIVE_FORWARD +0.18m подряд, робот стоит, кадр не меняется.
+        if asked < self.min_drive_m:
+            self._exec_note = ('blocked: a step of %+.2f m is below the %.2f m '
+                               'minimum, the robot will not move at all'
+                               % (asked, self.min_drive_m))
+            return False
         clearance = self._forward_clearance_m()   # scan-frame (camera, robot front)
         if clearance is None:                     # no scan info -> old behaviour
             drive = asked
         else:
             # standoff already contains the camera->footprint-front offset margin
             drive = min(asked, max(0.0, clearance - self.forward_standoff_m))
-        # Отказываем ЧЕСТНО, когда ехать некуда: иначе Nav2 принимает цель внутри
-        # своего допуска, мгновенно объявляет её достигнутой, и модель получает
-        # «ok» на движение, которого не было. Она повторяет ту же команду, пока
-        # не кончатся шаги. Лучше сказать «заблокировано» — тогда у неё есть
-        # повод развернуться.
-        if drive < self.min_drive_m:
-            self._exec_note = (
-                'blocked: obstacle ~%.1fm ahead, свободного хода %.2fm — меньше '
-                'минимального шага %.2fm, ехать некуда; поверните'
-                % (clearance if clearance is not None else -1.0, drive, self.min_drive_m))
-            self.get_logger().warn(
-                'DRIVE_FORWARD %.2fm refused: свободно %.2fm < min_drive %.2fm '
-                '(clearance %s)'
-                % (asked, drive, self.min_drive_m,
-                   ('%.2fm' % clearance) if clearance is not None else 'н/д'))
-            return False
         x, y, yaw, frame = pose
-        ok = self._send_goto(x + drive * math.cos(yaw), y + drive * math.sin(yaw),
-                             yaw, frame_id=frame)
-        if drive < asked - 1e-6:
-            self._exec_note = ('asked %+.2fm, obstacle ~%.1fm ahead, drove %+.2fm'
+        # 1) Прямо свободно на всю запрошенную длину — едем прямо, без затей.
+        if drive >= asked - 1e-6:
+            return self._send_goto(x + drive * math.cos(yaw),
+                                   y + drive * math.sin(yaw), yaw, frame_id=frame)
+        # 2) Впереди мешает препятствие. Раньше здесь обрезали шаг лидаром, а при
+        # совсем коротком остатке отказывали — то есть возлагали на модель работу,
+        # которая ей не по силам и не её: понять по картинке, что мешает, и
+        # придумать объезд. Ровно для этого в стеке есть Nav2: он знает
+        # построенную карту и умеет прокладывать маршрут. Спрашиваем карту о
+        # свободной точке примерно по курсу и отдаём её Nav2 — как добраться
+        # (обогнуть стул, выйти через дверь) решает он. Берём объезд только если
+        # он ДАЛЬШЕ обрезанного хода: иначе прямой шаг честнее и короче.
+        detour = (self._detour_goal(pose, asked, drive) if self.nav_detour
+                  else None)
+        if detour is not None and detour[3] > drive + 1e-6:
+            gx, gy, bearing, dist = detour
+            ok = self._send_goto(gx, gy, orch.wrap_angle(yaw + bearing),
+                                 frame_id=frame)
+            self._exec_note = (
+                'an obstacle is ~%.1f m straight ahead, so the nav stack was sent '
+                'around it, to free floor %.2f m away and %+.0f deg off your '
+                'heading' % (clearance if clearance is not None else -1.0, dist,
+                             math.degrees(bearing)))
+            self.get_logger().info(
+                'DRIVE_FORWARD %.2fm: прямо %.2fm, объезд через (%.2f, %.2f), '
+                '%+.0f°' % (asked, drive, gx, gy, math.degrees(bearing)))
+            return ok
+        # 3) Объезда нет. Едем прямо, насколько пустил лидар...
+        if drive >= self.min_drive_m:
+            ok = self._send_goto(x + drive * math.cos(yaw),
+                                 y + drive * math.sin(yaw), yaw, frame_id=frame)
+            self._exec_note = ('asked %+.2f m but an obstacle is ~%.1f m ahead, so '
+                               'only %+.2f m was attempted'
                                % (asked, clearance, drive))
             self.get_logger().info('DRIVE_FORWARD clamped %.2f -> %.2fm (clearance %.2fm)'
                                    % (asked, drive, clearance))
-        return ok
+            return ok
+        # 4) ...а если и на минимальный шаг места нет — отказываем ЧЕСТНО. Иначе
+        # Nav2 принимает цель внутри своего допуска, мгновенно объявляет её
+        # достигнутой, и модель получает «ok» на движение, которого не было; она
+        # повторяет ту же команду, пока не кончатся шаги.
+        # Формулировка зависит от того, БЫЛА ли карта: сказать «карта не
+        # показывает свободного места», не получив ни одной сетки, — врать
+        # модели о причине, а причина здесь единственное, на что она опирается.
+        self._exec_note = (
+            'blocked: no route forward -- a wall is ~%.1f m ahead and %s; turn or '
+            'back off'
+            % (clearance if clearance is not None else -1.0,
+               'the map shows no free spot ahead to route to'
+               if self._map is not None else 'no map is available to route by'))
+        self.get_logger().warn(
+            'DRIVE_FORWARD %.2fm refused: свободно %.2fm < min_drive %.2fm '
+            '(clearance %s), объезда не нашлось'
+            % (asked, drive, self.min_drive_m,
+               ('%.2fm' % clearance) if clearance is not None else 'н/д'))
+        return False
+
+    def _detour_goal(self, pose, asked, free_straight_m):
+        """Ближайшая СВОБОДНАЯ по карте точка примерно по курсу: (x, y, азимут,
+        расстояние) или None.
+
+        Проверяется только сама цель (и круг GOAL_CLEAR_RADIUS_M вокруг неё), а
+        не путь до неё: путь — работа Nav2, в том и смысл. Кадр цели тот же, в
+        котором пришла поза; если это не кадр карты, объезд не строим — карту
+        читать не в чем.
+
+        free_straight_m — измеренный лидаром свободный ход по курсу. Нужен, чтобы
+        карта не отменяла датчик: сетка SLAM обновляется реже скана и вполне может
+        показывать свободной клетку, перед которой лидар прямо сейчас видит стену
+        в 0.4 м. Поэтому цель отбрасывается, если она попадает В КОРИДОР, который
+        робот выметает телом (та же геометрия, что в forward_clearance), и при
+        этом лежит дальше измеренного свободного хода. Цели вбок от коридора
+        лидар не видит вовсе — там авторитет у карты.
+        """
+        grid = self._map
+        if grid is None or not _HAVE_CV or pose[3] != self.map_frame:
+            return None
+        w, h = int(grid.info.width), int(grid.info.height)
+        res = float(grid.info.resolution)
+        if w <= 0 or h <= 0 or res <= 0.0:
+            return None
+        try:
+            data = np.asarray(grid.data, dtype=np.int16).reshape(h, w)
+        except (ValueError, TypeError):
+            return None
+        ox = float(grid.info.origin.position.x)
+        oy = float(grid.info.origin.position.y)
+        rad_cells = max(1, int(math.ceil(GOAL_CLEAR_RADIUS_M / res)))
+        x, y, yaw = pose[0], pose[1], pose[2]
+        free_straight = max(0.0, float(free_straight_m))
+        for bearing, dist in orch.drive_goal_candidates(
+                asked, self.min_drive_m, self.detour_max_bearing_rad):
+            # Объезд имеет смысл только ДАЛЬШЕ обрезанного прямого хода — ровно
+            # это проверяет вызывающий. Без такой же проверки ЗДЕСЬ поиск
+            # заканчивался на первой же близкой цели по курсу (её пропускает
+            # фильтр коридора ниже, ведь она внутри измеренного свободного
+            # места), вызывающий её отбрасывал как не лучшую, и веер отклонений
+            # не рассматривался ВООБЩЕ. Ветка объезда была почти мертва: при
+            # запросе 1.2 м и стене в 1.1 м возвращалась цель прямо по курсу на
+            # 0.70 м, то есть тот же подкат к стене, что и до правки.
+            if dist <= free_straight + 1e-6:
+                continue
+            # Внутри выметаемого коридора верим лидару, а не карте (см. docstring).
+            if (abs(dist * math.sin(bearing)) <= self.forward_corridor_half_width_m
+                    and dist * math.cos(bearing) > free_straight):
+                continue
+            gx = x + dist * math.cos(yaw + bearing)
+            gy = y + dist * math.sin(yaw + bearing)
+            cx = int((gx - ox) / res)
+            cy = int((gy - oy) / res)
+            if not (rad_cells <= cx < w - rad_cells
+                    and rad_cells <= cy < h - rad_cells):
+                continue
+            patch = data[cy - rad_cells:cy + rad_cells + 1,
+                         cx - rad_cells:cx + rad_cells + 1]
+            # Свободно = всё известно и ничто не занято. Неизвестные клетки не
+            # берём в цель намеренно: Nav2 в них не проложит маршрут, и «объезд»
+            # выродился бы в отказ на шаг позже.
+            if patch.min() >= 0 and patch.max() < 50:
+                return gx, gy, bearing, dist
+        return None
 
     def _goal_id(self):
         return uuid.uuid4().hex
@@ -1150,11 +1560,15 @@ class PlannerOrchestrator(Node):
         pt = (cand_pixels or {}).get(int(mark_id))
         if pt is None:
             self.get_logger().warn('DRIVE_TO_VISIBLE: no pixel for mark %s' % mark_id)
+            self._exec_note = ('blocked: mark %s is not in the current detection '
+                               'list any more' % mark_id)
             return False
         if not distance_is_known(pt.z):
             self.get_logger().warn(
                 'DRIVE_TO_VISIBLE: mark %s has unknown depth; refusing ApproachDetection'
                 % mark_id)
+            self._exec_note = ('blocked: the depth camera has no range for mark %s, '
+                               'so the robot cannot drive to it' % mark_id)
             return False
         stop = threading.Event()
 
@@ -1216,6 +1630,7 @@ class PlannerOrchestrator(Node):
             return False
         if getattr(res, 'annotated', None) is not None and res.annotated.data:
             self._publish_view(self._setofmark_pub, bytes(res.annotated.data))
+        self._remember_objects(cands)
         seen = ', '.join('%s(%.2f)' % (c.label, c.confidence) for c in cands)
         self.notes.add_fact('objects in view: ' + seen)
         self.get_logger().info('DETECT_ALL: %d object(s): %s' % (len(cands), seen))
@@ -1234,10 +1649,20 @@ class PlannerOrchestrator(Node):
 
     def _send_and_wait(self, skill, goal):
         """Send a skill goal and block (in the worker thread) for the result,
-        using events set by the executor-thread done-callbacks (loopback-safe)."""
+        using events set by the executor-thread done-callbacks (loopback-safe).
+
+        Побочно заполняет self._skill_reason — ПОЧЕМУ не получилось. Раньше
+        отказ исполнителя схлопывался в один бит: модель видела «failed» и не
+        могла отличить «Nav2 не построил маршрут» от «сервер навыка не
+        отвечает», а значит не имела повода сменить действие и повторяла его до
+        конца миссии. Причина уходит в заметки и попадает в следующий промпт.
+        """
+        self._skill_reason = ''
         ac = self._ac[skill]
         if not ac.wait_for_server(timeout_sec=self.skill_wait_s):
             self.get_logger().warn('skill %s server unavailable' % skill)
+            self._skill_reason = ('the %s skill server is not responding '
+                                  '(robot software problem, not your choice)' % skill)
             return False
         gh_box = {}
         gh_evt = threading.Event()
@@ -1248,6 +1673,7 @@ class PlannerOrchestrator(Node):
         ac.send_goal_async(goal).add_done_callback(_gh_cb)
         if not gh_evt.wait(self.skill_wait_s) or gh_box.get('gh') is None or not gh_box['gh'].accepted:
             self.get_logger().warn('skill %s goal not accepted' % skill)
+            self._skill_reason = 'the %s skill refused the goal' % skill
             return False
         res_box = {}
         res_evt = threading.Event()
@@ -1258,10 +1684,20 @@ class PlannerOrchestrator(Node):
         gh_box['gh'].get_result_async().add_done_callback(_res_cb)
         if not res_evt.wait(self.result_timeout_s):
             self.get_logger().warn('skill %s result timeout' % skill)
+            self._skill_reason = ('the robot was still driving after %.0f s and the '
+                                  'move was given up' % self.result_timeout_s)
             return False
         res = res_box.get('res')
         outcome = getattr(getattr(res, 'result', None), 'outcome', None)
-        return outcome == 0   # 0 == SUCCEEDED across the skill results
+        if outcome == 0:                      # 0 == SUCCEEDED across the skill results
+            return True
+        # 1 = ABORTED, 2 = PREEMPTED в GoToPose/ApproachDetection/Stop.
+        self._skill_reason = (
+            'the nav stack could not get there: no route on the map, or the drive '
+            'was aborted on the way' if outcome == 1 else
+            'the move was interrupted (%s)' % ('preempted' if outcome == 2
+                                               else 'outcome %s' % outcome))
+        return False
 
     def _publish_notes(self, target):
         m = Notes()

@@ -40,65 +40,107 @@ from planner_orchestrator.planner_logic import (
 # шаг вперёд имеет смысл. Отсюда наблюдавшееся поведение — десятки DRIVE_FORWARD
 # подряд в упор в стену, без единого TURN.
 SYSTEM_PROMPT = (
-    "You drive a small wheeled robot through rooms to find one target object.\n"
-    "Each turn you get: the target, the camera view (numbered marks on detections), "
-    "a top-down map, the list of visible marks, and your notes.\n"
+    "YOU\n"
+    "You are the brain of a small wheeled robot inside a building. Your one job: "
+    "find the target object and stop next to it. You choose ONE action per turn; "
+    "the robot's nav stack executes it and reports back what physically happened.\n"
+    "\n"
+    "WHAT YOU GET EACH TURN\n"
+    "- Camera image, forward-facing. Detected objects are boxed and numbered.\n"
+    "- visible_marks: boxes matching THE TARGET only, each with its label and "
+    "distance_m measured by the depth camera. distance_m null = no depth for it, "
+    "you cannot approach it. An empty list means the target is not in view -- it "
+    "says nothing about what else is there, so use DETECT_ALL to find that out.\n"
+    "- Top-down SLAM map the robot builds as it drives (2nd image). "
+    "White = floor you have ALREADY seen. Black = wall. Gray = never seen by any "
+    "sensor. Red dot = you, red line = the way you face. Room names are written "
+    "on it.\n"
+    "- free_ahead_m: metres of clear floor straight ahead, from the laser. This is "
+    "measured, not guessed -- trust it over the camera image.\n"
+    "- objects_found: everything detected so far this mission, with map coordinates. "
+    "This is your memory of the place.\n"
+    "- notes: what you did and what actually happened, including refusals.\n"
+    "\n"
+    "WHERE TO LOOK\n"
+    "What you have not found is in the GRAY: white is ground you already searched. "
+    "Head for gray areas and for rooms you have not entered. The room labels on the "
+    "map say which room is which -- go to the room the target belongs in (toilet -> "
+    "bathroom, fridge -> kitchen, bed -> bedroom).\n"
     "\n"
     "ACTIONS\n"
     "TURN turn_yaw_rad      rotate in place. + = left, - = right. 1.57 = 90 deg.\n"
-    "DRIVE_FORWARD forward_dist_m   drive straight. Use 0.3..1.5 m.\n"
-    "DRIVE_TO_VISIBLE mark_id       let the nav stack drive to a listed mark.\n"
-    "DETECT_ALL             name every object in view and store it in notes.\n"
+    "DRIVE_FORWARD forward_dist_m   go forward. Use 0.3..1.5 m. The nav stack "
+    "plans the route on the SLAM map and drives AROUND obstacles, so a chair or a "
+    "corner in the way is its problem, not yours.\n"
+    "DRIVE_TO_VISIBLE mark_id       let the nav stack drive up to a listed mark.\n"
+    "DETECT_ALL             name every object in view and store it in memory.\n"
     "DONE                   target reached.\n"
     "\n"
     "RULES\n"
-    "- Wall or obstacle ahead: do NOT drive forward. TURN (1.57 or -1.57) and look.\n"
-    "- Target not visible: explore. TURN to scan, DRIVE_FORWARD into open space, "
-    "DETECT_ALL to record what is around. Note where each room and object is; that map "
-    "of the place is how you find the target later.\n"
-    "- Forward steps below 0.25 m do nothing at all -- the robot will not move. Never "
-    "ask for them. If only a few centimetres are free ahead, you are AT a wall: turn.\n"
-    "- Wedged with a wall in front and no room to turn? Back off first: negative "
-    "forward_dist_m, -0.3 to -0.5, then turn. That is what reverse is for. Never "
-    "reverse to explore -- there is no rear sensor, you are blind backwards, and the "
-    "step is capped at 0.5 m.\n"
-    "- Turning does not move you. After AT MOST two turns in a row you MUST drive: "
-    "pick the most open direction you have just seen and DRIVE_FORWARD. Spinning in "
-    "place forever fails the mission exactly as surely as ramming a wall.\n"
-    "- Read your notes: they list what you already did. Repeating the same action that "
-    "changed nothing is the main way this mission fails. Alternate look and move -- "
-    "turn to see, then drive to get there.\n"
-    "- DRIVE_TO_VISIBLE needs a mark_id from the list with a non-null distance_m. Never "
-    "invent one. Never output map coordinates.\n"
+    "- free_ahead_m below 0.7 means a wall is right in front: TURN, do not drive.\n"
+    "- Forward steps below 0.25 m do nothing at all -- the robot will not move.\n"
+    "- Target not visible: explore. TURN to scan, DRIVE_FORWARD toward gray, "
+    "DETECT_ALL to record what is around.\n"
+    "- Wedged, with a wall in front and no room to turn? Back off: negative "
+    "forward_dist_m, -0.3 to -0.5, then turn. Never reverse to explore -- there is "
+    "no rear sensor, you are blind backwards, and the step is capped at 0.5 m.\n"
+    "- Turning does not move you. After AT MOST two turns in a row you MUST drive.\n"
+    "- The notes tell you the truth about the last steps. 'moved 0.03 m' means you "
+    "did NOT move. 'blocked' or 'no route' means the nav stack refused: that exact "
+    "action is impossible from here, so pick a different one -- repeating it "
+    "changes nothing.\n"
+    "- DRIVE_TO_VISIBLE needs a mark_id from the list with a non-null distance_m. "
+    "Never invent one. Never output map coordinates.\n"
     "- DONE only when the target's distance_m is about 0.6 m or less, or right after "
     "DRIVE_TO_VISIBLE brought you up to it. Never DONE on unknown distance.\n"
     "\n"
     "REPLY\n"
-    'One JSON object, no prose, "think" first (one short sentence: what you see, what '
-    "you will do):\n"
+    'One JSON object, no prose. Think FIRST, then act -- "think" is one short '
+    "sentence: what you see, what it means, what you will do:\n"
     '{"think": str, "action": str, "turn_yaw_rad": float, "forward_dist_m": float, '
     '"mark_id": int, "arg_label": str}'
 )
 
-# Few-shot. Три примера покрывают три состояния, в которых модель ошибалась:
-# упёрлась в стену, ничего не видит, цель видна и близко. Пары «пользователь ->
-# ответ» кладутся в диалог как обычные сообщения — так модель видит не описание
-# формата, а его употребление.
+# Few-shot. Каждый пример — состояние, в котором модель РЕАЛЬНО ошибалась в
+# прогонах: упёрлась в стену, ничего не видит, крутится на месте, получила отказ
+# исполнителя, ищет не в той комнате, видит цель. Пары «пользователь -> ответ»
+# кладутся в диалог как обычные сообщения: так модель видит не описание формата,
+# а его употребление. Форма пользовательской реплики намеренно повторяет форму
+# настоящего запроса (target / free_ahead_m / visible_marks / notes) — пример,
+# написанный в другом виде, учит отвечать на то, чего в запросе не будет.
 FEWSHOT = (
-    ('Target: chair\nVisible marks: none\nNotes: wall ahead at 0.4 m',
-     '{"think": "Wall right in front, nothing visible, so driving forward is '
-     'pointless -- turn left and scan.", "action": "TURN", "turn_yaw_rad": 1.57, '
+    ({'target': 'chair', 'visible_marks': [], 'free_ahead_m': 0.35, 'notes': []},
+     '{"think": "free_ahead_m 0.35 means a wall is right in front of me; driving is '
+     'pointless, turn left and look.", "action": "TURN", "turn_yaw_rad": 1.57, '
      '"forward_dist_m": 0.0, "mark_id": 0, "arg_label": ""}'),
-    ('Target: chair\nVisible marks: none\nNotes: corridor open ahead, rooms unexplored',
-     '{"think": "Open corridor and no detections here; move up it and look for new '
-     'objects.", "action": "DRIVE_FORWARD", "turn_yaw_rad": 0.0, '
-     '"forward_dist_m": 1.0, "mark_id": 0, "arg_label": ""}'),
-    ('Target: chair\nVisible marks: none\nNotes: TURN -> ok; TURN -> ok',
-     '{"think": "Two turns already and still nothing -- turning again just spins me. '
-     'Drive into the open space I saw.", "action": "DRIVE_FORWARD", '
+    ({'target': 'chair', 'visible_marks': [], 'free_ahead_m': 3.2,
+      'notes': ['map: large gray unexplored area to the north']},
+     '{"think": "Clear floor ahead and the unexplored gray is that way, so drive '
+     'into it.", "action": "DRIVE_FORWARD", "turn_yaw_rad": 0.0, '
+     '"forward_dist_m": 1.2, "mark_id": 0, "arg_label": ""}'),
+    ({'target': 'chair', 'visible_marks': [], 'free_ahead_m': 2.0,
+      'notes': ['TURN -> ok | rotated +1.55 rad',
+                'TURN -> ok | rotated +1.56 rad']},
+     '{"think": "Two turns in a row and still nothing -- turning again only spins '
+     'me. Drive into the open space I just saw.", "action": "DRIVE_FORWARD", '
      '"turn_yaw_rad": 0.0, "forward_dist_m": 1.0, "mark_id": 0, "arg_label": ""}'),
-    ('Target: chair\nVisible marks: [{"mark_id": 2, "label": "chair", '
-     '"distance_m": 2.4}]\nNotes: -',
+    ({'target': 'chair', 'visible_marks': [], 'free_ahead_m': 0.5,
+      'notes': ['DRIVE_FORWARD -> failed | blocked: no route forward -- a wall is '
+                '~0.5 m ahead and the map shows no free spot ahead to route to']},
+     '{"think": "The nav stack says there is no route forward at all, so repeating '
+     'it is useless; back off to free some room and then turn.", '
+     '"action": "DRIVE_FORWARD", "turn_yaw_rad": 0.0, "forward_dist_m": -0.4, '
+     '"mark_id": 0, "arg_label": ""}'),
+    ({'target': 'toilet', 'visible_marks': [], 'free_ahead_m': 2.6,
+      'notes': ['I am in the hallway, the map shows bathroom to the north-east'],
+      'objects_found': [{'label': 'bed', 'x': -5.1, 'y': 3.0}]},
+     '{"think": "A toilet belongs in the bathroom and the map puts it north-east, '
+     'so head that way instead of searching the hallway again.", "action": "TURN", '
+     '"turn_yaw_rad": -0.79, "forward_dist_m": 0.0, "mark_id": 0, '
+     '"arg_label": ""}'),
+    ({'target': 'chair', 'free_ahead_m': 2.4,
+      'visible_marks': [{'mark_id': 2, 'label': 'chair', 'distance_m': 2.4}],
+      'notes': []},
      '{"think": "The chair is mark 2 at 2.4 m -- let the nav stack take me to it.", '
      '"action": "DRIVE_TO_VISIBLE", "turn_yaw_rad": 0.0, "forward_dist_m": 0.0, '
      '"mark_id": 2, "arg_label": "chair"}'),
@@ -171,13 +213,22 @@ class OpenAICompatibleClient(VlmClient):
         return {'type': 'image_url',
                 'image_url': {'url': 'data:image/jpeg;base64,' + b64}}
 
+    @staticmethod
+    def _user_text(target: str, opts: dict, n: int = 1) -> str:
+        """Единственное место, где собирается пользовательская реплика — и для
+        настоящего запроса, и для примеров few-shot. Одна функция намеренно:
+        пример, написанный в другой форме, учит модель отвечать на запрос,
+        которого она не увидит, и первым ломается ровно то, ради чего пример и
+        добавляли."""
+        tail = ('Reply with ONE JSON action.' if n <= 1 else
+                'Reply with a JSON object {"actions": [...]} of up to %d actions.' % n)
+        return ('Target: %s\nOptions (JSON):\n%s\n%s'
+                % (target, json.dumps(opts), tail))
+
     def build_messages(self, obs: Observation, image_jpeg: Optional[bytes],
                        map_jpeg: Optional[bytes] = None, n: int = 1) -> list:
         opts = build_vlm_options(obs)
-        tail = ('Reply with ONE JSON action.' if n <= 1 else
-                'Reply with a JSON object {"actions": [...]} of up to %d actions.' % n)
-        text = ('Target: %s\nOptions (JSON):\n%s\n%s'
-                % (obs.target, json.dumps(opts), tail))
+        text = self._user_text(obs.target, opts, n)
         content = [{'type': 'text', 'text': text}]
         if image_jpeg:                       # 1st image: live camera (Set-of-Mark)
             content.append({'type': 'text', 'text': 'Live camera (numbered marks):'})
@@ -188,8 +239,10 @@ class OpenAICompatibleClient(VlmClient):
         messages = [{'role': 'system', 'content': SYSTEM_PROMPT}]
         # Примеры идут ПОСЛЕ системного сообщения и ДО реального запроса, как
         # обычный диалог: так модель видит формат в употреблении, а не в описании.
-        for shot_user, shot_reply in FEWSHOT:
-            messages.append({'role': 'user', 'content': shot_user})
+        for shot_opts, shot_reply in FEWSHOT:
+            messages.append({'role': 'user',
+                             'content': self._user_text(shot_opts.get('target', ''),
+                                                        shot_opts)})
             messages.append({'role': 'assistant', 'content': shot_reply})
         if n > 1:
             messages.append({'role': 'system',

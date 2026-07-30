@@ -70,12 +70,22 @@ def format_distance(distance_m: float) -> str:
 class Observation:
     """Everything the planner sees at a replan point. ROS-free. The camera frame and
     the top-down SLAM map are passed as images alongside this (see VlmClient.plan);
-    map_text describes that map so the model can read it."""
+    map_text describes that map so the model can read it.
+
+    free_ahead_m и objects_found добавлены потому, что двух картинок модели не
+    хватало ровно там, где решение принимается. Свободный ход впереди она
+    оценивала по кадру на глаз и раз за разом упиралась в стену; лидар знает это
+    число точно. А найденные предметы жили только в тексте заметок, откуда
+    вытеснялись через два десятка шагов вместе с их координатами — то есть робот
+    буквально забывал, где что видел.
+    """
     target: str                          # mission instruction / object description
     candidates: List[Candidate] = field(default_factory=list)
     notes_facts: List[str] = field(default_factory=list)
     step_index: int = 0                  # atomic steps executed so far this mission
     map_text: str = ''                   # human description of the attached SLAM map
+    free_ahead_m: Optional[float] = None  # laser clearance straight ahead; None = no scan
+    objects_found: List[dict] = field(default_factory=list)  # {label, x, y} in map metres
 
 
 @dataclass
@@ -319,6 +329,13 @@ def build_vlm_options(obs: Observation) -> dict:
     }
     if obs.map_text:
         opts['map'] = obs.map_text
+    # Ключи появляются, только когда есть что сказать: пустой список найденного и
+    # None вместо расстояния модель читает как факты («ничего не найдено», «ноль
+    # метров впереди»), хотя означают они отсутствие данных.
+    if obs.free_ahead_m is not None:
+        opts['free_ahead_m'] = round(float(obs.free_ahead_m), 2)
+    if obs.objects_found:
+        opts['objects_found'] = list(obs.objects_found)
     return opts
 
 
