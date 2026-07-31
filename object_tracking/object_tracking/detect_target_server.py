@@ -52,6 +52,13 @@ class DetectTargetServer(Node):
         self.declare_parameter('use_compressed_input', False)
         self.declare_parameter('input_reliability', 'best_effort')
         self.declare_parameter('model_mode', 'yoloe')
+        # Чекпоинт GroundingDINO. Параметром, а не константой: какой из них
+        # лучше — вопрос ЗАМЕРА на своих кадрах, а не метрики из статьи. На мире
+        # house grounding-dino-tiny нашёл 10 предметов из 11, а
+        # mm_grounding_dino_tiny (у которого LVIS 41.4 против 27.4) — только 6:
+        # LVIS снят на фотографиях, а тут некрашеные примитивы. Пустая строка =
+        # значение по умолчанию бэкенда.
+        self.declare_parameter('dino_model_id', '')
         self.declare_parameter('conf_default', -1.0)  # legacy override for both paths
         self.declare_parameter('target_conf_default', 0.50)
         self.declare_parameter('vocab_conf_default', 0.12)
@@ -83,6 +90,7 @@ class DetectTargetServer(Node):
         self.image_topic = g('image_topic')
         self.use_compressed = bool(g('use_compressed_input'))
         self.model_mode = str(g('model_mode')).strip().lower()
+        self.dino_model_id = str(g('dino_model_id') or '').strip()
         legacy_conf_default = float(g('conf_default'))
         self.target_conf_default = float(g('target_conf_default'))
         self.vocab_conf_default = float(g('vocab_conf_default'))
@@ -231,7 +239,7 @@ class DetectTargetServer(Node):
                 from object_tracking.dino_mobilesam_image_segmentation import (
                     GroundingDINOMobileSAMSegmentor,
                 )
-                seg = GroundingDINOMobileSAMSegmentor()
+                seg = GroundingDINOMobileSAMSegmentor(model_id=self.dino_model_id)
             else:
                 self.get_logger().error('unknown detector backend "%s"' % backend_name)
                 return None

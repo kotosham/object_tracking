@@ -16,11 +16,26 @@ from geometry_msgs.msg import Quaternion
 
 import time
 
+DEFAULT_DINO_MODEL_ID = "IDEA-Research/grounding-dino-tiny"
+
+
 class GroundingDINOMobileSAMSegmentor:
-    def __init__(self, hfov=70, vfov=40):
+    """Открытый словарь по тексту: GroundingDINO даёт рамки, MobileSAM — маски.
+
+    model_id меняется параметром, потому что чекпоинт — это решение, которое
+    принимают по замеру, а не по метрике из статьи. Замерено на этом стенде
+    (11 кадров мира house, предмет заведомо в кадре, порог 0.30):
+    grounding-dino-tiny находит 10 из 11, mm_grounding_dino_tiny — 6 из 11,
+    хотя на LVIS второй выигрывает 41.4 против 27.4. LVIS снят на настоящих
+    фотографиях, а мебель в house — некрашеные примитивы, и порядок моделей
+    туда не переносится. Проверять чекпоинт надо на СВОИХ кадрах, и смена
+    должна стоить одну строку в профиле.
+    """
+
+    def __init__(self, hfov=70, vfov=40, model_id=None):
         self.HFOV = hfov
         self.VFOV = vfov
-        self.dino_model_id = "IDEA-Research/grounding-dino-tiny"
+        self.dino_model_id = (model_id or "").strip() or DEFAULT_DINO_MODEL_ID
         self.dino_device, self.sam_device = self._select_devices()
         self.last_detection_score = None
         self.last_detection_label = None
@@ -63,12 +78,14 @@ class GroundingDINOMobileSAMSegmentor:
             gpu_name = torch.cuda.get_device_name(0)
             total_memory_gib = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
             return (
-                f"GroundingDINO device={self.dino_device}, "
+                f"GroundingDINO model={self.dino_model_id} "
+                f"device={self.dino_device}, "
                 f"MobileSAM device={self.sam_device}, "
                 f"CUDA device={gpu_name} ({total_memory_gib:.2f} GiB VRAM)"
             )
         return (
-            f"GroundingDINO device={self.dino_device}, "
+            f"GroundingDINO model={self.dino_model_id} "
+            f"device={self.dino_device}, "
             f"MobileSAM device={self.sam_device}, CUDA unavailable"
         )
 
@@ -140,8 +157,11 @@ class GroundingDINOMobileSAMSegmentor:
         if env_model_dir:
             candidates.append(os.path.expanduser(env_model_dir))
 
+        # Имя каталога — последний сегмент идентификатора модели, чтобы рядом
+        # могли лежать несколько чекпоинтов и переключение оставалось параметром.
+        local_name = self.dino_model_id.rstrip("/").split("/")[-1]
         for weights_dir in self._model_weight_dirs(share_dir):
-            candidates.append(os.path.join(weights_dir, "grounding-dino-tiny"))
+            candidates.append(os.path.join(weights_dir, local_name))
 
         hf_snapshot_dir = self._find_local_hf_snapshot_dir()
         if hf_snapshot_dir:
@@ -155,12 +175,11 @@ class GroundingDINOMobileSAMSegmentor:
 
     def _find_local_hf_snapshot_dir(self):
         hf_home = os.path.expanduser(os.environ.get("HF_HOME", "~/.cache/huggingface"))
-        snapshots_root = os.path.join(
-            hf_home,
-            "hub",
-            "models--IDEA-Research--grounding-dino-tiny",
-            "snapshots",
-        )
+        # Кэш HF именует каталог как models--<org>--<name>; выводим его из
+        # текущего идентификатора, иначе при смене чекпоинта нашли бы снапшот
+        # ПРЕДЫДУЩЕЙ модели и молча запустили не то, что просили.
+        cache_name = "models--" + self.dino_model_id.strip("/").replace("/", "--")
+        snapshots_root = os.path.join(hf_home, "hub", cache_name, "snapshots")
         if not os.path.isdir(snapshots_root):
             return None
 

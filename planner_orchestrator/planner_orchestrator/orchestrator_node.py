@@ -114,7 +114,19 @@ DEFAULT_HFOV_RAD = 1.204
 # заведомо высокий: DETECT_ALL работает с порогом 0.12 ради полноты списка на
 # один шаг, и отмечать это на карте значило бы засеять её галлюцинациями,
 # которые потом никуда не денутся — модель им верит, потому что «уже найдено».
-DETECT_MEMORY_CONF = 0.55
+DETECT_MEMORY_CONF = 0.45
+
+# Сколько РАЗ предмет должен быть замечен в одном месте, прежде чем попадёт на
+# карту. Одного порога не хватает, и это замерено: на 24 кадрах пустого
+# коридора (голые стены, ни одного предмета) GroundingDINO при 144 запросах
+# выдал 75 находок выше 0.40 и 26 выше 0.50 — то есть уверенно называет стену
+# диваном. При этом настоящие предметы дают 0.24..0.80, и разделяющего порога
+# просто нет: подняв его до 0.6, теряем 9 предметов из 11.
+#
+# Зато ложное срабатывание не повторяется В ТОМ ЖЕ МЕСТЕ от кадра к кадру, а
+# настоящий предмет повторяется — робот подъезжает, поворачивается, и он всё
+# там же. Поэтому решает не величина оценки, а устойчивость наблюдения.
+DETECT_MEMORY_SIGHTINGS = 2
 
 # Ближе этого две детекции одного класса считаются одним предметом (метры).
 # Пол-метра — примерно точность привязки: поза робота в карте, азимут пикселя и
@@ -709,20 +721,41 @@ class PlannerOrchestrator(Node):
             key = (label, round(ox / OBJECT_MERGE_M), round(oy / OBJECT_MERGE_M))
             with self._objects_lock:
                 old = self._objects.get(key)
-                if old is None or score > old['score']:
+                if old is None:
                     self._objects[key] = {'label': label, 'x': ox, 'y': oy,
-                                          'score': score}
-                    if old is None:
-                        added.append('%s at map (%.1f, %.1f)' % (label, ox, oy))
+                                          'score': score, 'seen': 1}
+                else:
+                    old['seen'] += 1
+                    if score > old['score']:   # позиция от самого уверенного кадра
+                        old.update(x=ox, y=oy, score=score)
+                item = self._objects[key]
+                # В промпт и на карту предмет попадает, только когда подтверждён.
+                # Отдельная отметка «стал подтверждённым» нужна для журнала: без
+                # неё оператор видит, что предмет появился на карте, и не знает,
+                # почему не сразу.
+                if item['seen'] == DETECT_MEMORY_SIGHTINGS:
+                    added.append('%s at map (%.1f, %.1f), подтверждён с %d кадров'
+                                 % (label, item['x'], item['y'], item['seen']))
                 if len(self._objects) > OBJECT_MEMORY_MAX:
-                    worst = min(self._objects, key=lambda k: self._objects[k]['score'])
+                    # Вытесняем сперва неподтверждённые, среди равных — самые
+                    # неуверенные: подтверждённая отметка ценнее свежей догадки.
+                    worst = min(self._objects,
+                                key=lambda k: (self._objects[k]['seen'],
+                                               self._objects[k]['score']))
                     self._objects.pop(worst, None)
         if added:
             self.get_logger().info('на карту добавлено: ' + '; '.join(added))
 
     def _objects_snapshot(self):
+        """Только ПОДТВЕРЖДЁННЫЕ отметки — их видят и карта, и промпт.
+
+        Неподтверждённые остаются в словаре как кандидаты: они ждут второго
+        наблюдения и не показываются никому. Показать их значило бы вернуть ту
+        самую проблему, ради которой введён счётчик, — модель верит карте.
+        """
         with self._objects_lock:
-            return sorted(self._objects.values(),
+            return sorted((o for o in self._objects.values()
+                           if o['seen'] >= DETECT_MEMORY_SIGHTINGS),
                           key=lambda o: (o['label'], o['x'], o['y']))
 
     def _objects_for_prompt(self):
