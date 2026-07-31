@@ -345,12 +345,189 @@ class GroundingDINOMobileSAMSegmentor:
 
         return image_out, center_coords, depth_map, DINO_time+SAM_time
 
+    # --- DETECT_ALL по словарю -------------------------------------------
+    # Домашний словарь. Короткий намеренно: один класс = один запрос к модели
+    # (~0.2 с), и COCO-80 стоил бы 16 секунд на вызов. Составной запрос
+    # «toilet. sofa. bed. ...» одной фразой пробовали — он разваливается:
+    # при 12 классах унитаз становится «refrigerator 0.49», стол «wardrobe»,
+    # телевизор «television wardrobe». Фразовая привязка размазывается по
+    # токенам, и метки перестают значить что-либо.
+    DEFAULT_VOCAB = (
+        "toilet", "sofa", "bed", "television", "table", "chair", "sink",
+        "refrigerator", "wardrobe", "bathtub", "shelf", "stove", "door",
+        "person",
+    )
+
+    # На сколько победивший класс должен обойти следующий В ТОЙ ЖЕ рамке, чтобы
+    # метке можно было верить. Без этого правила DETECT_ALL врал бы уверенно, и
+    # это ИЗМЕРЕНО: на 11 кадрах мира house каждый из 12 классов срабатывает на
+    # каждом кадре с оценкой 0.2..0.8, а argmax совпадает с истиной лишь 2 раза
+    # из 11 (кадр ванны: стол 0.57, шкаф 0.56, сама ванна 0.51). Модель отвечает
+    # на вопрос «здесь вообще что-то есть», а не «что именно», когда предмет —
+    # некрашеный примитив без текстуры.
+    #
+    # Отрыв — честный признак: когда модель говорит «да» всему подряд, никто не
+    # отрывается, и словарный путь возвращает пусто. Пустой ответ хуже верного,
+    # но НЕСРАВНИМО лучше уверенно неверной метки: та попадает в память робота
+    # на карту и переживает всю миссию.
+    VOCAB_MARGIN = 0.10
+
+    @staticmethod
+    def _iou(a, b):
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+        inter = iw * ih
+        if inter <= 0.0:
+            return 0.0
+        area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+        area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+        union = area_a + area_b - inter
+        return inter / union if union > 0.0 else 0.0
+
+    def _best_box_per_class(self, image_pil, classes, box_threshold,
+                            text_threshold):
+        """{класс: (рамка, оценка)} — по одному запросу на класс.
+
+        Батчить бессмысленно: замерено 2.2 с на 12 классов и при размере пачки
+        1, и при 4, и при 12 — упирается в вычисления, а не в накладные расходы
+        на вызов.
+        """
+        out = {}
+        for cls in classes:
+            inputs = self.dino_processor(
+                images=image_pil, text=[[cls]], return_tensors="pt",
+            ).to(self.dino_device)
+            with torch.inference_mode():
+                outputs = self.dino_model(**inputs)
+            res = self.dino_processor.post_process_grounded_object_detection(
+                outputs, inputs.input_ids, threshold=box_threshold,
+                text_threshold=text_threshold,
+                target_sizes=[image_pil.size[::-1]],
+            )[0]
+            if not len(res["scores"]):
+                continue
+            i = int(torch.argmax(res["scores"]))
+            out[cls] = (res["boxes"][i].detach().cpu().numpy(),
+                        float(res["scores"][i].item()))
+        return out
+
+    def segment_vocab(self, image_bgr, classes=None, conf=0.20,
+                      min_mask_area=200):
+        """DETECT_ALL: что вокруг, по словарю, с проверкой на различимость.
+
+        Каждый класс спрашивается ОТДЕЛЬНЫМ запросом (составная фраза не
+        работает, см. DEFAULT_VOCAB). Рамки всех классов группируются по
+        пересечению, и внутри группы метку получает победитель — но только если
+        он обошёл следующий класс на VOCAB_MARGIN. Иначе группа отбрасывается:
+        значит, модель не различает, а угадывает.
+        """
+        from object_tracking.setofmark import Detection
+
+        vocab = [str(c).strip() for c in (classes or self.DEFAULT_VOCAB)
+                 if str(c).strip()]
+        if not vocab:
+            return []
+        conf = float(conf)
+        box_threshold = max(0.01, min(conf, 1.0))
+        text_threshold = min(0.25, max(0.01, box_threshold))
+
+        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        image_pil = PILImage.fromarray(image_rgb)
+        start = time.time()
+        per_class = self._best_box_per_class(image_pil, vocab, box_threshold,
+                                             text_threshold)
+        if not per_class:
+            print(f"DETECT_ALL: ни один из {len(vocab)} классов не сработал")
+            return []
+
+        # Группируем рамки разных классов, описывающие ОДНО место. Порог
+        # пересечения низкий (0.3), и это не придирка к числу: конкурирующие
+        # метки на одном предмете дают заметно разные рамки — «стол» обводит
+        # столешницу, «шкаф» весь силуэт. При 0.5 они попадали в РАЗНЫЕ группы,
+        # у победителя не оказывалось соперника, отрыв считался от нуля, и
+        # заведомо неверная метка проходила проверку. Наблюдалось ровно так:
+        # кадр кровати -> «table 0.54», хотя «wardrobe 0.53» стоял рядом.
+        ranked = sorted(per_class.items(), key=lambda kv: kv[1][1], reverse=True)
+        groups = []                      # [[(класс, рамка, оценка), ...], ...]
+        for cls, (box, score) in ranked:
+            for group in groups:
+                if any(self._iou(member[1], box) >= 0.3 for member in group):
+                    group.append((cls, box, score))
+                    break
+            else:
+                groups.append([(cls, box, score)])
+
+        winners, rejected = [], []
+        for group in groups:
+            best_cls, best_box, best_score = group[0]
+            if len(group) > 1:
+                runner_up, rival = group[1][2], group[1][0]
+            else:
+                # Одинокая группа. Соперника по месту нет, но «уверен» и
+                # «единственный, кто вообще откликнулся» — разные вещи: сравним
+                # с лучшим классом ВНЕ группы. Если по кадру откликнулся только
+                # один класс, сравнивать не с чем и метка принимается.
+                others = [s for c, (_b, s) in per_class.items() if c != best_cls]
+                runner_up = max(others) if others else 0.0
+                rival = 'лучший вне группы'
+            if best_score - runner_up < self.VOCAB_MARGIN:
+                rejected.append('%s~%s' % (best_cls, rival))
+                continue
+            winners.append((best_cls, best_box, best_score))
+        if rejected:
+            print('DETECT_ALL: отброшено как неразличимое (отрыв < %.2f): %s'
+                  % (self.VOCAB_MARGIN, ', '.join(rejected)))
+        if not winners:
+            print('DETECT_ALL: %d групп, ни одной различимой за %.1f с'
+                  % (len(groups), time.time() - start))
+            return []
+
+        boxes_np = np.asarray([w[1] for w in winners], dtype=np.float32)
+        try:
+            masks = self._predict_sam_masks(image_rgb, image_bgr.shape[:2],
+                                            boxes_np)
+        except torch.OutOfMemoryError:
+            if self.sam_device != "cuda":
+                raise
+            self.sam_device = "cpu"
+            self.sam = self.sam.to(self.sam_device)
+            self.predictor = SamPredictor(self.sam)
+            torch.cuda.empty_cache()
+            masks = self._predict_sam_masks(image_rgb, image_bgr.shape[:2],
+                                            boxes_np)
+
+        dets = []
+        for idx, (cls, box, score) in enumerate(winners):
+            x1, y1, x2, y2 = self._clamp_box(box, image_bgr.shape[:2])
+            if x2 <= x1 or y2 <= y1:
+                continue
+            mask = masks[idx] if idx < len(masks) else None
+            mask_for_det = None
+            if mask is not None:
+                if int(np.sum(mask)) < min_mask_area:
+                    continue
+                center = self.get_center_coordinates(mask)
+                cx, cy = center if center else ((x1 + x2) // 2, (y1 + y2) // 2)
+                mask_for_det = mask.astype(bool)
+            else:
+                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+            dets.append(Detection(label=cls, confidence=score, cx=int(cx),
+                                  cy=int(cy), bbox=(x1, y1, x2, y2),
+                                  mask=mask_for_det))
+        dets.sort(key=lambda d: d.confidence, reverse=True)
+        print('DETECT_ALL: %d класс(ов) из %d за %.1f с'
+              % (len(dets), len(vocab), time.time() - start))
+        return dets
+
     def segment_all(self, image_bgr, prompt, conf=0.20, min_mask_area=200):
         """Return all GroundingDINO+MobileSAM matches as Set-of-Mark detections.
 
-        This is the service-mode path used by DetectTarget for a concrete target
-        query. DETECT_ALL should still use YOLOE's broad vocabulary; DINO is most
-        useful here for phrase grounding such as "office chair" or "swivel chair".
+        Путь КОНКРЕТНОЙ цели: одна фраза, все её вхождения в кадре. Словарный
+        путь DETECT_ALL — в segment_vocab выше; там же объяснено, почему он
+        устроен иначе и почему составная фраза не годится.
         """
         from object_tracking.setofmark import Detection
 

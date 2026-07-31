@@ -221,8 +221,12 @@ class DetectTargetServer(Node):
             self._vocab_pending = 'yoloe'
             return self._load_backend('dino_mobilesam'), None
         if mode == 'dino_mobilesam':
-            # Concrete target mode only. DETECT_ALL is unavailable in this mode.
-            return self._load_backend('dino_mobilesam'), None
+            # ОБА пути на GroundingDINO: и цель, и DETECT_ALL. Словарный путь
+            # спрашивает по классу за запрос и требует отрыва победителя (см.
+            # segment_vocab) — иначе метки не значат ничего. YOLOE в графе не
+            # поднимается вовсе, то есть экономятся и его вес, и его прогрев.
+            dino = self._load_backend('dino_mobilesam')
+            return dino, dino
         if mode == 'yoloe':
             yoloe = self._load_backend('yoloe')
             return yoloe, yoloe
