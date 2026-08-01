@@ -6,14 +6,15 @@ detections + notes (+ the camera frame for the VLM), ask the client (mock or
 OpenAI-compatible) for up to N atomic actions, and dispatch each:
   TURN / DRIVE_FORWARD -> GoToPose at a pose RELATIVE to the robot's real pose
   DRIVE_TO_VISIBLE     -> ApproachDetection (drive to a detected object via Nav)
-  DETECT_ALL           -> broad-vocab detector call -> objects + classes into notes
+  DETECT_ALL           -> fixed-vocabulary context refresh -> notes
   DONE                 -> finish
 The vocabulary is deliberately small (raw motion + perception) so the VLM does its
 own navigation reasoning -- a fair comparison against the FLAT policy. The VLM is
 never on the reactive path; the executive owns motion + safety. A
 per-call timeout + circuit-breaker degrade VLM->FLAT on loss. Mock-first: with
 use_mock (or no credentials anywhere) the whole loop runs in sim/CI with no API
-key. Trigger a mission by publishing the target on /vlm_mission (std_msgs/String).
+key. In normal HIL runs, trigger a mission through SeekObject allow_vlm=true;
+the Pi-side executive bridges it into /vlm_mission (std_msgs/String).
 
 Real-VLM credentials: set the ROS params vlm_base_url / vlm_api_key / vlm_model,
 OR (preferred for secrets) export the environment variables VLM_BASE_URL /
@@ -155,8 +156,8 @@ class PlannerOrchestrator(Node):
         self.declare_parameter('detect_action_name', 'detect_target')
         self.declare_parameter('detect_timeout_s', 6.0)
         # Legacy override: if >0, applies one confidence floor to both target
-        # detection and DETECT_ALL. Prefer the split thresholds below: they mirror
-        # the diploma tracker (DINO strict for target, YOLOE permissive for overview).
+        # detection and context refresh. Prefer the split thresholds below: they
+        # mirror the diploma tracker (strict target, softer context).
         self.declare_parameter('detect_conf', 0.0)
         self.declare_parameter('target_detect_conf', 0.60)
         self.declare_parameter('detect_all_conf', 0.08)
@@ -168,9 +169,9 @@ class PlannerOrchestrator(Node):
         self.declare_parameter('target_confirm_interval_s', 0.20)
         self.declare_parameter('target_confirm_pixel_tolerance_px', 90.0)
         self.declare_parameter('target_confirm_depth_tolerance_m', 0.80)
-        # When the target detector returns no candidates, run a broad-vocab context
-        # pass so the VLM can reason "office furniture is on the left" instead of
-        # falling straight into a blind scan.
+        # When the target detector returns no candidates, run a fixed-vocabulary
+        # context pass so the VLM can reason "office furniture is on the left"
+        # instead of falling straight into a blind scan.
         self.declare_parameter('auto_context_when_target_absent', True)
         self.declare_parameter('context_detect_conf', 0.30)
         # Legacy no-op kept so old runbook commands with this parameter still start.
@@ -299,7 +300,8 @@ class PlannerOrchestrator(Node):
         self._fallback = make_client(use_mock=True)
         self._degrade = DegradationLatch()
         self.notes = NotesBuffer()
-        self._epoch = int(g('mission_epoch'))
+        self._default_epoch = int(g('mission_epoch'))
+        self._epoch = self._default_epoch
 
         # ---- inputs ----
         self._pixel = None
@@ -362,7 +364,7 @@ class PlannerOrchestrator(Node):
         self._busy = False
         self.get_logger().info(
             'planner_orchestrator up (Phase 4 VLM mode): client=%s creds=%s replan_every_n=%d. '
-            'Publish target on /vlm_mission to start.'
+            'Waiting for /vlm_mission (normally bridged from /seek_object allow_vlm=true).'
             % (type(self.client).__name__, self._cred_src, self.replan_n))
 
     # ---- input callbacks ----
@@ -389,12 +391,40 @@ class PlannerOrchestrator(Node):
         except Exception as e:
             self.get_logger().warn('image encode failed: %s' % e, throttle_duration_sec=5.0)
 
+    @staticmethod
+    def _parse_mission_message(data):
+        text = (data or '').strip()
+        if not text:
+            return '', None, ''
+        if text.startswith('{'):
+            try:
+                payload = json.loads(text)
+            except (TypeError, json.JSONDecodeError):
+                payload = None
+            if isinstance(payload, dict):
+                target = str(
+                    payload.get('instruction')
+                    or payload.get('target')
+                    or payload.get('data')
+                    or '').strip()
+                request_id = str(payload.get('request_id') or '').strip()
+                epoch = payload.get('mission_epoch')
+                try:
+                    epoch = int(epoch) if epoch is not None else None
+                except (TypeError, ValueError):
+                    epoch = None
+                return target, epoch, request_id
+        return text, None, ''
+
     def _on_mission(self, msg):
-        target = (msg.data or '').strip()
+        target, mission_epoch, request_id = self._parse_mission_message(msg.data)
         if not target or self._busy:
             return
         self._busy = True
-        threading.Thread(target=self._run_mission, args=(target,), daemon=True).start()
+        threading.Thread(
+            target=self._run_mission,
+            args=(target, mission_epoch, request_id),
+            daemon=True).start()
 
     # ---- monitoring trace ----
     def _activity(self, event, **data):
@@ -945,7 +975,7 @@ class PlannerOrchestrator(Node):
             # back to /target_pixel here: during DRIVE_TO_VISIBLE the orchestrator keeps
             # republishing the chosen pixel on /target_pixel, which would otherwise leak
             # back as a PHANTOM stale detection (target still "1.7 m away" after we drove
-            # right up to it and YOLOE lost it at close range).
+            # right up to it and the detector lost it at close range).
             return [], {}, self._camera_jpeg()
         # Detector server absent -> last-resort single /target_pixel candidate (lets the
         # orchestrator also run against the continuous rgb_tracker instead of the service).
@@ -1077,7 +1107,7 @@ class PlannerOrchestrator(Node):
         return [], {}, jpeg
 
     def _context_marks_from_candidates(self, target, candidates):
-        """Convert broad-vocab detector results into scene-context marks for the
+        """Convert detector results into scene-context marks for the
         VLM. These marks are not valid DRIVE_TO_VISIBLE targets; they only explain
         what kind of area is visible and on which side of the camera frame."""
         out = []
@@ -1125,7 +1155,10 @@ class PlannerOrchestrator(Node):
         if not self._detect.wait_for_server(timeout_sec=1.0):
             return [], None
         query = self._context_query_for_target(target)
-        conf_threshold = self.context_detect_conf if query else self.detect_all_conf
+        if not query:
+            self._activity('context_detect', backend='none', objects=[])
+            return [], None
+        conf_threshold = self.context_detect_conf
         res = self._call_detect_target(query, conf_threshold, True)
         cands = getattr(res, 'candidates', None) if res is not None else None
         jpeg = None
@@ -1160,12 +1193,12 @@ class PlannerOrchestrator(Node):
                     or int(m.mark_id) in confirmed_target_like_ids)
             ]
         if marks:
-            backend = 'dino_office' if query else 'yoloe_all'
-            self.get_logger().info('context_detect[%s]: %d object(s): %s' % (
-                backend, len(marks), ', '.join(self._context_brief(m) for m in marks)))
+            self.get_logger().info('context_detect[dino_office]: %d object(s): %s'
+                                   % (len(marks), ', '.join(self._context_brief(m)
+                                                            for m in marks)))
         self._activity(
             'context_detect',
-            backend='dino_office' if query else 'yoloe_all',
+            backend='dino_office',
             objects=[{'mark_id': m.mark_id, 'label': m.label,
                       'score': round(float(m.score), 2),
                       'distance_m': distance_for_options(m.distance_m),
@@ -1465,8 +1498,9 @@ class PlannerOrchestrator(Node):
                resolution.detection_query, resolution.query_type))
         return resolution, latency_ms
 
-    def _run_mission(self, raw_query):
+    def _run_mission(self, raw_query, mission_epoch=None, request_id=''):
         raw_query = (raw_query or '').strip()
+        self._epoch = self._default_epoch if mission_epoch is None else int(mission_epoch)
         self.notes = NotesBuffer()
         self.cb = CircuitBreaker()
         self._degrade = DegradationLatch()   # fresh mission retries the VLM
@@ -1487,6 +1521,8 @@ class PlannerOrchestrator(Node):
             canonical_target=resolution.canonical_target,
             detection_query=detection_query,
             query_type=resolution.query_type,
+            request_id=request_id,
+            mission_epoch=int(self._epoch),
             client=type(self.client).__name__, creds=self._cred_src,
             replan_every_n=self.replan_n, max_steps=self.max_steps)
         self._activity(
@@ -1595,8 +1631,14 @@ class PlannerOrchestrator(Node):
                 pending = None
             self.get_logger().info('VLM mission ended after %d steps%s' % (
                 step, ' (DEGRADED: ran in FLAT fallback)' if self._degrade.degraded else ''))
-            self._activity('mission_end', target=target, steps=step,
-                           degraded=bool(self._degrade.degraded))
+            self._activity(
+                'mission_end', target=target, raw_query=raw_query,
+                canonical_target=resolution.canonical_target,
+                detection_query=detection_query,
+                query_type=resolution.query_type,
+                request_id=request_id,
+                mission_epoch=int(self._epoch),
+                steps=step, degraded=bool(self._degrade.degraded))
         finally:
             # Join the in-flight replan BEFORE clearing _busy, so a stale pool worker
             # can never write this mission's circuit-breaker / degrade-latch / notes
@@ -1941,33 +1983,44 @@ class PlannerOrchestrator(Node):
         return getattr(res_box.get('res'), 'result', None)
 
     def _do_detect_all(self, target=''):
-        """DETECT_ALL: run the detector over a broad object vocabulary (empty query =>
-        detect-all on the server) and record what is in view -- objects + their
-        classes -- into the notes the VLM reads next replan. Perception only; the
-        robot does not move. Returns True if anything was detected."""
+        """DETECT_ALL: refresh fixed-vocabulary context for the current target.
+
+        The action name is kept for protocol compatibility, but the hardware VLM
+        pipeline no longer uses an empty-query broad detector here. For office
+        targets this sends the DINO office vocabulary as a normal non-empty query;
+        for non-context targets there is no safe broad fallback.
+        """
         if not self._detect.wait_for_server(timeout_sec=1.0):
             self.get_logger().warn('DETECT_ALL: detector server unavailable')
+            return False
+        query = self._context_query_for_target(target)
+        if not query:
+            self.notes.add_fact(
+                'DETECT_ALL: no fixed context vocabulary configured for this target')
+            self._activity('detect_all', backend='none', objects=[])
             return False
         g = DetectTarget.Goal()
         g.request_id = self._goal_id()
         g.mission_epoch = self._epoch
-        g.query = ''                      # empty query => broad-vocabulary detection
+        g.query = query
         g.render_setofmark = True
-        g.conf_threshold = self.detect_all_conf
+        g.conf_threshold = self.context_detect_conf
         res = self._call_action(self._detect, g, self.detect_timeout_s)
         cands = getattr(res, 'candidates', None) if res is not None else None
         if not cands:
-            self.notes.add_fact('DETECT_ALL: nothing detected in view')
-            self._activity('detect_all', objects=[])
+            self.notes.add_fact('DETECT_ALL: no fixed-context objects detected in view')
+            self._activity('detect_all', backend='dino_office', objects=[])
             return False
         if getattr(res, 'annotated', None) is not None and res.annotated.data:
             self._publish_view(self._setofmark_pub, bytes(res.annotated.data))
         marks = self._context_marks_from_candidates(target, cands)
         seen = ', '.join('%s(%.2f,%s,%s)' % (
             m.label, m.score, m.side, m.relevance) for m in marks)
-        self.notes.add_fact('objects in view: ' + seen)
-        self.get_logger().info('DETECT_ALL: %d object(s): %s' % (len(cands), seen))
+        self.notes.add_fact('fixed context in view: ' + seen)
+        self.get_logger().info('DETECT_ALL[dino_office]: %d object(s): %s'
+                               % (len(cands), seen))
         self._activity('detect_all',
+                       backend='dino_office',
                        objects=[{'mark_id': m.mark_id, 'label': m.label,
                                  'score': round(float(m.score), 2),
                                  'distance_m': distance_for_options(m.distance_m),

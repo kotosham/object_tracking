@@ -7,7 +7,7 @@
 uint8 TURN=0              # rotate in place by turn_yaw_rad (rad, + = CCW)
 uint8 DRIVE_FORWARD=1     # drive forward_dist_m along the heading (negative = backward)
 uint8 DRIVE_TO_VISIBLE=2  # approach a visible detection via Nav (mark_id from the Candidate list)
-uint8 DETECT_ALL=3        # detect all objects + classes in view (broad-vocab perception)
+uint8 DETECT_ALL=3        # refresh scene context detections (perception-only)
 uint8 DONE=4              # mission satisfied / target reached
 
 uint8 action

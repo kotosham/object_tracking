@@ -90,7 +90,7 @@ def test_mock_done_when_lost_after_approach():
     mp = MockPlanner()
     seen = Observation(target='bus', candidates=[Candidate(2, 'bus', 0.9, distance_m=1.5)])
     assert mp.plan(seen).kind == DRIVE_TO_VISIBLE     # drove toward it
-    # at point-blank the bus overflows the frame and YOLOE drops it -> treated as arrived.
+    # at point-blank the bus overflows the frame and the detector drops it -> treated as arrived.
     assert mp.plan(Observation(target='bus')).kind == DONE
 
 

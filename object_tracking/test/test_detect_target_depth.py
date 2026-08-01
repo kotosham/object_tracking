@@ -69,9 +69,10 @@ def test_sample_depth_point_prefers_nearest_valid_point_inside_mask():
     assert z == pytest.approx(1.5)
 
 
-def test_hybrid_mode_routes_target_to_dino_and_detect_all_to_yoloe(monkeypatch):
+@pytest.mark.parametrize("mode", ["dino", "dino_mobilesam", "hybrid_dino_yoloe"])
+def test_dino_modes_load_only_dino_backend(monkeypatch, mode):
     srv = DetectTargetServer.__new__(DetectTargetServer)
-    srv.model_mode = "hybrid_dino_yoloe"
+    srv.model_mode = mode
     loaded = []
 
     def fake_load_backend(_self, name):
@@ -82,9 +83,9 @@ def test_hybrid_mode_routes_target_to_dino_and_detect_all_to_yoloe(monkeypatch):
 
     target, vocab = srv._load_segmentors()
 
-    assert loaded == ["dino_mobilesam", "yoloe"]
+    assert loaded == ["dino_mobilesam"]
     assert target is not None
-    assert vocab is not None
+    assert vocab is None
 
 
 def test_yoloe_mode_uses_one_backend_for_target_and_detect_all(monkeypatch):

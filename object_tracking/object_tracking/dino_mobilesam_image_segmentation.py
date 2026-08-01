@@ -371,8 +371,8 @@ class GroundingDINOMobileSAMSegmentor:
         """Return all GroundingDINO+MobileSAM matches as Set-of-Mark detections.
 
         This is the service-mode path used by DetectTarget for a concrete target
-        query. DETECT_ALL should still use YOLOE's broad vocabulary; DINO is most
-        useful here for phrase grounding such as "office chair" or "swivel chair".
+        query. Fixed-vocabulary context scans use the same DINO path by passing a
+        non-empty prompt with multiple labels, e.g. office furniture classes.
         """
         from object_tracking.setofmark import Detection
 

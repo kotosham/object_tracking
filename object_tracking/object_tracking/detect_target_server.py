@@ -5,10 +5,12 @@ The service-mode counterpart to the continuous rgb_tracker_node: instead of stre
 /target_pixel, it answers a DetectTarget goal (open-vocab ``query`` + ``conf_threshold``)
 with a numbered Candidate[] and an optional annotated Set-of-Mark frame, so the VLM can
 pick a target by ``mark_id`` (DRIVE_TO_VISIBLE). In hybrid mode, concrete target
-queries use GroundingDINO+MobileSAM while DETECT_ALL stays on YOLOE's broad
-vocabulary. The heavy torch/ultralytics imports are deferred to construction so
-this module imports without a GPU (node returns ABORTED if a required backend
-can't load). The VLM/executive owns all motion -- this node only perceives.
+queries use GroundingDINO+MobileSAM. Empty-query broad DETECT_ALL remains
+available only in explicit ``model_mode:=yoloe``; the DINO experiment mode uses
+non-empty fixed-vocabulary queries for scene context instead. The heavy
+torch/ultralytics imports are deferred to construction so this module imports
+without a GPU (node returns ABORTED if a required backend can't load). The
+VLM/executive owns all motion -- this node only perceives.
 """
 import threading
 import time
@@ -51,7 +53,7 @@ class DetectTargetServer(Node):
         self.declare_parameter('image_topic', '/camera/camera/color/image_raw')
         self.declare_parameter('use_compressed_input', False)
         self.declare_parameter('input_reliability', 'best_effort')
-        self.declare_parameter('model_mode', 'yoloe')
+        self.declare_parameter('model_mode', 'dino')
         self.declare_parameter('conf_default', -1.0)  # legacy override for both paths
         self.declare_parameter('target_conf_default', 0.50)
         self.declare_parameter('vocab_conf_default', 0.08)
@@ -71,7 +73,7 @@ class DetectTargetServer(Node):
         g = lambda n: self.get_parameter(n).value
         self.image_topic = g('image_topic')
         self.use_compressed = bool(g('use_compressed_input'))
-        self.model_mode = str(g('model_mode')).strip().lower()
+        self.model_mode = self._canonical_model_mode(str(g('model_mode')).strip().lower())
         legacy_conf_default = float(g('conf_default'))
         self.target_conf_default = float(g('target_conf_default'))
         self.vocab_conf_default = float(g('vocab_conf_default'))
@@ -171,16 +173,21 @@ class DetectTargetServer(Node):
             self._hb.set_status(Heartbeat.OK)
 
     # ---- detector backend (heavy import deferred here) ----
+    @staticmethod
+    def _canonical_model_mode(mode):
+        if mode in ('dino', 'dino_mobilesam', 'hybrid', 'hybrid_dino_yoloe', 'dino_yoloe'):
+            return 'dino'
+        return mode
+
     def _load_segmentors(self):
         if not _HAVE_CV:
             self.get_logger().error('cv2/cv_bridge unavailable; detector disabled')
             return None, None
 
-        mode = self.model_mode
-        if mode in ('hybrid', 'hybrid_dino_yoloe', 'dino_yoloe'):
-            return self._load_backend('dino_mobilesam'), self._load_backend('yoloe')
-        if mode == 'dino_mobilesam':
-            # Concrete target mode only. DETECT_ALL is unavailable in this mode.
+        mode = self._canonical_model_mode(self.model_mode)
+        if mode == 'dino':
+            # DINO-only experiment mode. Non-empty target/context queries work;
+            # empty broad DETECT_ALL is intentionally unavailable to avoid YOLOE noise.
             return self._load_backend('dino_mobilesam'), None
         if mode == 'yoloe':
             yoloe = self._load_backend('yoloe')
@@ -217,9 +224,7 @@ class DetectTargetServer(Node):
         return type(segmentor).__name__
 
     def _backends_ready(self):
-        if self.model_mode in ('hybrid', 'hybrid_dino_yoloe', 'dino_yoloe'):
-            return self.target_segmentor is not None and self.vocab_segmentor is not None
-        if self.model_mode == 'dino_mobilesam':
+        if self._canonical_model_mode(self.model_mode) == 'dino':
             return self.target_segmentor is not None
         return self.target_segmentor is not None and self.vocab_segmentor is not None
 
@@ -472,8 +477,8 @@ class DetectTargetServer(Node):
             return result
 
         # The query is passed straight through (open-vocab object class). An EMPTY
-        # query means DETECT_ALL: detect every object in a broad built-in vocabulary
-        # and report each with its OWN predicted class, rather than one named target.
+        # query means DETECT_ALL in broad-vocabulary modes. In DINO-only mode this
+        # branch is unavailable; context scans must use a non-empty fixed vocabulary.
         query = (req.query or '').strip()
         fb = DetectTarget.Feedback()
         seg_t0 = time.monotonic()

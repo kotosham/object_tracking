@@ -14,13 +14,13 @@ This package does not send Nav2 goals directly in the current base architecture.
 
 `model_mode` values:
 
-- `dino_mobilesam` - GroundingDINO for box detection plus MobileSAM for segmentation.
+- `dino` / `dino_mobilesam` - GroundingDINO for box detection plus MobileSAM for segmentation.
 - `clip` - CLIPSeg segmentation.
 - `florence2` - Florence-2 referring-expression segmentation.
 - `yoloe` - YOLOE text-prompted detection/segmentation.
 - `auto` - legacy mode; selects DINO + MobileSAM when `use_sam:=true`, otherwise CLIPSeg.
 
-For the diploma experiments, the main baseline model has been `dino_mobilesam`; `clip`, `yoloe`, and `florence2` are useful for comparisons.
+For the current VLM/HIL experiments, the main detector mode is `dino`; `clip`, `yoloe`, and `florence2` are useful for comparisons or legacy runs.
 
 ## Main Nodes And Launch Files
 

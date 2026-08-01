@@ -81,6 +81,21 @@ def _approach_result(outcome=ApproachDetection.Result.SUCCEEDED):
     return res
 
 
+def test_parse_mission_message_accepts_plain_target():
+    target, epoch, request_id = PlannerOrchestrator._parse_mission_message('chair')
+    assert target == 'chair'
+    assert epoch is None
+    assert request_id == ''
+
+
+def test_parse_mission_message_accepts_seek_object_handoff_json():
+    data = '{"instruction": "office chair", "mission_epoch": 7, "request_id": "vlm-1"}'
+    target, epoch, request_id = PlannerOrchestrator._parse_mission_message(data)
+    assert target == 'office chair'
+    assert epoch == 7
+    assert request_id == 'vlm-1'
+
+
 def test_antioscillation_probes_forward_even_with_close_dino_context():
     node = _bare_orchestrator()
     obs = Observation(

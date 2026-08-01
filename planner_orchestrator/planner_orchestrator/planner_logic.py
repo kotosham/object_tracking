@@ -24,7 +24,7 @@ from typing import List, Optional, Tuple
 #   TURN           rotate in place by turn_yaw_rad (+ = CCW)
 #   DRIVE_FORWARD  drive forward_dist_m along the heading (negative = backward)
 #   DRIVE_TO_VISIBLE  approach a detected object by mark_id, via Nav (ApproachDetection)
-#   DETECT_ALL     run the detector over a broad vocabulary -> all objects + classes
+#   DETECT_ALL     refresh fixed-vocabulary scene context (perception only)
 #   DONE           mission complete / target reached
 TURN = 0
 DRIVE_FORWARD = 1
@@ -686,8 +686,8 @@ class MockPlanner:
     """Deterministic stand-in for the VLM so the whole loop runs/tests with no API.
 
     Policy (target = mission object), using only the honest primitives: approach a
-    matching visible detection; else take ONE wide look (DETECT_ALL) to list what is
-    around; else rotate to scan; after a bounded number of fruitless scans declare
+    matching visible detection; else use semantic context / a fixed-vocabulary
+    refresh; else rotate to scan; after a bounded number of fruitless scans declare
     DONE. Same Observation contract as the real VLM client, so swapping in the API
     changes nothing else. Also serves as the FLAT degradation fallback, so it must
     always drive the loop to a terminal action.
@@ -770,7 +770,7 @@ class MockPlanner:
                           rationale='target "%s" visible as mark %d (%.2fm)'
                           % (obs.target, best.mark_id, best.distance_m))
         # 2) not in view but we WERE just driving up to it -> at point-blank it overflows
-        #    the frame and YOLOE drops it: treat that as arrived only if the last
+        #    the frame and the detector drops it: treat that as arrived only if the last
         #    confirmed target range was already close. Far bounded approaches must
         #    keep searching/re-observing.
         if self._approaches > 0:
@@ -786,10 +786,10 @@ class MockPlanner:
             self._looked = True
             self._scans = 0
             return semantic_action
-        # 4) nothing matching in view -> one broad look before blind scanning.
+        # 4) nothing matching in view -> refresh fixed context before blind scanning.
         if not self._looked:
             self._looked = True
-            return Action(DETECT_ALL, rationale='no target in view; detect all objects')
+            return Action(DETECT_ALL, rationale='no target in view; refresh context')
         # 5) rotate to bring new things into view.
         if self._scans < self.scan_turn_limit:
             self._scans += 1
