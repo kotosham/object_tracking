@@ -30,6 +30,10 @@ def _bare_orchestrator():
     node.initial_scan_when_target_absent = True
     node.initial_scan_left_rad = 3.14
     node.initial_scan_right_rad = 1.57
+    node.target_lock_recovery_steps = 3
+    node.target_lock_recovery_turn_rad = 0.6
+    node.target_lock_recovery_forward_m = 0.45
+    node._target_lock = None
     node._semantic_turn_side = 'left'
     node._semantic_turn_streak = 2
     node.locked_target_approach_max_attempts = 8
@@ -154,6 +158,28 @@ def test_initial_scan_ignores_context_marks_but_stops_for_strict_target():
 
     assert node._initial_scan_actions(context_only, 0)
     assert node._initial_scan_actions(strict, 0) == []
+
+
+def test_recent_edge_target_lock_recovery_preempts_initial_scan():
+    node = _bare_orchestrator()
+    node._target_lock = {
+        'target': 'office chair',
+        'label': 'office chair',
+        'score': 0.77,
+        'distance_m': 5.15,
+        'side': 'left',
+        'step': 0,
+        'recoveries': 0,
+    }
+    obs = Observation(target='office chair')
+
+    action = node._target_lock_recovery_action(obs, 'office chair', step_index=1)
+
+    assert action.kind == TURN
+    assert action.turn_yaw_rad == 0.6
+    assert 'target_lock' in action.rationale
+    assert node._initial_scan_actions(obs, 1)
+    assert node._target_lock['recoveries'] == 1
 
 
 def test_corridor_scan_records_initial_views_as_context_cues():

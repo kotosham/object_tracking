@@ -41,6 +41,7 @@ ACTION_KINDS = {v: k for k, v in ACTION_NAMES.items()}
 CONTEXT_EXPLORE_TURN_RAD = 0.6
 CONTEXT_EXPLORE_FORWARD_M = 0.4
 CONTEXT_EXPLORE_MIN_CLEARANCE_M = 0.8
+CONTEXT_EXPLORE_SIDE_BLOCKER_M = 0.55
 TARGET_PROBE_TURN_RAD = 0.45
 TARGET_PROBE_FORWARD_M = 0.6
 STRICT_TARGET_DONE_DIST_M = 0.8
@@ -131,15 +132,26 @@ def format_distance(distance_m: float) -> str:
 
 
 def centered_forward_blocker(obs: Observation,
-                             min_clearance_m: float = CONTEXT_EXPLORE_MIN_CLEARANCE_M
+                             min_clearance_m: float = CONTEXT_EXPLORE_MIN_CLEARANCE_M,
+                             side_clearance_m: float = CONTEXT_EXPLORE_SIDE_BLOCKER_M
                              ) -> Optional[ContextMark]:
-    """Closest centered context mark that makes a blind/context forward probe unsafe."""
-    blockers = [
-        m for m in obs.context_marks
-        if m.side == 'center'
-        and distance_is_known(m.distance_m)
-        and float(m.distance_m) < float(min_clearance_m)
-    ]
+    """Closest context mark that makes a blind/context forward probe unsafe.
+
+    Centered blockers get the normal clearance threshold. Side blockers are only
+    treated as forward blockers when they are very close: with a floor-level
+    camera, a table wall/leg can appear left/right in the image while still being
+    inside the robot's near-forward swept area.
+    """
+    blockers = []
+    for mark in obs.context_marks:
+        if not distance_is_known(mark.distance_m):
+            continue
+        dist = float(mark.distance_m)
+        side = mark.side if mark.side in ('left', 'right', 'center') else 'center'
+        if side == 'center' and dist < float(min_clearance_m):
+            blockers.append(mark)
+        elif side in ('left', 'right') and dist < float(side_clearance_m):
+            blockers.append(mark)
     if not blockers:
         return None
     return min(blockers, key=lambda m: float(m.distance_m))
@@ -165,6 +177,22 @@ def best_context_mark(obs: Observation) -> Optional['ContextMark']:
 
 def best_directional_context_mark(obs: Observation) -> Optional['ContextMark']:
     directional = [m for m in useful_context_marks(obs) if m.side in ('left', 'right')]
+    if not directional:
+        return None
+    return max(directional, key=lambda m: (
+        2 if m.relevance == 'target_like' else 1 if m.relevance == 'office_context' else 0,
+        float(m.score),
+        -float(m.distance_m) if distance_is_known(m.distance_m) else -999.0,
+    ))
+
+
+def best_nonblocking_directional_context_mark(obs: Observation) -> Optional['ContextMark']:
+    directional = [
+        m for m in useful_context_marks(obs)
+        if m.side in ('left', 'right')
+        and (not distance_is_known(m.distance_m)
+             or float(m.distance_m) >= CONTEXT_EXPLORE_SIDE_BLOCKER_M)
+    ]
     if not directional:
         return None
     return max(directional, key=lambda m: (
@@ -365,15 +393,13 @@ def target_probe_action(obs: Observation, mark_id: int = 0,
 
 
 def context_forward_to_directional_explore(action: Action, obs: Observation) -> Optional[Action]:
-    """Keep corridor exploration as the default when the target is absent.
+    """Do not let corridor exploration drive nose-first into visible furniture.
 
-    Context marks are semantic hints, not destinations. Older logic rewrote a
-    VLM DRIVE_FORWARD into a TURN toward the strongest desk/cabinet, which made
-    the robot orbit furniture instead of exploring the free corridor the map
-    showed. Preserve DRIVE_FORWARD even if DINO sees a close desk/table fragment:
-    low camera viewpoints often include table edges at the bottom/center of the
-    frame while the actual corridor is still open. Shorten the step and let Nav2
-    costmaps/collision_monitor decide whether the guarded probe is safe.
+    Context marks are semantic hints, not destinations. If the VLM asks to
+    DRIVE_FORWARD while the target is absent, a close centered context object is
+    strong evidence that the *camera-facing* direction is not the corridor to
+    explore. Redirect to a meaningful side inspection instead of trying to creep
+    toward the furniture.
     """
     if action.kind != DRIVE_FORWARD:
         return None
@@ -384,19 +410,46 @@ def context_forward_to_directional_explore(action: Action, obs: Observation) -> 
         return None
 
     base = ('semantic_explore: target "%s" not visible; requested corridor '
-            'probe sees close centered context mark %d "%s" at %s'
-            % (obs.target, blocker.mark_id, blocker.label,
+            'probe sees close %s context mark %d "%s" at %s'
+            % (obs.target, blocker.side, blocker.mark_id, blocker.label,
                format_distance(blocker.distance_m)))
     if action.rationale:
         base += '; original rationale: ' + action.rationale
-    guarded_step = min(max(0.05, float(action.forward_dist_m)), 0.30)
+    if blocker.side == 'left':
+        return Action(
+            TURN,
+            turn_yaw_rad=-CONTEXT_EXPLORE_TURN_RAD,
+            arg_label=blocker.label,
+            rationale=(base + '; very close left-side furniture may still be in '
+                       'the robot swept path, so turn right to search for a free '
+                       'adjacent corridor instead of driving forward'))
+    if blocker.side == 'right':
+        return Action(
+            TURN,
+            turn_yaw_rad=CONTEXT_EXPLORE_TURN_RAD,
+            arg_label=blocker.label,
+            rationale=(base + '; very close right-side furniture may still be in '
+                       'the robot swept path, so turn left to search for a free '
+                       'adjacent corridor instead of driving forward'))
+
+    best_side = best_nonblocking_directional_context_mark(obs)
+    if best_side is not None:
+        turn = (CONTEXT_EXPLORE_TURN_RAD if best_side.side == 'left'
+                else -CONTEXT_EXPLORE_TURN_RAD)
+        return Action(
+            TURN,
+            turn_yaw_rad=turn,
+            arg_label=best_side.label,
+            rationale=(base + '; do not drive into centered furniture; turn toward '
+                       'the adjacent %s-side corridor/context cue mark %d "%s"')
+                      % (best_side.side, best_side.mark_id, best_side.label))
+
     return Action(
-        DRIVE_FORWARD,
-        forward_dist_m=guarded_step,
-        arg_label=action.arg_label,
-        rationale=(base + '; keep exploring the visible corridor with a shortened '
-                   'guarded forward probe; context furniture is not a destination '
-                   'and should not force another turn'))
+        TURN,
+        turn_yaw_rad=CONTEXT_EXPLORE_TURN_RAD,
+        arg_label=blocker.label,
+        rationale=(base + '; do not drive into centered furniture; no side cue is '
+                   'visible, so rotate left to search for a free adjacent corridor'))
 
 
 def context_turn_to_directional_explore(action: Action, obs: Observation) -> Optional[Action]:

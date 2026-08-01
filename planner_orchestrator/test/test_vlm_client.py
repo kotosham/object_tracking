@@ -9,7 +9,7 @@ from planner_orchestrator.planner_logic import (
 from planner_orchestrator.vlm_client import (
     ENV_API_KEY, ENV_BASE_URL, ENV_MODEL,
     MockVlmClient, OpenAICompatibleClient, SYSTEM_PROMPT, make_client,
-    resolve_credentials,
+    TargetResolution, resolve_credentials,
 )
 
 
@@ -66,6 +66,50 @@ def test_mock_client_drives_loop():
     assert a.kind == DRIVE_TO_VISIBLE and a.mark_id == 2
 
 
+def test_mock_client_target_resolution_passthrough():
+    res = MockVlmClient().resolve_target_query('office chair')
+    assert res.canonical_target == 'office chair'
+    assert res.detection_query == 'office chair'
+    assert res.query_type == 'direct_object_name'
+
+
+def test_target_resolution_keeps_attributes_for_detector():
+    res = TargetResolution.from_json('black office chair', {
+        'canonical_target': 'office chair',
+        'detection_query': 'black office chair',
+        'query_type': 'object_with_attributes',
+        'aliases': ['chair', 'office chair'],
+        'reason': 'direct name with color',
+    })
+    assert res.canonical_target == 'office chair'
+    assert res.detection_query == 'black office chair'
+    assert res.aliases == ('chair',)
+
+
+def test_parse_target_resolution_from_real_client_response():
+    c = OpenAICompatibleClient('http://x/v1', 'k', 'qwen')
+    content = {
+        'canonical_target': 'office chair',
+        'detection_query': 'office chair',
+        'query_type': 'semantic_description',
+        'aliases': ['chair'],
+        'reason': 'used for sitting at a desk',
+    }
+    resp = json.dumps({'choices': [{'message': {'content': json.dumps(content)}}]})
+    res = c.parse_target_resolution(resp, 'where people sit at a desk')
+    assert res.raw_query == 'where people sit at a desk'
+    assert res.canonical_target == 'office chair'
+    assert res.detection_query == 'office chair'
+    assert res.query_type == 'semantic_description'
+
+
+def test_target_resolution_invalid_json_falls_back_to_raw_object():
+    res = TargetResolution.from_json('drawer cabinet', ['not', 'an', 'object'])
+    assert res.canonical_target == 'drawer cabinet'
+    assert res.detection_query == 'drawer cabinet'
+    assert res.query_type == 'resolver_invalid'
+
+
 def test_build_messages_includes_image_and_options():
     c = OpenAICompatibleClient('http://x/v1', 'k', 'qwen')
     obs = Observation(target='bus', candidates=[Candidate(2, 'bus', 0.9, distance_m=2.0)])
@@ -89,6 +133,9 @@ def test_system_prompt_prioritizes_corridor_exploration():
     assert 'initial_scan turns are already done' in SYSTEM_PROMPT
     assert 'corridor_scan entries' in SYSTEM_PROMPT
     assert 'prefer a real free/unknown corridor' in SYSTEM_PROMPT
+    assert 'very close left/right furniture edge' in SYSTEM_PROMPT
+    assert 'If no such close forward/swept-path blocker is visible' in SYSTEM_PROMPT
+    assert 'DRIVE_FORWARD remains the preferred corridor-exploration action' in SYSTEM_PROMPT
 
 
 def test_build_messages_text_only_when_no_image():

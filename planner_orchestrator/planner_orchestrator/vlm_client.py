@@ -15,6 +15,7 @@ import base64
 import json
 import os
 import urllib.request
+from dataclasses import dataclass
 from typing import Optional
 
 # Environment variables the real VLM credentials can be supplied through. The
@@ -81,11 +82,16 @@ SYSTEM_PROMPT = (
     "or with a semantic cue. If notes show the initial_scan turns are already done "
     "and the target is still absent, stop scanning in place and choose an active "
     "corridor exploration action. Do not spend many steps rotating around the same local "
-    "furniture patch. A partial close desk/table fragment in the low camera view is "
-    "not by itself a reason to abandon a visible free corridor; if the SLAM map shows "
-    "free space ahead, prefer a shortened cautious DRIVE_FORWARD and let Nav2/costmaps "
-    "reject unsafe motion. If a real close obstacle blocks the corridor, TURN toward "
-    "the clearest adjacent corridor instead. "
+    "furniture patch. If the live camera and depth show a reliable close centered "
+    "desk/table/cabinet or other furniture physically blocking the forward direction "
+    "(roughly <0.8 m), or a very close left/right furniture edge that may still be "
+    "inside the robot's forward swept path (roughly <0.55 m), that direction is "
+    "not a corridor probe: do NOT DRIVE_FORWARD into the blocker just because the "
+    "map looks white there. If no such close forward/swept-path blocker is visible "
+    "and the SLAM map shows connected free space ahead, "
+    "DRIVE_FORWARD remains the preferred corridor-exploration action. "
+    "When the forward direction is blocked, TURN toward the clearest adjacent "
+    "left/right corridor instead. "
     "After the initial forward/right/left sweep, compare corridor_scan entries: "
     "prefer a real free/unknown corridor on the SLAM map first; if multiple corridors "
     "are similarly open, prefer the corridor whose recorded context objects are most "
@@ -101,8 +107,10 @@ SYSTEM_PROMPT = (
     "furniture; move through free space beside/beyond it. Start the rationale with "
     "'semantic_explore:'. Do not keep rotating in place around the same local furniture: "
     "after one meaningful semantic_explore TURN, prefer DRIVE_FORWARD about 0.45-0.6 m "
-    "into a clear corridor/free area to change viewpoint, unless a close centered "
-    "obstacle blocks the way. Target-like context detections in context_marks are still "
+    "into a clear corridor/free area to change viewpoint. Only suppress that "
+    "forward probe when a close forward/swept-path blocker is visible in the "
+    "live camera/depth. "
+    "Target-like context detections in context_marks are still "
     "search cues only: use them to choose a corridor or viewpoint, but do not "
     "DRIVE_TO_VISIBLE to their mark_id and do not DONE from context alone. "
     "If neither target nor useful context is visible, use blind_scan "
@@ -115,6 +123,84 @@ SYSTEM_PROMPT = (
 )
 
 
+TARGET_RESOLUTION_PROMPT = (
+    "You normalize a user's robot-search target before perception starts. "
+    "Decide whether the user query is already a concrete object name, a concrete "
+    "object name with visual attributes, or a semantic/riddle-like description. "
+    "If it is already a direct object name, preserve it. For example, "
+    "'office chair' stays 'office chair'. If it has useful visual attributes, "
+    "keep them in detection_query, but set canonical_target to the basic object "
+    "name. For example, 'black office chair' -> canonical_target 'office chair', "
+    "detection_query 'black office chair'. If it is a riddle/metaphor, infer the "
+    "most likely common physical object and express it as a short English "
+    "open-vocabulary detector phrase. Do not choose robot actions and do not "
+    "invent scene facts. Return one JSON object only with this schema: "
+    '{"canonical_target": str, "detection_query": str, "query_type": str, '
+    '"aliases": [str], "reason": str}. '
+    "Allowed query_type values: direct_object_name, object_with_attributes, "
+    "semantic_description, ambiguous. If ambiguous, still provide the best short "
+    "detector phrase."
+)
+
+
+@dataclass(frozen=True)
+class TargetResolution:
+    """Normalized mission target.
+
+    raw_query is what the operator published. canonical_target is what the
+    planner reasons about. detection_query is what the open-vocabulary detector
+    should receive; it may keep useful visual attributes.
+    """
+
+    raw_query: str
+    canonical_target: str
+    detection_query: str
+    query_type: str = 'direct_object_name'
+    aliases: tuple = ()
+    reason: str = ''
+
+    @staticmethod
+    def _clean_text(value, fallback, max_len=120):
+        text = str(value or '').strip().strip('"').strip("'")
+        if not text:
+            text = str(fallback or '').strip()
+        text = ' '.join(text.split())
+        return text[:max_len].strip()
+
+    @classmethod
+    def passthrough(cls, raw_query, query_type='direct_object_name', reason='passthrough'):
+        raw = cls._clean_text(raw_query, '')
+        return cls(raw_query=raw, canonical_target=raw, detection_query=raw,
+                   query_type=query_type, aliases=tuple(), reason=reason)
+
+    @classmethod
+    def from_json(cls, raw_query, data):
+        if not isinstance(data, dict):
+            return cls.passthrough(raw_query, query_type='resolver_invalid',
+                                   reason='resolver returned non-object JSON')
+        raw = cls._clean_text(raw_query, '')
+        canonical = cls._clean_text(data.get('canonical_target'), raw)
+        detection = cls._clean_text(data.get('detection_query'), canonical)
+        query_type = cls._clean_text(data.get('query_type'), 'direct_object_name', 40)
+        allowed = {
+            'direct_object_name', 'object_with_attributes',
+            'semantic_description', 'ambiguous',
+        }
+        if query_type not in allowed:
+            query_type = 'ambiguous'
+        aliases = data.get('aliases') or []
+        if not isinstance(aliases, list):
+            aliases = []
+        clean_aliases = []
+        for item in aliases[:8]:
+            alias = cls._clean_text(item, '', 80)
+            if alias and alias not in clean_aliases and alias not in (canonical, detection):
+                clean_aliases.append(alias)
+        reason = cls._clean_text(data.get('reason'), '', 240)
+        return cls(raw_query=raw, canonical_target=canonical, detection_query=detection,
+                   query_type=query_type, aliases=tuple(clean_aliases), reason=reason)
+
+
 class VlmClient:
     """Observation (+ optional camera JPEG + optional map JPEG) -> Action. Raises on
     failure/timeout."""
@@ -122,6 +208,10 @@ class VlmClient:
     def plan(self, obs: Observation, image_jpeg: Optional[bytes] = None,
              map_jpeg: Optional[bytes] = None) -> Action:
         raise NotImplementedError
+
+    def resolve_target_query(self, raw_query: str) -> TargetResolution:
+        """Map a raw operator query/riddle to a concrete detector target."""
+        return TargetResolution.passthrough(raw_query)
 
     def plan_sequence(self, obs: Observation, image_jpeg: Optional[bytes] = None,
                       map_jpeg: Optional[bytes] = None, n: int = 1) -> list:
@@ -194,6 +284,28 @@ class OpenAICompatibleClient(VlmClient):
             method='POST')
         with urllib.request.urlopen(req, timeout=self.timeout_s) as r:
             return r.read().decode('utf-8')
+
+    def parse_target_resolution(self, resp_text: str, raw_query: str) -> TargetResolution:
+        """Extract and sanitize the target-normalization JSON."""
+        data = json.loads(resp_text)
+        content = data['choices'][0]['message']['content']
+        if isinstance(content, list):
+            content = ''.join(p.get('text', '') for p in content if isinstance(p, dict))
+        return TargetResolution.from_json(raw_query, json.loads(content))
+
+    def resolve_target_query(self, raw_query: str) -> TargetResolution:
+        raw = TargetResolution._clean_text(raw_query, '')
+        body = {
+            'model': self.model,
+            'messages': [
+                {'role': 'system', 'content': TARGET_RESOLUTION_PROMPT},
+                {'role': 'user', 'content': 'User target query: %s' % raw},
+            ],
+            'temperature': 0,
+            'max_tokens': 256,
+            'response_format': {'type': 'json_object'},
+        }
+        return self.parse_target_resolution(self._post(body), raw)
 
     def plan(self, obs: Observation, image_jpeg: Optional[bytes] = None,
              map_jpeg: Optional[bytes] = None) -> Action:

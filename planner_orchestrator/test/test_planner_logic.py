@@ -212,7 +212,7 @@ def test_parse_preserves_context_forward_corridor_probe():
     assert a.rationale == 'probe forward'
 
 
-def test_parse_shortens_context_forward_when_center_fragment_is_close():
+def test_parse_redirects_context_forward_when_center_furniture_is_close():
     obs = Observation(
         target='office chair',
         context_marks=[
@@ -228,10 +228,53 @@ def test_parse_shortens_context_forward_when_center_fragment_is_close():
          'rationale': 'corridor ahead'},
         obs)
     assert reason == 'OK'
-    assert a.kind == DRIVE_FORWARD
-    assert a.forward_dist_m == 0.30
-    assert 'guarded forward probe' in a.rationale
-    assert 'should not force another turn' in a.rationale
+    assert a.kind == TURN
+    assert a.turn_yaw_rad == -0.6
+    assert 'do not drive into centered furniture' in a.rationale
+    assert 'right-side corridor/context cue' in a.rationale
+
+
+def test_parse_redirects_context_forward_away_from_very_close_side_furniture():
+    obs = Observation(
+        target='office chair',
+        context_marks=[
+            ContextMark(1, 'keyboard', 0.47, distance_m=0.45,
+                        side='left', center_x_norm=0.25,
+                        relevance='office_context'),
+            ContextMark(2, 'drawer cabinet file cabinet', 0.39, distance_m=0.42,
+                        side='left', center_x_norm=0.30,
+                        relevance='office_context'),
+            ContextMark(3, 'printer', 0.36, distance_m=2.17,
+                        side='right', center_x_norm=0.80,
+                        relevance='office_context'),
+        ])
+    a, reason = parse_vlm_action(
+        {'action': 'DRIVE_FORWARD', 'forward_dist_m': 0.55,
+         'rationale': 'camera shows no close obstacles blocking forward'},
+        obs)
+    assert reason == 'OK'
+    assert a.kind == TURN
+    assert a.turn_yaw_rad == -0.6
+    assert 'close left context mark' in a.rationale
+    assert 'turn right' in a.rationale
+
+
+def test_parse_turns_to_find_side_corridor_when_only_center_furniture_is_close():
+    obs = Observation(
+        target='office chair',
+        context_marks=[
+            ContextMark(1, 'desk table', 0.52, distance_m=0.33,
+                        side='center', center_x_norm=0.5,
+                        relevance='office_context'),
+        ])
+    a, reason = parse_vlm_action(
+        {'action': 'DRIVE_FORWARD', 'forward_dist_m': 0.55,
+         'rationale': 'corridor ahead'},
+        obs)
+    assert reason == 'OK'
+    assert a.kind == TURN
+    assert a.turn_yaw_rad == 0.6
+    assert 'no side cue is visible' in a.rationale
 
 
 def test_parse_normalizes_tiny_context_turn_to_directional_turn():

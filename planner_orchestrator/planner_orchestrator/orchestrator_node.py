@@ -65,7 +65,7 @@ from planner_orchestrator.planner_logic import (
     TURN, context_relevance_for, distance_for_options, distance_is_known,
     format_distance, image_side, lost_target_lock_recovery_action,
 )
-from planner_orchestrator.vlm_client import make_client
+from planner_orchestrator.vlm_client import TargetResolution, make_client
 
 try:
     import cv2
@@ -103,6 +103,9 @@ class PlannerOrchestrator(Node):
         self.declare_parameter('vlm_api_key', '')
         self.declare_parameter('vlm_model', '')
         self.declare_parameter('vlm_timeout_s', 30.0)
+        # Optional pre-flight semantic resolver: a direct target name is kept as-is,
+        # while a riddle/metaphorical query is normalized to a detector-friendly object.
+        self.declare_parameter('resolve_target_query', True)
         self.declare_parameter('turn_step_rad', 0.6)
         self.declare_parameter('min_effective_turn_rad', 0.6)
         self.declare_parameter('initial_scan_when_target_absent', True)
@@ -268,6 +271,7 @@ class PlannerOrchestrator(Node):
             self.target_detect_conf = self.detect_conf
             self.detect_all_conf = self.detect_conf
         self.vlm_timeout_s = float(g('vlm_timeout_s'))
+        self.resolve_target_query_enabled = bool(g('resolve_target_query'))
         self.camera_frame = g('camera_frame')
         self.subscribe_camera_image = bool(g('subscribe_camera_image')) and _HAVE_CV
         self.camera_image_topic = str(g('camera_image_topic'))
@@ -424,12 +428,13 @@ class PlannerOrchestrator(Node):
         with self._lock:
             return self._jpeg
 
-    def _observation(self, target, step_index):
+    def _observation(self, target, step_index, detection_query=None):
         """Pull candidates + the matching VLM image together, then build the
         Observation. Returns (obs, pixels, jpeg, map_jpeg) so the plan uses a
         CONSISTENT (candidate ids, camera image) pair even while the camera/replan
         threads run; the top-down SLAM map is rendered alongside (or None)."""
-        cands, pixels, jpeg = self._refresh_candidates(target)
+        detector_target = (detection_query or target or '').strip()
+        cands, pixels, jpeg = self._refresh_candidates(detector_target)
         if cands:
             self._remember_target_lock(target, cands, step_index)
         context_marks = []
@@ -661,6 +666,46 @@ class PlannerOrchestrator(Node):
             recovery=lock['recoveries'],
             max_recovery=self.target_lock_recovery_steps)
         return [action]
+
+    def _target_lock_recovery_action(self, obs, target, step_index):
+        """Recover a recently seen strict target before generic initial scan.
+
+        This matters after edge_target_guard / target_probe turns: the target may
+        briefly leave the frame after a recenter motion. That is not a reason to
+        restart the panoramic initial_scan; keep trying to reacquire the same
+        target first.
+        """
+        if obs is None or obs.candidates:
+            return None
+        lock = self._active_target_lock(target, step_index)
+        if lock is None:
+            return None
+        age_steps = max(0, int(step_index) - int(lock.get('step', 0)))
+        action = lost_target_lock_recovery_action(
+            obs,
+            label=str(lock.get('label', target) or target),
+            distance_m=float(lock.get('distance_m', 0.0) or 0.0),
+            side=str(lock.get('side', 'center') or 'center'),
+            age_steps=age_steps,
+            turn_step_rad=self.target_lock_recovery_turn_rad,
+            forward_dist_m=self.target_lock_recovery_forward_m)
+        if action is None:
+            return None
+        lock['recoveries'] = int(lock.get('recoveries', 0)) + 1
+        self.get_logger().info(
+            'target_lock: recovering last confirmed target before initial_scan -> %s '
+            '(recovery %d/%d)'
+            % (self._action_brief(action), lock['recoveries'],
+               self.target_lock_recovery_steps))
+        self._activity(
+            'target_lock_recovery', step=step_index,
+            action=self._action_brief(action),
+            label=lock.get('label', target),
+            distance_m=round(float(lock.get('distance_m', 0.0) or 0.0), 2),
+            side=lock.get('side', 'center'),
+            recovery=lock['recoveries'],
+            max_recovery=self.target_lock_recovery_steps)
+        return action
 
     @staticmethod
     def _pose_is_valid(ps):
@@ -1213,14 +1258,14 @@ class PlannerOrchestrator(Node):
             w, h, res, robot_xy, n_free, n_occ, n_unknown)
 
     # ---- anytime/async mission loop (Phase 4.6): replan overlaps execution ----
-    def _compute_plan(self, target, step):
+    def _compute_plan(self, target, step, detection_query=None):
         """Build an observation and ask the planner for up to N atomic actions.
         Runs either inline (bootstrap) or on the planner pool concurrently with
         execution. Returns a _PlanBundle (actions + the candidate pixel snapshot
         the VLM chose from); empty actions on VLM failure (circuit-breaker fed)."""
         # (obs, pixels, jpeg, map_jpeg) captured together -> the plan's DRIVE_TO_VISIBLE
         # pixels and the VLM images are a consistent set (race-free vs camera/replan).
-        obs, pixels, jpeg, map_jpeg = self._observation(target, step)
+        obs, pixels, jpeg, map_jpeg = self._observation(target, step, detection_query)
         # Dashboard views: the map image actually sent to the VLM this cycle.
         self._publish_view(self._map_view_pub, map_jpeg)
         # Phase 5.1: pick VLM or the latched FLAT fallback (once the breaker opens).
@@ -1241,12 +1286,20 @@ class PlannerOrchestrator(Node):
         blocked_action = self._target_approach_blocked_action(obs, target, step)
         locked_action = None if blocked_action is not None else self._locked_target_action(
             obs, target, step)
-        initial_scan_actions = [] if (blocked_action is not None or locked_action is not None) \
-            else self._initial_scan_actions(obs, step)
+        lock_recovery_action = None
+        if blocked_action is None and locked_action is None:
+            lock_recovery_action = self._target_lock_recovery_action(obs, target, step)
+        initial_scan_actions = [] if (
+            blocked_action is not None
+            or locked_action is not None
+            or lock_recovery_action is not None
+        ) else self._initial_scan_actions(obs, step)
         if blocked_action is not None:
             planner_name = 'target_approach_blocked'
         elif locked_action is not None:
             planner_name = 'target_nav_lock'
+        elif lock_recovery_action is not None:
+            planner_name = 'target_lock_recovery'
         elif initial_scan_actions:
             planner_name = 'initial_scan'
         else:
@@ -1279,6 +1332,20 @@ class PlannerOrchestrator(Node):
                 actions=[{'action': self._action_brief(a),
                           'role': self._action_role(a, obs),
                           'rationale': a.rationale or ''} for a in actions])
+            self.heartbeat.set_latency_ms(0.0)
+            self.heartbeat.set_status(
+                Heartbeat.DEGRADED if (self.cb.is_open or self._degrade.degraded)
+                else Heartbeat.OK)
+            return _PlanBundle(actions, pixels, obs)
+        if lock_recovery_action is not None:
+            actions = [lock_recovery_action]
+            self.get_logger().info('plan@step %d: target lock recovery action: %s'
+                                   % (step, self._action_brief(lock_recovery_action)))
+            self._activity(
+                'plan', step=step, latency_ms=0.0, source='target_lock_recovery',
+                actions=[{'action': self._action_brief(lock_recovery_action),
+                          'role': self._action_role(lock_recovery_action, obs),
+                          'rationale': lock_recovery_action.rationale or ''}])
             self.heartbeat.set_latency_ms(0.0)
             self.heartbeat.set_status(
                 Heartbeat.DEGRADED if (self.cb.is_open or self._degrade.degraded)
@@ -1340,7 +1407,7 @@ class PlannerOrchestrator(Node):
             else Heartbeat.OK)
         return _PlanBundle(actions, pixels, obs)
 
-    def _next_bundle(self, pending, target, step):
+    def _next_bundle(self, pending, target, step, detection_query=None):
         """Adopt the concurrently-computed plan at the commit-point (no idle if it
         finished during execution), or compute inline when async is off."""
         if pending is not None:
@@ -1348,7 +1415,7 @@ class PlannerOrchestrator(Node):
                 return pending.result()
             except Exception:
                 return _PlanBundle([], {}, None)
-        return self._compute_plan(target, step)
+        return self._compute_plan(target, step, detection_query)
 
     def _should_launch_lead_replan(self, action, action_index, batch_len, already_pending):
         """Do not observe/replan while a turn is physically in progress.
@@ -1376,11 +1443,30 @@ class PlannerOrchestrator(Node):
             reason='post_turn_image_stabilization')
         time.sleep(delay)
 
-    def _run_mission(self, target):
-        self.get_logger().info('VLM mission start: target="%s"' % target)
-        self._activity('mission_start', target=target,
-                       client=type(self.client).__name__, creds=self._cred_src,
-                       replan_every_n=self.replan_n, max_steps=self.max_steps)
+    def _resolve_target_query(self, raw_query):
+        if not self.resolve_target_query_enabled:
+            return TargetResolution.passthrough(
+                raw_query, query_type='resolver_disabled',
+                reason='resolve_target_query parameter is false'), 0.0
+        t0 = time.monotonic()
+        try:
+            resolution = self.client.resolve_target_query(raw_query)
+            latency_ms = (time.monotonic() - t0) * 1e3
+        except Exception as e:
+            latency_ms = (time.monotonic() - t0) * 1e3
+            self.get_logger().warn(
+                'target query resolver failed (%s); using raw query "%s"'
+                % (e, raw_query))
+            resolution = TargetResolution.passthrough(
+                raw_query, query_type='resolver_failed', reason=str(e))
+        self.get_logger().info(
+            'target_query: raw="%s" -> canonical="%s", detection_query="%s", type=%s'
+            % (resolution.raw_query, resolution.canonical_target,
+               resolution.detection_query, resolution.query_type))
+        return resolution, latency_ms
+
+    def _run_mission(self, raw_query):
+        raw_query = (raw_query or '').strip()
         self.notes = NotesBuffer()
         self.cb = CircuitBreaker()
         self._degrade = DegradationLatch()   # fresh mission retries the VLM
@@ -1390,10 +1476,36 @@ class PlannerOrchestrator(Node):
         self._target_nav_lock = None
         self._target_approach_blocked = None
         self._corridor_scan = {}
+        resolution, resolve_latency_ms = self._resolve_target_query(raw_query)
+        target = resolution.canonical_target or raw_query
+        detection_query = resolution.detection_query or target
+        self.get_logger().info(
+            'VLM mission start: target="%s" raw_query="%s" detection_query="%s"'
+            % (target, raw_query, detection_query))
+        self._activity(
+            'mission_start', target=target, raw_query=raw_query,
+            canonical_target=resolution.canonical_target,
+            detection_query=detection_query,
+            query_type=resolution.query_type,
+            client=type(self.client).__name__, creds=self._cred_src,
+            replan_every_n=self.replan_n, max_steps=self.max_steps)
+        self._activity(
+            'target_query_resolved', target=target, raw_query=raw_query,
+            canonical_target=resolution.canonical_target,
+            detection_query=detection_query,
+            query_type=resolution.query_type,
+            aliases=list(resolution.aliases),
+            reason=resolution.reason,
+            latency_ms=round(resolve_latency_ms, 1))
+        if raw_query != target or detection_query != target:
+            self.notes.add_fact(
+                'TARGET_QUERY raw="%s" -> canonical="%s", detector="%s" (%s)'
+                % (raw_query, target, detection_query, resolution.query_type))
         step = 0
         pending = None
         try:
-            bundle = self._compute_plan(target, step)   # bootstrap (the only idle point)
+            bundle = self._compute_plan(
+                target, step, detection_query)   # bootstrap (the only idle point)
             while rclpy.ok() and step < self.max_steps:
                 if not bundle.actions:
                     # Degradation (cb open) does NOT stop the mission -- _compute_plan
@@ -1403,7 +1515,7 @@ class PlannerOrchestrator(Node):
                         self.get_logger().error('FLAT fallback produced no action -> stopping')
                         self._dispatch_stop()
                         break
-                    bundle = self._next_bundle(pending, target, step)
+                    bundle = self._next_bundle(pending, target, step, detection_query)
                     pending = None
                     time.sleep(self.min_step_s)   # rate-limit transient empty-plan retries
                     continue
@@ -1436,7 +1548,8 @@ class PlannerOrchestrator(Node):
                     # executes, so it is ready at the commit-point -> no wasted idle.
                     if self._should_launch_lead_replan(
                             action, i, len(bundle.actions), pending is not None):
-                        pending = self._planner_pool.submit(self._compute_plan, target, step + 1)
+                        pending = self._planner_pool.submit(
+                            self._compute_plan, target, step + 1, detection_query)
                     t0 = time.monotonic()
                     ok = self._dispatch(action, bundle.pixels, target, step)
                     self.notes.add_fact('%s%s -> %s' % (
@@ -1478,7 +1591,7 @@ class PlannerOrchestrator(Node):
                 if terminate or step >= self.max_steps:
                     break
                 # commit-point: adopt the plan computed during execution
-                bundle = self._next_bundle(pending, target, step)
+                bundle = self._next_bundle(pending, target, step, detection_query)
                 pending = None
             self.get_logger().info('VLM mission ended after %d steps%s' % (
                 step, ' (DEGRADED: ran in FLAT fallback)' if self._degrade.degraded else ''))
@@ -1709,7 +1822,10 @@ class PlannerOrchestrator(Node):
                        self.motion_fallback_frame, self.robot_frame))
                 return False
             gx, gy, gyaw = orch.relative_goal(pose[0], pose[1], pose[2], action)
-            return self._send_goto(gx, gy, gyaw, frame_id=pose[3])
+            return self._send_goto(
+                gx, gy, gyaw, frame_id=pose[3],
+                safe_forward=(action.kind == DRIVE_FORWARD
+                              and float(action.forward_dist_m) > 0.0))
         if action.kind == DRIVE_TO_VISIBLE:
             self._last_approach_result = None
             if action.mark_id == 0 and action.arg_label == '__locked_target__':
@@ -1723,9 +1839,10 @@ class PlannerOrchestrator(Node):
     def _goal_id(self):
         return uuid.uuid4().hex
 
-    def _send_goto(self, x, y, yaw, frame_id=None):
+    def _send_goto(self, x, y, yaw, frame_id=None, safe_forward=False):
         g = GoToPose.Goal()
-        g.request_id = self._goal_id()
+        rid = self._goal_id()
+        g.request_id = ('safe_forward:' + rid) if safe_forward else rid
         g.mission_epoch = self._epoch
         ps = PoseStamped()
         ps.header.frame_id = frame_id or self.map_frame
