@@ -67,7 +67,11 @@ def launch_setup(context, *args, **kwargs):
         '-p',
         f"depth_match_tolerance:={LaunchConfiguration('depth_match_tolerance').perform(context)}",
         '-p',
+        f"continuous_inference_rate:={LaunchConfiguration('continuous_inference_rate').perform(context)}",
+        '-p',
         f"target_publish_rate:={LaunchConfiguration('target_publish_rate').perform(context)}",
+        '-p',
+        f"target_conf_default:={LaunchConfiguration('target_conf_default').perform(context)}",
         '-p',
         f"continuous_frame_max_age:={LaunchConfiguration('continuous_frame_max_age').perform(context)}",
         '-p',
@@ -188,9 +192,19 @@ def generate_launch_description():
             description='Maximum allowed timestamp mismatch in seconds between RGB and depth frames.',
         ),
         DeclareLaunchArgument(
+            'continuous_inference_rate',
+            default_value='1.0',
+            description='Maximum DINO/SAM inference rate in continuous mode. Publication rate is controlled separately.',
+        ),
+        DeclareLaunchArgument(
             'target_publish_rate',
             default_value='3.0',
             description='Maximum rate in Hz for publishing /target_pixel and /target_mask in continuous mode. Set <=0 for no limit.',
+        ),
+        DeclareLaunchArgument(
+            'target_conf_default',
+            default_value='0.60',
+            description='Confidence floor for target detections in continuous DINO tracking.',
         ),
         DeclareLaunchArgument(
             'continuous_frame_max_age',

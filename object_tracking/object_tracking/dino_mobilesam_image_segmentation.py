@@ -226,7 +226,7 @@ class GroundingDINOMobileSAMSegmentor:
                     for c in candidate_labels if str(c).strip()}
         return by_lower.get(label.lower(), label)
 
-    def segment(self, image_bgr, prompt, depth_map):
+    def segment(self, image_bgr, prompt, depth_map, conf=0.60):
         self.last_detection_score = None
         self.last_detection_label = None
         self.last_mask = None
@@ -244,11 +244,14 @@ class GroundingDINOMobileSAMSegmentor:
 
         print("received outputs from DINO")
 
+        box_threshold = max(0.01, min(float(conf), 1.0))
+        text_threshold = min(0.25, max(0.01, box_threshold))
+
         results = self.dino_processor.post_process_grounded_object_detection(
             outputs,
             inputs.input_ids,
-            threshold=0.3,
-            text_threshold=0.25,
+            threshold=box_threshold,
+            text_threshold=text_threshold,
             target_sizes=[image_pil.size[::-1]]
         )
 
@@ -262,8 +265,6 @@ class GroundingDINOMobileSAMSegmentor:
 
         result = results[0]
 
-        # Фильтрация по порогу
-        box_threshold = 0.55
         output_labels = result.get("text_labels", result.get("labels", []))
         filtered = [
             (box.cpu().numpy(), score.item(),

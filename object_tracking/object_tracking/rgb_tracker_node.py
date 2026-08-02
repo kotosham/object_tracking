@@ -33,7 +33,9 @@ class RGBTrackerNode(Node):
         self.declare_parameter('min_depth_m', 0.1)
         self.declare_parameter('max_depth_m', 6.0)
         self.declare_parameter('nearest_depth_band_m', 0.02)
+        self.declare_parameter('continuous_inference_rate', 1.0)
         self.declare_parameter('target_publish_rate', 3.0)
+        self.declare_parameter('target_conf_default', 0.60)
         self.declare_parameter('continuous_frame_max_age', 2.0)
         self.declare_parameter('publish_mask_in_continuous', False)
         self.declare_parameter('cv_runtime_topic', '/experiment/cv_runtime')
@@ -51,7 +53,9 @@ class RGBTrackerNode(Node):
         self.min_depth_m = self.get_parameter('min_depth_m').get_parameter_value().double_value
         self.max_depth_m = self.get_parameter('max_depth_m').get_parameter_value().double_value
         self.nearest_depth_band_m = self.get_parameter('nearest_depth_band_m').get_parameter_value().double_value
+        self.continuous_inference_rate = self.get_parameter('continuous_inference_rate').get_parameter_value().double_value
         self.target_publish_rate = self.get_parameter('target_publish_rate').get_parameter_value().double_value
+        self.target_conf_default = self.get_parameter('target_conf_default').get_parameter_value().double_value
         self.continuous_frame_max_age = self.get_parameter('continuous_frame_max_age').get_parameter_value().double_value
         self.publish_mask_in_continuous = self.get_parameter('publish_mask_in_continuous').get_parameter_value().bool_value
         self.cv_runtime_topic = self.get_parameter('cv_runtime_topic').get_parameter_value().string_value
@@ -91,7 +95,9 @@ class RGBTrackerNode(Node):
         self.get_logger().info(
             f'Tracking mode: {self.tracking_mode}. '
             f'Depth input is {"enabled" if self.use_depth_input else "disabled"}. '
-            f'Input QoS reliability: {self.input_reliability}.'
+            f'Input QoS reliability: {self.input_reliability}. '
+            f'Continuous inference rate: {self.continuous_inference_rate:.2f} Hz. '
+            f'Target confidence threshold: {self.target_conf_default:.2f}.'
         )
 
         self.current_prompt = None
@@ -117,6 +123,7 @@ class RGBTrackerNode(Node):
         self.last_target_publish_time = 0.0
         self.prompt_started_monotonic = 0.0
         self.last_rgb_frame_received_monotonic = 0.0
+        self.last_continuous_inference_monotonic = 0.0
         self.frames_received_for_prompt = 0
         self.last_depth_sync_warn_time = 0.0
         self.depth_sync_warn_period = 2.0
@@ -202,6 +209,7 @@ class RGBTrackerNode(Node):
         self.last_logged_center = None
         self.last_not_found_log_time = 0.0
         self.last_target_publish_time = 0.0
+        self.last_continuous_inference_monotonic = 0.0
         self.prompt_started_monotonic = time.monotonic()
         self.last_rgb_frame_received_monotonic = 0.0
         self.frames_received_for_prompt = 0
@@ -346,7 +354,7 @@ class RGBTrackerNode(Node):
     def _process_image(self, image, header, depth_frame):
         if self.model_mode == 'dino_mobilesam':
             seg_img, center_coords, _unused_depth, segmentation_time = self.segmentor.segment(
-                image, self.current_prompt, depth_frame
+                image, self.current_prompt, depth_frame, conf=self.target_conf_default
             )
         else:
             seg_img, center_coords, segmentation_time, _unused_depth = self.segmentor.segment(
@@ -411,8 +419,14 @@ class RGBTrackerNode(Node):
         if self.latest_continuous_frame is None:
             return
 
+        now = time.monotonic()
+        if self.continuous_inference_rate > 0.0:
+            inference_period = 1.0 / self.continuous_inference_rate
+            if (now - self.last_continuous_inference_monotonic) < inference_period:
+                return
+
         frame = self.latest_continuous_frame
-        frame_age = time.monotonic() - frame['stored_monotonic']
+        frame_age = now - frame['stored_monotonic']
         if self.continuous_frame_max_age > 0.0 and frame_age > self.continuous_frame_max_age:
             self.latest_continuous_frame = None
             if (time.monotonic() - self.last_continuous_age_warn_time) >= self.depth_sync_warn_period:
@@ -428,6 +442,7 @@ class RGBTrackerNode(Node):
             return
 
         self.latest_continuous_frame = None
+        self.last_continuous_inference_monotonic = now
         self._process_image(frame['image'], frame['header'], depth_frame)
 
     def _note_burst_frame_arrival(self, header):

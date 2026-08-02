@@ -28,7 +28,9 @@ def generate_launch_description():
     image_out_topic = LaunchConfiguration('image_out_topic')
     enable_search_rotation = LaunchConfiguration('enable_search_rotation')
     depth_match_tolerance = LaunchConfiguration('depth_match_tolerance')
+    continuous_inference_rate = LaunchConfiguration('continuous_inference_rate')
     target_publish_rate = LaunchConfiguration('target_publish_rate')
+    target_conf_default = LaunchConfiguration('target_conf_default')
     continuous_frame_max_age = LaunchConfiguration('continuous_frame_max_age')
     publish_mask_in_continuous = LaunchConfiguration('publish_mask_in_continuous')
 
@@ -53,7 +55,9 @@ def generate_launch_description():
             'use_depth_input': use_depth_input,
             'depth_topic': depth_topic,
             'depth_match_tolerance': depth_match_tolerance,
+            'continuous_inference_rate': continuous_inference_rate,
             'target_publish_rate': target_publish_rate,
+            'target_conf_default': target_conf_default,
             'continuous_frame_max_age': continuous_frame_max_age,
             'publish_mask_in_continuous': publish_mask_in_continuous,
             'enable_search_rotation': enable_search_rotation,
@@ -148,9 +152,19 @@ def generate_launch_description():
             description='Maximum allowed timestamp mismatch in seconds between RGB and depth frames.',
         ),
         DeclareLaunchArgument(
+            'continuous_inference_rate',
+            default_value='1.0',
+            description='Maximum DINO/SAM inference rate in continuous mode. Publication rate is controlled separately.',
+        ),
+        DeclareLaunchArgument(
             'target_publish_rate',
             default_value='3.0',
             description='Maximum continuous publication rate in Hz for /target_pixel and /target_mask.',
+        ),
+        DeclareLaunchArgument(
+            'target_conf_default',
+            default_value='0.60',
+            description='Confidence floor for target detections in continuous DINO tracking.',
         ),
         DeclareLaunchArgument(
             'publish_mask_in_continuous',
