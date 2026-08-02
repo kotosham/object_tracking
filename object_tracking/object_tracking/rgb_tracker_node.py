@@ -33,10 +33,11 @@ class RGBTrackerNode(Node):
         self.declare_parameter('min_depth_m', 0.1)
         self.declare_parameter('max_depth_m', 6.0)
         self.declare_parameter('nearest_depth_band_m', 0.02)
-        self.declare_parameter('continuous_inference_rate', 1.0)
+        self.declare_parameter('continuous_inference_rate', 0.5)
         self.declare_parameter('target_publish_rate', 3.0)
         self.declare_parameter('target_conf_default', 0.60)
         self.declare_parameter('continuous_frame_max_age', 2.0)
+        self.declare_parameter('continuous_header_max_age', 2.0)
         self.declare_parameter('publish_mask_in_continuous', False)
         self.declare_parameter('cv_runtime_topic', '/experiment/cv_runtime')
 
@@ -57,6 +58,7 @@ class RGBTrackerNode(Node):
         self.target_publish_rate = self.get_parameter('target_publish_rate').get_parameter_value().double_value
         self.target_conf_default = self.get_parameter('target_conf_default').get_parameter_value().double_value
         self.continuous_frame_max_age = self.get_parameter('continuous_frame_max_age').get_parameter_value().double_value
+        self.continuous_header_max_age = self.get_parameter('continuous_header_max_age').get_parameter_value().double_value
         self.publish_mask_in_continuous = self.get_parameter('publish_mask_in_continuous').get_parameter_value().bool_value
         self.cv_runtime_topic = self.get_parameter('cv_runtime_topic').get_parameter_value().string_value
 
@@ -97,6 +99,7 @@ class RGBTrackerNode(Node):
             f'Depth input is {"enabled" if self.use_depth_input else "disabled"}. '
             f'Input QoS reliability: {self.input_reliability}. '
             f'Continuous inference rate: {self.continuous_inference_rate:.2f} Hz. '
+            f'Continuous header max age: {self.continuous_header_max_age:.2f}s. '
             f'Target confidence threshold: {self.target_conf_default:.2f}.'
         )
 
@@ -128,6 +131,7 @@ class RGBTrackerNode(Node):
         self.last_depth_sync_warn_time = 0.0
         self.depth_sync_warn_period = 2.0
         self.last_continuous_age_warn_time = 0.0
+        self.last_continuous_header_age_warn_time = 0.0
         self.last_no_frame_warn_time = 0.0
         self.target_publish_period = 0.0 if self.target_publish_rate <= 0.0 else 1.0 / self.target_publish_rate
         sensor_qos = QoSProfile(depth=1)
@@ -437,6 +441,10 @@ class RGBTrackerNode(Node):
                 )
             return
 
+        if not self._continuous_header_is_fresh(frame['header'], 'before inference'):
+            self.latest_continuous_frame = None
+            return
+
         depth_frame = self._get_matching_depth(frame['header'])
         if self.use_depth_input and depth_frame is None:
             return
@@ -564,6 +572,9 @@ class RGBTrackerNode(Node):
         self._reset_burst_state()
 
     def _publish_continuous_target(self, center_coords, header, mask, depth_frame):
+        if not self._continuous_header_is_fresh(header, 'before /target_pixel publish'):
+            return None, None
+
         now = time.monotonic()
         if self.target_publish_period > 0.0 and (now - self.last_target_publish_time) < self.target_publish_period:
             return None, None
@@ -663,6 +674,27 @@ class RGBTrackerNode(Node):
             return None
 
         return best_match['image']
+
+    def _continuous_header_is_fresh(self, header, stage):
+        if self.continuous_header_max_age <= 0.0:
+            return True
+
+        stamp_ns = self._stamp_to_ns(header.stamp)
+        if stamp_ns <= 0:
+            return True
+
+        age_s = (self.get_clock().now().nanoseconds - stamp_ns) / 1e9
+        if age_s <= self.continuous_header_max_age:
+            return True
+
+        now = time.monotonic()
+        if (now - self.last_continuous_header_age_warn_time) >= self.depth_sync_warn_period:
+            self.last_continuous_header_age_warn_time = now
+            self.get_logger().warn(
+                f'Skipping stale continuous RGB frame {stage}: '
+                f'header age {age_s:.3f}s > {self.continuous_header_max_age:.3f}s.'
+            )
+        return False
 
     def _warn_depth_sync(self, message):
         now = time.monotonic()

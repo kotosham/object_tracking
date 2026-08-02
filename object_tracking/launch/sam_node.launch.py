@@ -75,6 +75,8 @@ def launch_setup(context, *args, **kwargs):
         '-p',
         f"continuous_frame_max_age:={LaunchConfiguration('continuous_frame_max_age').perform(context)}",
         '-p',
+        f"continuous_header_max_age:={LaunchConfiguration('continuous_header_max_age').perform(context)}",
+        '-p',
         f"publish_mask_in_continuous:={LaunchConfiguration('publish_mask_in_continuous').perform(context)}",
         '-r',
         f"/image_in:={LaunchConfiguration('image_topic').perform(context)}",
@@ -193,7 +195,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'continuous_inference_rate',
-            default_value='1.0',
+            default_value='0.5',
             description='Maximum DINO/SAM inference rate in continuous mode. Publication rate is controlled separately.',
         ),
         DeclareLaunchArgument(
@@ -210,6 +212,11 @@ def generate_launch_description():
             'continuous_frame_max_age',
             default_value='2.0',
             description='Drop a cached frame in continuous mode if it sat unprocessed longer than this many seconds. Set <=0 to disable.',
+        ),
+        DeclareLaunchArgument(
+            'continuous_header_max_age',
+            default_value='2.0',
+            description='Drop continuous RGB results whose message header stamp is older than this many seconds. Set <=0 to disable.',
         ),
         DeclareLaunchArgument(
             'publish_mask_in_continuous',
