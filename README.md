@@ -218,7 +218,7 @@ Useful continuous-mode parameters:
 
 - `target_publish_rate` - max `/target_pixel` publication rate, default `3.0 Hz`.
 - `continuous_frame_max_age` - max time a cached frame may wait before inference, default `2.0 s`.
-- `continuous_header_max_age` - max acceptable RGB header age, default `2.0 s`.
+- `continuous_header_max_age` - max acceptable RGB header age, default `3.5 s`.
 - `depth_match_tolerance` - max RGB/depth stamp mismatch, default `0.2 s`.
 - `nearest_depth_percentile` - depth percentile used to select the near point on a mask, default `5.0`.
 - `nearest_depth_min_pixels` - minimum pixels in the near-depth band, default `3`.

@@ -215,7 +215,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'continuous_header_max_age',
-            default_value='2.0',
+            default_value='3.5',
             description='Drop continuous RGB results whose message header stamp is older than this many seconds. Set <=0 to disable.',
         ),
         DeclareLaunchArgument(

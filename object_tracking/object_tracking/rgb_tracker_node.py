@@ -37,7 +37,7 @@ class RGBTrackerNode(Node):
         self.declare_parameter('target_publish_rate', 3.0)
         self.declare_parameter('target_conf_default', 0.60)
         self.declare_parameter('continuous_frame_max_age', 2.0)
-        self.declare_parameter('continuous_header_max_age', 2.0)
+        self.declare_parameter('continuous_header_max_age', 3.5)
         self.declare_parameter('publish_mask_in_continuous', False)
         self.declare_parameter('cv_runtime_topic', '/experiment/cv_runtime')
 
@@ -204,9 +204,10 @@ class RGBTrackerNode(Node):
             )
             return
 
-        self.current_prompt = msg.data
+        prompt = str(msg.data or '').strip()
+        self.current_prompt = prompt or None
         self.target_found = False
-        self.tracking_enabled = bool(self.current_prompt)
+        self.tracking_enabled = self.current_prompt is not None
         self.total_seg_time = 0.0
         self.segmentations = 0
         self.last_tracking_log_time = 0.0
@@ -220,7 +221,10 @@ class RGBTrackerNode(Node):
         self.last_no_frame_warn_time = 0.0
         self.latest_continuous_frame = None
         self._reset_burst_state()
-        self.get_logger().info(f'New prompt received: "{self.current_prompt}"')
+        if self.tracking_enabled:
+            self.get_logger().info(f'New prompt received: "{self.current_prompt}"')
+        else:
+            self.get_logger().info('Prompt cleared; tracking disabled.')
 
     def burst_complete_callback(self, msg):
         if self.tracking_mode != 'burst':
