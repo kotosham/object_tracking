@@ -14,6 +14,7 @@ VLM/executive owns all motion -- this node only perceives.
 """
 import threading
 import time
+import re
 from collections import deque
 
 import rclpy
@@ -232,6 +233,52 @@ class DetectTargetServer(Node):
         if request_conf > 0.0:
             return float(request_conf)
         return self.target_conf_default if query else self.vocab_conf_default
+
+    @staticmethod
+    def _target_query_alternatives(query):
+        """Small target alias lists are safer as separate DINO prompts."""
+        text = str(query or '').strip()
+        if '|' not in text:
+            return [text] if text else []
+        parts = [p.strip() for p in re.split(r'\s*\|\s*', text) if p.strip()]
+        if 1 < len(parts) <= 4:
+            return parts
+        return [text] if text else []
+
+    @staticmethod
+    def _bbox_iou(a, b):
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+        inter = iw * ih
+        if inter <= 0:
+            return 0.0
+        area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+        area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+        denom = area_a + area_b - inter
+        return float(inter) / float(denom) if denom > 0 else 0.0
+
+    @classmethod
+    def _dedupe_detections(cls, detections, iou_threshold=0.75):
+        kept = []
+        for det in sorted(detections, key=lambda d: d.confidence, reverse=True):
+            if all(cls._bbox_iou(det.bbox, prev.bbox) < iou_threshold for prev in kept):
+                kept.append(det)
+        return kept
+
+    def _segment_target_query(self, segmentor, frame, query, conf):
+        alternatives = self._target_query_alternatives(query)
+        if len(alternatives) <= 1:
+            return segmentor.segment_all(
+                frame, query, conf=conf, min_mask_area=self.min_mask_area)
+
+        dets = []
+        for alt in alternatives:
+            dets.extend(segmentor.segment_all(
+                frame, alt, conf=conf, min_mask_area=self.min_mask_area))
+        return self._dedupe_detections(dets)
 
     # ---- camera ----
     def _on_image(self, msg):
@@ -488,8 +535,7 @@ class DetectTargetServer(Node):
                     raise RuntimeError('target detector backend is not available')
                 segmentor = self.target_segmentor
                 conf = self._conf_for_query(query, float(req.conf_threshold))
-                dets = segmentor.segment_all(frame, query, conf=conf,
-                                             min_mask_area=self.min_mask_area)
+                dets = self._segment_target_query(segmentor, frame, query, conf)
             else:
                 if self.vocab_segmentor is None:
                     raise RuntimeError('DETECT_ALL backend is not available')

@@ -103,6 +103,54 @@ def test_parse_target_resolution_from_real_client_response():
     assert res.query_type == 'semantic_description'
 
 
+def test_target_resolution_replaces_raw_riddle_detector_query():
+    res = TargetResolution.from_json('something you can sit on', {
+        'canonical_target': 'chair',
+        'detection_query': 'something you can sit on',
+        'query_type': 'semantic_description',
+        'aliases': ['seat', 'desk chair', 'office chair'],
+        'reason': 'used for sitting',
+    })
+    assert res.canonical_target == 'chair'
+    assert res.detection_query == 'chair'
+    assert res.query_type == 'semantic_description'
+
+
+def test_target_resolution_preserves_vlm_detector_aliases():
+    res = TargetResolution.from_json(
+        'thing that keeps other things packed away and is often made of brown paper-like material',
+        {
+            'canonical_target': 'cardboard box',
+            'detection_query': 'cardboard box | box',
+            'query_type': 'semantic_description',
+            'aliases': ['carton', 'package'],
+            'reason': 'used for packing things',
+        },
+    )
+    assert res.canonical_target == 'cardboard box'
+    assert res.detection_query == 'cardboard box | box | carton | package'
+    assert res.query_type == 'semantic_description'
+
+
+def test_target_resolution_uses_vlm_whole_object_query():
+    res = TargetResolution.from_json(
+        'piece of furniture that keeps small things hidden in sliding compartments',
+        {
+            'canonical_target': 'drawer cabinet',
+            'detection_query': 'drawer cabinet | cabinet with drawers',
+            'query_type': 'semantic_description',
+            'aliases': ['file cabinet', 'storage cabinet'],
+            'reason': 'furniture with sliding compartments',
+        },
+    )
+    assert res.canonical_target == 'drawer cabinet'
+    assert (
+        res.detection_query
+        == 'drawer cabinet | cabinet with drawers | file cabinet | storage cabinet'
+    )
+    assert res.query_type == 'semantic_description'
+
+
 def test_target_resolution_invalid_json_falls_back_to_raw_object():
     res = TargetResolution.from_json('drawer cabinet', ['not', 'an', 'object'])
     assert res.canonical_target == 'drawer cabinet'

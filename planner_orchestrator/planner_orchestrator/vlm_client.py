@@ -135,8 +135,17 @@ TARGET_RESOLUTION_PROMPT = (
     "keep them in detection_query, but set canonical_target to the basic object "
     "name. For example, 'black office chair' -> canonical_target 'office chair', "
     "detection_query 'black office chair'. If it is a riddle/metaphor, infer the "
-    "most likely common physical object and express it as a short English "
-    "open-vocabulary detector phrase. Do not choose robot actions and do not "
+    "most likely common physical object and express BOTH canonical_target and "
+    "detection_query as short English open-vocabulary detector phrases, never "
+    "as the original riddle. For semantic/riddle-like queries, detection_query "
+    "should be a pipe-separated list of 2-4 concrete phrases that refer to the "
+    "same whole physical object, ordered from most specific to most general. "
+    "Do not answer with a component, attribute, or affordance when the clue "
+    "describes a whole object. For example, if the clue describes a piece of "
+    "furniture with parts, choose the whole furniture item, not one part. "
+    "Aliases should also be concrete detector phrases for the same object, not "
+    "nearby objects or loose associations. "
+    "Do not choose robot actions and do not "
     "invent scene facts. Return one JSON object only with this schema: "
     '{"canonical_target": str, "detection_query": str, "query_type": str, '
     '"aliases": [str], "reason": str}. '
@@ -170,6 +179,45 @@ class TargetResolution:
         text = ' '.join(text.split())
         return text[:max_len].strip()
 
+    @staticmethod
+    def _looks_like_description(text):
+        if '|' in str(text or ''):
+            return False
+        words = str(text or '').lower().split()
+        if len(words) > 5:
+            return True
+        joined = ' '.join(words)
+        cues = (
+            'something ', 'thing ', 'object ', 'where ', 'what ', 'used for ',
+            'you can ', 'people can ', 'for sitting', 'to sit', 'sit on',
+        )
+        return any(cue in joined for cue in cues)
+
+    @staticmethod
+    def _expand_semantic_detector_query(canonical, detection, aliases):
+        """For riddles, use the VLM-proposed detector aliases without object hacks."""
+        detection_terms = TargetResolution._split_detector_terms(detection)
+        use_aliases = len(detection_terms) >= 2
+        terms = []
+        seen = set()
+        source_items = (detection, canonical, *(aliases if use_aliases else ()))
+        for item in source_items:
+            for term in TargetResolution._split_detector_terms(item):
+                term = TargetResolution._clean_text(term, '', 80)
+                key = term.lower()
+                if not term or key in seen:
+                    continue
+                terms.append(term)
+                seen.add(key)
+                if len(terms) >= 4:
+                    return ' | '.join(terms)
+        return ' | '.join(terms) if terms else detection
+
+    @staticmethod
+    def _split_detector_terms(text):
+        raw = str(text or '')
+        return [part.strip() for part in raw.split('|') if part.strip()]
+
     @classmethod
     def passthrough(cls, raw_query, query_type='direct_object_name', reason='passthrough'):
         raw = cls._clean_text(raw_query, '')
@@ -199,6 +247,12 @@ class TargetResolution:
             alias = cls._clean_text(item, '', 80)
             if alias and alias not in clean_aliases and alias not in (canonical, detection):
                 clean_aliases.append(alias)
+        if query_type in ('semantic_description', 'ambiguous'):
+            same_as_raw = detection.lower() == raw.lower()
+            if same_as_raw or cls._looks_like_description(detection):
+                detection = canonical
+            detection = cls._expand_semantic_detector_query(
+                canonical, detection, clean_aliases)
         reason = cls._clean_text(data.get('reason'), '', 240)
         return cls(raw_query=raw, canonical_target=canonical, detection_query=detection,
                    query_type=query_type, aliases=tuple(clean_aliases), reason=reason)

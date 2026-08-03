@@ -111,6 +111,36 @@ def test_detector_uses_split_target_and_context_confidence_defaults():
     assert srv._conf_for_query("drawer cabinet", 0.35) == pytest.approx(0.35)
 
 
+def test_short_target_alias_query_is_split_for_dino():
+    parts = DetectTargetServer._target_query_alternatives(
+        "chair | desk chair | office chair")
+
+    assert parts == ["chair", "desk chair", "office chair"]
+
+
+def test_long_context_vocab_query_is_kept_as_one_prompt():
+    query = (
+        "desk | table | drawer cabinet | cabinet | file cabinet | "
+        "bookshelf | shelf | monitor | keyboard | laptop | printer"
+    )
+
+    assert DetectTargetServer._target_query_alternatives(query) == [query]
+
+
+def test_detection_dedupe_keeps_highest_confidence_box():
+    from object_tracking.setofmark import Detection
+
+    dets = [
+        Detection("chair", 0.7, 10, 10, (0, 0, 100, 100)),
+        Detection("office chair", 0.9, 12, 12, (2, 2, 102, 102)),
+        Detection("desk chair", 0.8, 200, 200, (180, 180, 260, 260)),
+    ]
+
+    kept = DetectTargetServer._dedupe_detections(dets)
+
+    assert [d.label for d in kept] == ["office chair", "desk chair"]
+
+
 def test_dino_output_label_deduplicates_overlapping_prompt_terms():
     dino_mod = pytest.importorskip("object_tracking.dino_mobilesam_image_segmentation")
     segmentor = dino_mod.GroundingDINOMobileSAMSegmentor
