@@ -128,7 +128,7 @@ class SAMNode(Node):
     def prompt_callback(self, msg):
         if self.current_prompt != msg.data:
             self.current_prompt = msg.data
-            self.get_logger().info(f'Новый промпт получен: "{self.current_prompt}"')
+            self.get_logger().info(f'New prompt received: "{self.current_prompt}"')
             self.target_found = False
             self.target_reached = False
             self.last_tracking_log_time = 0.0
@@ -149,7 +149,7 @@ class SAMNode(Node):
             else:
                 self.latest_depth = depth_image.astype(np.float32, copy=False)
         except CvBridgeError as e:
-            self.get_logger().error(f'Ошибка конвертации depth изображения: {e}')
+            self.get_logger().error(f'Depth image conversion failed: {e}')
 
     def should_log_tracking_update(self, distance, center_coords):
         now = time.time()
@@ -194,13 +194,13 @@ class SAMNode(Node):
                     self.image_pub.publish(self.bridge.cv2_to_imgmsg(seg_img, encoding='bgr8'))
                     if center_coords is None:
                         if not self.target_found and not self.target_reached:
-                            self.get_logger().warn('Объект не найден')
+                            self.get_logger().warn('Object not found')
                             msg = Twist()
                             msg.angular.z = self.search_angular_speed
                             self.search_cmd_pub.publish(msg)
                             time.sleep(4.0)
                             self.latest_depth = None
-                            self.get_logger().info("Ожидание после поворота окончено")
+                            self.get_logger().info("Post-turn wait finished")
                         if self.target_found and not self.target_reached:
                             transform_base = self.tf_buffer.lookup_transform('map', 
                                                                             'base_link', 
@@ -217,7 +217,7 @@ class SAMNode(Node):
 
                             if distance <= self.offset + self.offset_delta:
                                 self.target_reached = True
-                                self.get_logger().info("Объект достигнут")
+                                self.get_logger().info("Object reached")
                                 self.get_logger().info(f'Average segmentation time is {(self.total_seg_time/self.segmentations)}')
                         return
                     else:
@@ -251,7 +251,7 @@ class SAMNode(Node):
                                     f"{(self.total_seg_time/self.segmentations)}"
                                 )
                         except Exception as e:
-                            self.get_logger().error(f'Ошибка трансформации в map: {e}')
+                            self.get_logger().error(f'Transform to map failed: {e}')
                 return
 
             seg_img, center_coords, segmentation_time, depth_map_used = self.segmentor.segment(image, self.current_prompt, self.latest_depth)
@@ -259,7 +259,7 @@ class SAMNode(Node):
 
             if center_coords is None:
                 #if not self.target_found:
-                    #self.get_logger().warn('Объект не найден')
+                    #self.get_logger().warn('Object not found')
                 if self.target_found and not self.target_reached:
                     transform_base = self.tf_buffer.lookup_transform('map', 
                                                                     'base_link', 
@@ -276,13 +276,13 @@ class SAMNode(Node):
 
                     if distance <= self.offset + self.offset_delta:
                         self.target_reached = True
-                        self.get_logger().info("Объект достигнут")
+                        self.get_logger().info("Object reached")
                         self.get_logger().info(f'Average segmentation time is {(self.total_seg_time/self.segmentations)}')
 
                 return
             else:
                 if not self.target_found:
-                    self.get_logger().info('Координаты центра: (' + str(center_coords[0]) + ', ' + str(center_coords[1]) + ')')
+                    self.get_logger().info('Center coordinates: (' + str(center_coords[0]) + ', ' + str(center_coords[1]) + ')')
                 self.target_found = True
 
             self.total_seg_time += segmentation_time
@@ -290,7 +290,7 @@ class SAMNode(Node):
 
             if self.latest_depth is None:
                 #if not self.target_found:
-                #    self.get_logger().warn('Нет данных depth')
+                #    self.get_logger().warn('No depth data')
                 return
 
             x_px = int(center_coords[0])
@@ -298,14 +298,14 @@ class SAMNode(Node):
 
             depth = depth_map_used[y_px, x_px]
             if np.isnan(depth) or depth <= 0.0:
-                self.get_logger().warn('Некорректная глубина в центре объекта')
+                self.get_logger().warn('Invalid depth at object center')
                 return
             
             X = (x_px - self.cx) * depth / self.fx
             Y = (y_px - self.cy) * depth / self.fy
             Z = depth
     
-            #self.get_logger().info(f'Объект в системе камеры: X={X:.2f}, Y={Y:.2f}, Z={Z:.2f}')
+            #self.get_logger().info(f'Object in camera frame: X={X:.2f}, Y={Y:.2f}, Z={Z:.2f}')
 
             point_camera = Point()
             point_camera.x = X
@@ -342,7 +342,7 @@ class SAMNode(Node):
                     else:
                         scale = 0.8
                         self.target_reached = True
-                        self.get_logger().info("Объект достигнут")
+                        self.get_logger().info("Object reached")
                         self.get_logger().info(f'Average segmentation time is {(self.total_seg_time/self.segmentations)}')
 
                     goal_x = robot_x + dx * scale
@@ -382,7 +382,7 @@ class SAMNode(Node):
                             f'y={goal.pose.position.y:.2f}, yaw={theta:.2f}rad'
                         )
                 except Exception as e:
-                    self.get_logger().error(f'Ошибка трансформации в map: {e}')
+                    self.get_logger().error(f'Transform to map failed: {e}')
 
 def main(args=None):
     rclpy.init(args=args)

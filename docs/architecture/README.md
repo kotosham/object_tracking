@@ -1,31 +1,45 @@
-# object_tracking — edge-сторона робастной архитектуры (ветка `robust`)
+# object_tracking - Edge Side of the Robust Architecture (`robust` branch)
 
-Этот репозиторий на ветке `robust` реализует **edge/ПК-сторону (GPU)** новой архитектуры: восприятие, SLAM и VLM-планировщик. Робот (Raspberry Pi 5) и реактивный контур живут в репозитории [`ar_project`](https://github.com/dnbabkov/ar_project) (ветка `robust`).
+On the `robust` branch, this repository implements the **edge/PC GPU side** of
+the architecture: perception, SLAM, and the VLM planner. The robot side
+(Raspberry Pi 5 and the reactive loop) lives in the
+[`ar_project`](https://github.com/dnbabkov/ar_project) repository on the
+`robust` branch.
 
-> **Единый источник правды по архитектуре — в `ar_project/docs/architecture/`.** Здесь — только краткая выжимка edge-стороны и указатели. Контракты и режимы не дублируем — см. оригиналы.
+> The single source of truth for architecture lives in
+> `ar_project/docs/architecture/`. This file is only a short edge-side summary
+> and pointer list. Contracts and modes are not duplicated here.
 
-## Полная документация (в `ar_project/docs/`)
+## Full Documentation in `ar_project/docs/`
 
-- `docs/architecture/README.md` — обзор 3T-иерархии, инварианты, два режима, FMEA must-fix.
-- `docs/architecture/DATA_CONTRACTS.md` — контракты передачи Pi↔ПК (форматы/QoS/полоса/задержки).
-- `docs/architecture/MODES.md` — режимы `flat`/`vlm`, тайминг реплана, notes-буфер.
-- `docs/architecture/REPOS_INTERFACES.md` — пакеты, интерфейсы, REUSED/NEW/DELETED, оценки.
-- `docs/architecture/GAZEBO_WSL_TESTING.md` — тест-план в Gazebo на WSL2.
-- `docs/ROADMAP.md` — пошаговый чек-лист реализации.
+- `docs/architecture/README.md`: 3-layer hierarchy, invariants, two modes, FMEA
+  must-fix items.
+- `docs/architecture/DATA_CONTRACTS.md`: Pi-PC transfer contracts, formats, QoS,
+  bandwidth, and latency.
+- `docs/architecture/MODES.md`: `flat`/`vlm` modes, replan timing, notes buffer.
+- `docs/architecture/REPOS_INTERFACES.md`: packages, interfaces,
+  REUSED/NEW/DELETED inventory, estimates.
+- `docs/architecture/GAZEBO_WSL_TESTING.md`: Gazebo-on-WSL2 test plan.
+- `docs/ROADMAP.md`: step-by-step implementation checklist.
 
-## Что живёт на этой (edge) стороне
+## What Lives on the Edge Side
 
-| Компонент | Пакет (robust) | Роль |
+| Component | Package (`robust`) | Role |
 |---|---|---|
-| **Planner Orchestrator** | `planner_orchestrator` (NEW) | лёгкий async **HTTP-клиент к внешнему OpenAI-совместимому VLM API** (Qwen3-VL-30B-A3B; модель **здесь не хостим**, GPU не требует — `base_url`+ключ): single-in-flight, UUID-идемпотентность, timeout по измеренному p99, circuit-breaker, **structured/enum tool-call** (VLM выбирает только `frontier_id`/`approach_target` из реального списка, координат не порождает), streaming; notes/summary-буфер; anytime/async-реплан с adoption в commit-точке |
-| **Open-vocab детектор** | `object_tracking/` (REUSED) | GroundingDINO+MobileSAM (`model_mode:=dino`) для target query и fixed context vocab; YOLOE оставлен только для legacy/comparison `model_mode:=yoloe`. Set-of-Mark рендер кандидатов; CLIPSeg из грудинга исключён. Отдаёт пиксель/маску по запросу (`DetectTarget.action`) |
-| **SLAM** | RTAB-Map (REUSED) | offline mapping → `.db`; online localization → **low-rate `MapOdomCorrection`** (НЕ TF-поток) для `map_odom_relay` на Pi |
-| **Интерфейсы** | `object_tracking_msgs` (NEW) | `SeekObject.action`, `DetectTarget.action`, `PlanStep.msg`, `Notes.msg`, `Candidate.msg` |
-| **Транспорт** | bring-up | `rmw_zenoh` systemd-роутер на этом хосте; multicast off; QoS deadline/liveliness; chrony |
+| **Planner Orchestrator** | `planner_orchestrator` | Light async HTTP client to an external OpenAI-compatible VLM API. The model is not hosted here; GPU is not required. Implements single-in-flight requests, UUID idempotency, p99 timeout, circuit breaker, structured/enum tool calls, notes buffer, and async replan with commit-point adoption. |
+| **Open-vocabulary detector** | `object_tracking/` | GroundingDINO+MobileSAM (`model_mode:=dino`) for target query and fixed context vocabulary. YOLOE remains only for legacy/comparison (`model_mode:=yoloe`). Provides Set-of-Mark candidate rendering and pixel/mask output through `DetectTarget.action`. |
+| **SLAM** | RTAB-Map | offline mapping to `.db`; online localization to low-rate `MapOdomCorrection` for Pi `map_odom_relay`. This is not a TF stream. |
+| **Interfaces** | `object_tracking_msgs` | `SeekObject.action`, `DetectTarget.action`, `PlanStep.msg`, `Notes.msg`, `Candidate.msg`. |
+| **Transport** | bringup | `rmw_zenoh` router on this host, multicast off, QoS deadline/liveliness, chrony. |
 
-## Жёсткие правила edge-стороны
+## Hard Edge-Side Rules
 
-- **VLM/детектор никогда не пишут в реактивный путь робота** и не выдают навигационных координат.
-- **Никаких PointCloud2/сырых depth-потоков по Wi-Fi** — приходит один сжатый keyframe по событию; SLAM получает RGB-D и отдаёт компактную коррекцию.
-- **VLM — ненадёжный медленный советник**: при недоступности edge/VLM/Wi-Fi робот бесшовно работает в `flat` (см. деградацию в `MODES.md`).
-- **VLM — всегда внешний OpenAI-совместимый API**, не self-hosted на edge: Planner Orchestrator — лишь HTTP-клиент (`base_url`), GPU не требует. Edge-GPU обслуживает **только** детектор (DINO+SAM; YOLOE только legacy/comparison) и SLAM (RTAB-Map). Кто поднял эндпоинт (vLLM/SGLang/облако) — деталь развёртывания (см. `GAZEBO_WSL_TESTING.md`).
+- VLM and detector never write to the robot reactive path and never output
+  navigation coordinates.
+- No PointCloud2 or raw depth streams over Wi-Fi. Only compressed event data and
+  compact metadata cross the link.
+- VLM is a slow, unreliable advisor. If edge/VLM/Wi-Fi is unavailable, the robot
+  continues seamlessly in `flat` mode.
+- The VLM is always an external OpenAI-compatible API, not self-hosted on edge.
+  Planner Orchestrator is only an HTTP client. Edge GPU serves the detector and
+  SLAM only. Endpoint hosting is a deployment detail.

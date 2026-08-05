@@ -274,16 +274,16 @@ class GroundingDINOMobileSAMSegmentor:
         ]
 
         if not filtered:
-            print("Объект не найден по уверенности")
+            print("No object passed the confidence threshold")
             return image_bgr, None, depth_map, 0
 
-        # Выбери самый уверенный бокс
+        # Select the most confident box.
         box, score, label = sorted(filtered, key=lambda x: -x[1])[0]
         input_box = np.array([box])
         self.last_detection_score = float(score)
         self.last_detection_label = str(label)
         self.last_bbox = tuple(int(v) for v in box.tolist())
-        print(f"Найден объект: {label} (score={score:.2f})")
+        print(f"Found object: {label} (score={score:.2f})")
 
         print("Received bounding boxes")
 
@@ -569,8 +569,8 @@ class GroundingDINOMobileSAMSegmentor:
         goal_x = robot_x + dx * scale
         goal_y = robot_y + dy * scale
 
-        print(f'Объект в map frame: X={point_world.point.x:.2f}, Y={point_world.point.y:.2f}, Z={point_world.point.z:.2f}')
-        print(f'Расстояние до цели distance = {distance:.2f}, offset = {offset:.2f}')
+        print(f'Object in map frame: X={point_world.point.x:.2f}, Y={point_world.point.y:.2f}, Z={point_world.point.z:.2f}')
+        print(f'Target distance = {distance:.2f}, offset = {offset:.2f}')
 
         goal = PoseStamped()
                     
