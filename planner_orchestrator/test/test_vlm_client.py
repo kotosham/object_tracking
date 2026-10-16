@@ -181,7 +181,8 @@ def test_system_prompt_prioritizes_corridor_exploration():
     assert 'initial_scan turns are already done' in SYSTEM_PROMPT
     assert 'corridor_scan entries' in SYSTEM_PROMPT
     assert 'prefer a real free/unknown corridor' in SYSTEM_PROMPT
-    assert 'very close left/right furniture edge' in SYSTEM_PROMPT
+    assert 'almost touching the swept path' in SYSTEM_PROMPT
+    assert 'let Nav2/collision_monitor judge the local clearance' in SYSTEM_PROMPT
     assert 'If no such close forward/swept-path blocker is visible' in SYSTEM_PROMPT
     assert 'DRIVE_FORWARD remains the preferred corridor-exploration action' in SYSTEM_PROMPT
 

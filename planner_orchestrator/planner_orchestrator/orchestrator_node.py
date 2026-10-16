@@ -186,6 +186,8 @@ class PlannerOrchestrator(Node):
         self.declare_parameter('target_lock_recovery_steps', 3)
         self.declare_parameter('target_lock_recovery_turn_rad', 0.6)
         self.declare_parameter('target_lock_recovery_forward_m', 0.45)
+        self.declare_parameter('target_lock_max_distance_m', 4.0)
+        self.declare_parameter('target_lock_ignore_edge_targets', True)
         # After a strict target was confidently approached once, keep a navigation
         # lock on its map point. The detector may lose the object at close range
         # because it overflows the camera; that should not drop us back to context
@@ -256,6 +258,8 @@ class PlannerOrchestrator(Node):
         self.target_lock_recovery_steps = max(0, int(g('target_lock_recovery_steps')))
         self.target_lock_recovery_turn_rad = float(g('target_lock_recovery_turn_rad'))
         self.target_lock_recovery_forward_m = float(g('target_lock_recovery_forward_m'))
+        self.target_lock_max_distance_m = max(0.0, float(g('target_lock_max_distance_m')))
+        self.target_lock_ignore_edge_targets = bool(g('target_lock_ignore_edge_targets'))
         self._target_lock = None
         self.locked_target_approach_max_attempts = max(
             0, int(g('locked_target_approach_max_attempts')))
@@ -613,6 +617,28 @@ class PlannerOrchestrator(Node):
         actions = self._initial_scan_actions(obs, step_index)
         return actions[0] if actions else None
 
+    @staticmethod
+    def _candidate_on_image_edge(cand, margin=0.08):
+        try:
+            x = float(cand.pixel_x_norm)
+        except (TypeError, ValueError):
+            try:
+                x = float(cand.center_x_norm)
+            except (TypeError, ValueError):
+                return False
+        margin = max(0.0, min(0.49, float(margin)))
+        return x < margin or x > 1.0 - margin
+
+    def _target_lock_candidate_is_actionable(self, cand):
+        if not distance_is_known(cand.distance_m):
+            return False
+        if (self.target_lock_max_distance_m > 0.0
+                and float(cand.distance_m) > self.target_lock_max_distance_m):
+            return False
+        if self.target_lock_ignore_edge_targets and self._candidate_on_image_edge(cand):
+            return False
+        return True
+
     def _remember_target_lock(self, target, cands, step_index):
         strict = [
             c for c in cands or []
@@ -620,7 +646,19 @@ class PlannerOrchestrator(Node):
         ]
         if not strict:
             return
-        best = max(strict, key=lambda c: (float(c.score), -float(c.distance_m)))
+        actionable = [c for c in strict if self._target_lock_candidate_is_actionable(c)]
+        if not actionable:
+            self.get_logger().info(
+                'target_lock: skip non-actionable strict target(s): %s'
+                % ', '.join('%s(%.2f@%s,%s%s)' % (
+                    c.label,
+                    float(c.score),
+                    format_distance(c.distance_m),
+                    c.side,
+                    ',edge' if self._candidate_on_image_edge(c) else '')
+                            for c in strict[:3]))
+            return
+        best = max(actionable, key=lambda c: (float(c.score), -float(c.distance_m)))
         self._target_lock = {
             'target': target,
             'label': best.label,

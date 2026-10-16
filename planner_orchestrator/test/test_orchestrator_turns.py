@@ -33,6 +33,8 @@ def _bare_orchestrator():
     node.target_lock_recovery_steps = 3
     node.target_lock_recovery_turn_rad = 0.6
     node.target_lock_recovery_forward_m = 0.45
+    node.target_lock_max_distance_m = 4.0
+    node.target_lock_ignore_edge_targets = True
     node._target_lock = None
     node._semantic_turn_side = 'left'
     node._semantic_turn_streak = 2
@@ -195,6 +197,29 @@ def test_recent_edge_target_lock_recovery_preempts_initial_scan():
     assert 'target_lock' in action.rationale
     assert node._initial_scan_actions(obs, 1)
     assert node._target_lock['recoveries'] == 1
+
+
+def test_target_lock_skips_far_edge_hint_so_corridor_search_is_not_preempted():
+    node = _bare_orchestrator()
+    node._remember_target_lock(
+        'office chair',
+        [Candidate(1, 'office chair', 0.76, distance_m=7.44,
+                   side='right', source='target', pixel_x_norm=0.99)],
+        step_index=4)
+
+    assert node._target_lock is None
+
+
+def test_target_lock_remembers_actionable_center_target():
+    node = _bare_orchestrator()
+    node._remember_target_lock(
+        'office chair',
+        [Candidate(1, 'office chair', 0.76, distance_m=2.4,
+                   side='center', source='target', pixel_x_norm=0.5)],
+        step_index=4)
+
+    assert node._target_lock is not None
+    assert node._target_lock['label'] == 'office chair'
 
 
 def test_corridor_scan_records_initial_views_as_context_cues():

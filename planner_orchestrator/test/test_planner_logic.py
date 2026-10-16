@@ -192,6 +192,34 @@ def test_visible_target_guard_recenters_edge_target_instead_of_done():
     assert 'edge_target_guard' in a.rationale
 
 
+def test_visible_target_guard_approaches_far_edge_target_bounded_instead_of_turning():
+    obs = Observation(
+        target='office chair',
+        candidates=[Candidate(1, 'office chair', 0.76, distance_m=7.44,
+                              side='right', center_x_norm=0.95,
+                              source='target', pixel_x_norm=0.99)])
+    a, reason = parse_vlm_action({'action': 'DONE', 'rationale': 'target visible'}, obs)
+    assert reason == 'OK'
+    assert a.kind == DRIVE_TO_VISIBLE
+    assert a.mark_id == 1
+    assert 'bounded ApproachDetection' in a.rationale
+
+
+def test_parse_keeps_far_edge_drive_to_visible_as_approach_not_recenter():
+    obs = Observation(
+        target='office chair',
+        candidates=[Candidate(1, 'office chair', 0.76, distance_m=7.44,
+                              side='right', center_x_norm=0.95,
+                              source='target', pixel_x_norm=0.99)])
+    a, reason = parse_vlm_action(
+        {'action': 'DRIVE_TO_VISIBLE', 'mark_id': 1, 'rationale': 'drive to target'},
+        obs)
+    assert reason == 'OK'
+    assert a.kind == DRIVE_TO_VISIBLE
+    assert a.mark_id == 1
+    assert a.rationale == 'drive to target'
+
+
 def test_parse_preserves_context_forward_corridor_probe():
     obs = Observation(
         target='office chair',
@@ -238,10 +266,10 @@ def test_parse_redirects_context_forward_away_from_very_close_side_furniture():
     obs = Observation(
         target='office chair',
         context_marks=[
-            ContextMark(1, 'keyboard', 0.47, distance_m=0.45,
+            ContextMark(1, 'keyboard', 0.47, distance_m=0.22,
                         side='left', center_x_norm=0.25,
                         relevance='office_context'),
-            ContextMark(2, 'drawer cabinet file cabinet', 0.39, distance_m=0.42,
+            ContextMark(2, 'drawer cabinet file cabinet', 0.39, distance_m=0.20,
                         side='left', center_x_norm=0.30,
                         relevance='office_context'),
             ContextMark(3, 'printer', 0.36, distance_m=2.17,
@@ -257,6 +285,23 @@ def test_parse_redirects_context_forward_away_from_very_close_side_furniture():
     assert a.turn_yaw_rad == -0.6
     assert 'close left context mark' in a.rationale
     assert 'turn right' in a.rationale
+
+
+def test_parse_preserves_corridor_forward_with_side_furniture_fragment():
+    obs = Observation(
+        target='office chair',
+        context_marks=[
+            ContextMark(1, 'drawer cabinet file cabinet bookshelf', 0.36,
+                        distance_m=0.44, side='left', center_x_norm=0.20,
+                        relevance='office_context'),
+        ])
+    a, reason = parse_vlm_action(
+        {'action': 'DRIVE_FORWARD', 'forward_dist_m': 0.55,
+         'rationale': 'continue corridor exploration'},
+        obs)
+    assert reason == 'OK'
+    assert a.kind == DRIVE_FORWARD
+    assert a.forward_dist_m == 0.55
 
 
 def test_parse_turns_to_find_side_corridor_when_only_center_furniture_is_close():

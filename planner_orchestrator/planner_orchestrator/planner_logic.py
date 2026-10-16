@@ -41,11 +41,15 @@ ACTION_KINDS = {v: k for k, v in ACTION_NAMES.items()}
 CONTEXT_EXPLORE_TURN_RAD = 0.6
 CONTEXT_EXPLORE_FORWARD_M = 0.4
 CONTEXT_EXPLORE_MIN_CLEARANCE_M = 0.8
-CONTEXT_EXPLORE_SIDE_BLOCKER_M = 0.55
+# Side context detections are often partial table/cabinet fragments at the image
+# edge. Treat them as a forward blocker only if they are almost touching; Nav2
+# and collision_monitor are the real path-safety authorities.
+CONTEXT_EXPLORE_SIDE_BLOCKER_M = 0.25
 TARGET_PROBE_TURN_RAD = 0.45
 TARGET_PROBE_FORWARD_M = 0.6
 STRICT_TARGET_DONE_DIST_M = 0.8
 TARGET_EDGE_REACQUIRE_MARGIN_NORM = 0.08
+TARGET_EDGE_RECENTER_MAX_DIST_M = 3.0
 
 
 @dataclass(frozen=True)
@@ -361,6 +365,8 @@ def edge_target_to_recenter(action: Action, obs: Observation) -> Optional[Action
     side = _candidate_edge_side(cand)
     if not side:
         return None
+    if float(cand.distance_m) > TARGET_EDGE_RECENTER_MAX_DIST_M:
+        return None
     turn = TARGET_PROBE_TURN_RAD if side == 'left' else -TARGET_PROBE_TURN_RAD
     base = ('edge_target_guard: target mark %d "%s" is depth-backed but its '
             'navigation pixel is on the %s image edge; recenter and re-detect '
@@ -492,10 +498,21 @@ def visible_target_to_approach(action: Action, obs: Observation) -> Optional[Act
     stable = [c for c in strict if not _candidate_edge_side(c)]
     if not stable:
         closest_edge = min(strict, key=lambda c: float(c.distance_m))
-        return edge_target_to_recenter(
+        recenter = edge_target_to_recenter(
             Action(DRIVE_TO_VISIBLE, mark_id=closest_edge.mark_id,
                    arg_label=closest_edge.label, rationale=action.rationale),
             obs)
+        if recenter is not None:
+            return recenter
+        base = ('target_guard: strict target "%s" is visible as far edge mark %d '
+                'at %.2fm; use bounded ApproachDetection instead of %s so the '
+                'robot keeps moving while Nav2 checks a safe intermediate pose'
+                % (obs.target, closest_edge.mark_id, float(closest_edge.distance_m),
+                   action.name))
+        if action.rationale:
+            base += '; original rationale: ' + action.rationale
+        return Action(DRIVE_TO_VISIBLE, mark_id=closest_edge.mark_id,
+                      arg_label=closest_edge.label, rationale=base)
     closest = min(stable, key=lambda c: float(c.distance_m))
     if float(closest.distance_m) <= STRICT_TARGET_DONE_DIST_M:
         return None
